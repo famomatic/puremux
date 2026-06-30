@@ -1,6 +1,6 @@
 package preprocessor
 
-import "famomatic/puremux/internal/core"
+import "github.com/famomatic/puremux/internal/core"
 
 // Config bounds preprocessor state so jitter buffering cannot grow
 // unbounded (ARCHITECTURE.md section 5.B).

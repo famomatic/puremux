@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/core"
 )
 
 // fakeDetector is a test-only CodecKeyframeDetector returning a fixed result.

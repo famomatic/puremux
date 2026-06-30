@@ -4,7 +4,7 @@ import (
 	"sort"
 	"time"
 
-	"famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/core"
 )
 
 // Enforcer forces a packet stream into monotonically increasing DTS order

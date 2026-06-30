@@ -10,9 +10,9 @@ import (
 	"io"
 	"time"
 
-	"famomatic/puremux/internal/core"
-	"famomatic/puremux/internal/format/webm"
-	"famomatic/puremux/internal/preprocessor"
+	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/webm"
+	"github.com/famomatic/puremux/internal/preprocessor"
 )
 
 // Track describes a media stream for the public API.

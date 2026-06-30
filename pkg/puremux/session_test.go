@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/core"
 )
 
 // seekBuf is an in-memory io.WriteSeeker for seekable-mode tests.

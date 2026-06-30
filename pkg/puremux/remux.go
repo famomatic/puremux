@@ -7,8 +7,8 @@ import (
 	"sort"
 	"time"
 
-	"famomatic/puremux/internal/core"
-	"famomatic/puremux/internal/format/webm"
+	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/webm"
 )
 
 // RemuxInputs merges one or more WebM input files (e.g. separate video and

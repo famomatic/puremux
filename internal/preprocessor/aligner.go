@@ -3,7 +3,7 @@ package preprocessor
 import (
 	"time"
 
-	"famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/core"
 )
 
 // Aligner enforces that a video stream starts with a keyframe and realigns

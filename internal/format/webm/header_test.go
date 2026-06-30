@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"famomatic/puremux/internal/format/ebml"
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 func TestWriteEBMLHeader(t *testing.T) {

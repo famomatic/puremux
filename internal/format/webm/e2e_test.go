@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"famomatic/puremux/internal/format/ebml"
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 // TestWebMEndToEnd generates a minimal but complete WebM stream and verifies

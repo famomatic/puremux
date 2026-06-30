@@ -6,9 +6,9 @@ import (
 	"math"
 	"testing"
 
-	"famomatic/puremux/internal/format/ebml"
+	"github.com/famomatic/puremux/internal/format/ebml"
 
-	"famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/core"
 )
 
 func TestPatchDuration(t *testing.T) {

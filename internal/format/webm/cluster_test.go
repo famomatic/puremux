@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"famomatic/puremux/internal/format/ebml"
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 func TestClusterSeekablePatchesSize(t *testing.T) {

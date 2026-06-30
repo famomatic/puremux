@@ -5,8 +5,8 @@ import (
 	"io"
 	"time"
 
-	"famomatic/puremux/internal/core"
-	"famomatic/puremux/internal/format/ebml"
+	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 // Reader decodes a WebM/Matroska file into tracks and packets.

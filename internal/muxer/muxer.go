@@ -3,7 +3,7 @@ package muxer
 import (
 	"io"
 
-	"famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/core"
 )
 
 // Writer is the sink a Muxer serializes container bytes to. It extends

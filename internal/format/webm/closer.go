@@ -5,7 +5,7 @@ import (
 	"io"
 	"math"
 
-	"famomatic/puremux/internal/format/ebml"
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 // CuePoint is a seek index entry pointing at a Cluster.

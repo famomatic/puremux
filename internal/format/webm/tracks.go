@@ -3,7 +3,7 @@ package webm
 import (
 	"io"
 
-	"famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/core"
 )
 
 // TrackSpec is the muxer's view of a track for Tracks-element serialization.
