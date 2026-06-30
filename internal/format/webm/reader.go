@@ -426,6 +426,14 @@ func codecTypeFromString(s string) core.CodecType {
 		return core.CodecAV1
 	case "A_OPUS":
 		return core.CodecOpus
+	case "A_VORBIS":
+		return core.CodecVorbis
+	case "A_FLAC":
+		return core.CodecFLAC
+	case "V_MPEG4/ISO/AVC":
+		return core.CodecH264
+	case "V_MPEGH/ISO/SHEVC":
+		return core.CodecHEVC
 	default:
 		return core.CodecUnknown
 	}

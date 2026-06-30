@@ -5,55 +5,128 @@ import (
 	"io"
 	"os"
 	"sort"
-	"time"
 
 	"github.com/famomatic/puremux/internal/core"
 	"github.com/famomatic/puremux/internal/format/webm"
 )
 
-// RemuxInputs merges one or more WebM input files (e.g. separate video and
-// audio downloads) into a single WebM output via the puremux pipeline.
+// openFile opens an input file read-only.
+func openFile(path string) (*os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("puremux: open %s: %w", path, err)
+	}
+	return f, nil
+}
+
+// webmReaderAdapter wraps internal/format/webm.Reader so it satisfies
+// inputReader. It translates webm.Block into InputBlock.
+type webmReaderAdapter struct {
+	f      *os.File
+	rd     *webm.Reader
+	tracks []InputTrack
+}
+
+func newWebMReader(f *os.File) (inputReader, error) {
+	rd, err := webm.NewReader(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("puremux: read webm: %w", err)
+	}
+	a := &webmReaderAdapter{f: f, rd: rd}
+	for _, t := range rd.Tracks() {
+		a.tracks = append(a.tracks, InputTrack{
+			Number:       t.Number,
+			Codec:        t.Codec,
+			IsVideo:      t.IsVideo,
+			Width:        t.Width,
+			Height:       t.Height,
+			Channels:     t.Channels,
+			SampleRate:   t.SampleRate,
+			CodecPrivate: t.CodecPrivate,
+		})
+	}
+	return a, nil
+}
+
+func (a *webmReaderAdapter) Tracks() []InputTrack { return a.tracks }
+
+func (a *webmReaderAdapter) NextBlock() (*InputBlock, error) {
+	blk, err := a.rd.NextBlock()
+	if err != nil {
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, err
+	}
+	return &InputBlock{
+		TrackNum: blk.TrackNum,
+		AbsMs:    blk.AbsTimecode(),
+		Keyframe: blk.Keyframe,
+		Data:     blk.Data,
+	}, nil
+}
+
+func (a *webmReaderAdapter) Close() error { return a.f.Close() }
+
+// RemuxInputs merges one or more EBML (WebM/MKV) input files into a single
+// WebM/MKV output via the puremux pipeline. This is the legacy entry point
+// that assumes all inputs are EBML; new callers should use Merge, which gates
+// on the output container and input magic first.
 //
-// Each input is demuxed with the WebM reader (opaque payloads, no decoding),
-// fed through the Enforcer+Aligner pipeline, and serialized to the output.
-// Packets are emitted in merged timecode order across all inputs.
+// Each input is demuxed (opaque payloads, no decoding), fed through the
+// Enforcer+Aligner pipeline, and serialized to the output. Packets are
+// emitted in merged timecode order across all inputs.
 func RemuxInputs(inputs []string, w io.Writer, cfg Config) error {
+	containers := make([]Container, len(inputs))
+	for i, in := range inputs {
+		c, err := DetectContainer(in)
+		if err != nil {
+			return fmt.Errorf("puremux: detect %s: %w", in, err)
+		}
+		containers[i] = c
+	}
+	return remuxInputs(inputs, containers, w, cfg)
+}
+
+// remuxInputs is the container-agnostic merge core. It opens each input with
+// the matching demuxer, registers tracks on a fresh session, and drains all
+// sources in merged absolute-timecode order. The cfg.OutputContainer decides
+// the EBML doctype written; it defaults to WebM when zero.
+func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Config) error {
 	if len(inputs) == 0 {
 		return fmt.Errorf("puremux: no inputs")
 	}
+	if cfg.OutputContainer == ContainerUnknown {
+		cfg.OutputContainer = ContainerWebM
+	}
 
-	// Open all inputs and parse their tracks.
 	type source struct {
-		file   *os.File
-		reader *webm.Reader
-		tracks []webm.ReadTrack
-		// next block cached per source
-		next *webm.Block
-		err  error
+		reader inputReader
+		tracks []InputTrack
+		next   *InputBlock
 	}
 	var srcs []*source
 	trackIDMap := map[int]int{} // (srcIdx, srcTrackNum) -> output track number
+
 	for _, path := range inputs {
-		f, err := os.Open(path)
+		_ = path
+	}
+
+	// Open all inputs.
+	for i, path := range inputs {
+		rd, err := openInputReader(path, containers[i])
 		if err != nil {
 			for _, s := range srcs {
-				s.file.Close()
+				_ = s.reader.Close()
 			}
-			return fmt.Errorf("puremux: open %s: %w", path, err)
+			return err
 		}
-		rd, err := webm.NewReader(f)
-		if err != nil {
-			f.Close()
-			for _, s := range srcs {
-				s.file.Close()
-			}
-			return fmt.Errorf("puremux: read %s: %w", path, err)
-		}
-		srcs = append(srcs, &source{file: f, reader: rd, tracks: rd.Tracks()})
+		srcs = append(srcs, &source{reader: rd, tracks: rd.Tracks()})
 	}
 	defer func() {
 		for _, s := range srcs {
-			s.file.Close()
+			_ = s.reader.Close()
 		}
 	}()
 
@@ -81,7 +154,7 @@ func RemuxInputs(inputs []string, w io.Writer, cfg Config) error {
 	}
 
 	// Prime each source with its first block.
-	for srcIdx, src := range srcs {
+	for _, src := range srcs {
 		blk, err := src.reader.NextBlock()
 		if err == io.EOF {
 			src.next = nil
@@ -91,12 +164,10 @@ func RemuxInputs(inputs []string, w io.Writer, cfg Config) error {
 			return fmt.Errorf("puremux: read block: %w", err)
 		}
 		src.next = blk
-		_ = srcIdx
 	}
 
 	// Merge loop: pick the source with the earliest block, emit it, advance.
 	for {
-		// Find the source with the smallest absolute timecode.
 		var pick int = -1
 		var bestTC uint64
 		for i, src := range srcs {
@@ -110,7 +181,7 @@ func RemuxInputs(inputs []string, w io.Writer, cfg Config) error {
 			}
 		}
 		if pick < 0 {
-			break // all sources exhausted
+			break
 		}
 		src := srcs[pick]
 		blk := src.next
@@ -120,20 +191,12 @@ func RemuxInputs(inputs []string, w io.Writer, cfg Config) error {
 			DTS:        blk.Duration(),
 			PTS:        blk.Duration(),
 			IsKeyframe: blk.Keyframe,
-			Codec:      src.tracks[0].Codec, // approx; refined below
+			Codec:      trackCodec(src.tracks, blk.TrackNum),
 			Data:       blk.Data,
-		}
-		// Find the codec for this track number.
-		for _, t := range src.tracks {
-			if t.Number == blk.TrackNum {
-				p.Codec = t.Codec
-				break
-			}
 		}
 		if err := s.WritePacket(p); err != nil {
 			return fmt.Errorf("puremux: write packet: %w", err)
 		}
-		// Advance this source.
 		blk2, err := src.reader.NextBlock()
 		if err == io.EOF {
 			src.next = nil
@@ -152,11 +215,8 @@ func RemuxInputs(inputs []string, w io.Writer, cfg Config) error {
 
 // mergeByTime sorts blocks across sources by absolute timecode for stable
 // merge ordering. (Currently inline above; kept for future batching.)
-func mergeByTime(blocks []*webm.Block) {
+func mergeByTime(blocks []*InputBlock) {
 	sort.SliceStable(blocks, func(i, j int) bool {
 		return blocks[i].AbsTimecode() < blocks[j].AbsTimecode()
 	})
 }
-
-// Ensure time import is used (referenced via blk.Duration()).
-var _ = time.Millisecond

@@ -37,6 +37,40 @@ type Header struct {
 	FirstClusterOff int64
 }
 
+// DocType values selectable for the EBML header.
+const (
+	DocTypeWebM     = "webm"
+	DocTypeMatroska = "matroska"
+)
+
+// WriteEBMLHeaderFor writes the EBML header element with the requested doctype.
+// doctype is "webm" for WebM or "matroska" for MKV. doctypeVersion 4 / readVer 2
+// are used for both (WebM current; Matroska read-version 2 is broadly compatible).
+func WriteEBMLHeaderFor(w io.Writer, doctype string) error {
+	var buf trackedBuf
+	if err := writeUint(&buf, idEBMLVersion, 1); err != nil {
+		return err
+	}
+	if err := writeUint(&buf, idEBMLReadVersion, 1); err != nil {
+		return err
+	}
+	if err := writeUint(&buf, idEBMLMaxIDLength, 4); err != nil {
+		return err
+	}
+	if err := writeUint(&buf, idEBMLMaxSizeLen, 8); err != nil {
+		return err
+	}
+	if err := writeString(&buf, idDocType, doctype); err != nil {
+		return err
+	}
+	if err := writeUint(&buf, idDocTypeVersion, 4); err != nil {
+		return err
+	}
+	if err := writeUint(&buf, idDocTypeReadVer, 2); err != nil {
+		return err
+	}
+	return writeElement(w, idEBML, buf.Bytes())
+}
 // WriteEBMLHeader writes the EBML header element (id 0x1A45DFA3) wrapping
 // the WebM doctype declaration. The children are buffered so the master
 // element can be written with a known size up front.

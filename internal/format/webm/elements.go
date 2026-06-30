@@ -58,7 +58,11 @@ const (
 	codecIDVP8  = "V_VP8"
 	codecIDVP9  = "V_VP9"
 	codecIDAV1  = "V_AV1"
-	codecIDOpus = "A_OPUS"
+	codecIDOpus   = "A_OPUS"
+	codecIDVorbis = "A_VORBIS"
+	codecIDFLAC   = "A_FLAC"
+	codecIDH264   = "V_MPEG4/ISO/AVC"
+	codecIDHEVC   = "V_MPEGH/ISO/SHEVC"
 )
 
 // TrackType values (Matroska spec).

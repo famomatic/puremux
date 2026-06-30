@@ -33,6 +33,10 @@ type Config struct {
 	TimecodeScale uint64
 	// Preprocessor config bounds the jitter buffer (ARCHITECTURE.md §5.B).
 	Preprocessor preprocessor.Config
+	// OutputContainer selects the EBML doctype written by the session. Zero
+	// defaults to WebM for backward compatibility. Set to ContainerMKV to
+	// emit a Matroska container (codec superset of WebM).
+	OutputContainer Container
 }
 
 // DefaultConfig returns a real-time-friendly configuration.
@@ -40,6 +44,7 @@ func DefaultConfig() Config {
 	return Config{
 		TimecodeScale: 1_000_000,
 		Preprocessor:  preprocessor.DefaultConfig(),
+		OutputContainer: ContainerWebM,
 	}
 }
 
@@ -91,6 +96,13 @@ func NewSession(w io.Writer, cfg Config) (*Session, error) {
 // AddTrack registers a media track. Returns the assigned track number (1-based)
 // to use in Packet.TrackID. Must be called before the first WritePacket.
 func (s *Session) AddTrack(t Track) (int, error) {
+	out := s.cfg.OutputContainer
+	if out == ContainerUnknown {
+		out = ContainerWebM
+	}
+	if !codecAllowed(out, t.Codec) {
+		return 0, errUnsupportedCodec
+	}
 	num := len(s.tracks) + 1
 	spec := webm.TrackSpec{
 		Number:       uint64(num),
@@ -209,7 +221,11 @@ func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 
 // writeHeader writes the EBML header, Segment, Info, and Tracks.
 func (s *Session) writeHeader() error {
-	if err := webm.WriteEBMLHeader(s.ws); err != nil {
+	doctype := webm.DocTypeWebM
+	if s.cfg.OutputContainer == ContainerMKV {
+		doctype = webm.DocTypeMatroska
+	}
+	if err := webm.WriteEBMLHeaderFor(s.ws, doctype); err != nil {
 		return err
 	}
 	h, err := webm.BeginSegment(s.ws, s.ws.seekable)
@@ -307,7 +323,8 @@ func (sw *seekWriter) Seek(offset int64, whence int) (int64, error) {
 func (sw *seekWriter) offset() int64 { return sw.off }
 
 var (
-	errUnknownTrack = errPtr("unknown track")
+	errUnknownTrack    = errPtr("unknown track")
+	errUnsupportedCodec = errPtr("codec not permitted in output container")
 	errNotSeekable  = errPtr("writer is not seekable")
 )
 

@@ -11,6 +11,20 @@ const (
 	CodecVP9
 	CodecAV1
 	CodecOpus
+	// Audio-only codecs supported by the WebM/Matroska containers. These
+	// carry no keyframe concept and use the no-op detector (ARCHITECTURE.md
+	// section 4). Vorbis is the legacy WebM audio codec; FLAC is a Matroska
+	// (MKV) lossless codec not permitted in WebM.
+	CodecVorbis
+	CodecFLAC
+	// CodecAAC is read-only: MP4 input may carry AAC audio. puremux never
+	// writes AAC (no MP4 writer; AAC is not a WebM/MKV-pure codec we mux).
+	CodecAAC
+	// MPEG video codecs. Muxing these is patent-free (muxers do not decode or
+	// implement the codec); they are carried opaque and read/written across
+	// MKV (and MP4 input). VP8-style NAL keyframe detection applies.
+	CodecH264 // H.264/AVC (V_MPEG4/ISO/AVC)
+	CodecHEVC // H.265/HEVC (V_MPEGH/ISO/SHEVC)
 )
 
 // String returns the canonical lowercase codec name used in WebM codec IDs.
@@ -24,6 +38,16 @@ func (c CodecType) String() string {
 		return "av1"
 	case CodecOpus:
 		return "opus"
+	case CodecVorbis:
+		return "vorbis"
+	case CodecFLAC:
+		return "flac"
+	case CodecAAC:
+		return "aac"
+	case CodecH264:
+		return "h264"
+	case CodecHEVC:
+		return "hevc"
 	default:
 		return "unknown"
 	}
@@ -32,7 +56,17 @@ func (c CodecType) String() string {
 // IsVideo reports whether the codec is a video track.
 func (c CodecType) IsVideo() bool {
 	switch c {
-	case CodecVP8, CodecVP9, CodecAV1:
+	case CodecVP8, CodecVP9, CodecAV1, CodecH264, CodecHEVC:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsAudio reports whether the codec is an audio track.
+func (c CodecType) IsAudio() bool {
+	switch c {
+	case CodecOpus, CodecVorbis, CodecFLAC:
 		return true
 	default:
 		return false

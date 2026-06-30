@@ -30,6 +30,14 @@ func codecIDFor(c core.CodecType) string {
 		return codecIDAV1
 	case core.CodecOpus:
 		return codecIDOpus
+	case core.CodecVorbis:
+		return codecIDVorbis
+	case core.CodecFLAC:
+		return codecIDFLAC
+	case core.CodecH264:
+		return codecIDH264
+	case core.CodecHEVC:
+		return codecIDHEVC
 	default:
 		return ""
 	}
