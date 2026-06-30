@@ -1,0 +1,16 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Test binary artifacts
+/puremux
+/cmd/puremux/puremux
+
+# OS
+.DS_Store
+Thumbs.db
