@@ -1,6 +1,7 @@
 package webm
 
 import (
+	"github.com/famomatic/puremux/internal/format/ebml"
 	"io"
 	"time"
 )
@@ -15,6 +16,12 @@ type Header struct {
 	// SegmentStart is the byte offset where the Segment element body begins
 	// (i.e. just after the Segment ID + size VINT).
 	SegmentStart int64
+
+	// InfoStart is the byte offset where the Info element begins (absolute).
+	// Recorded so Close can emit a SeekHead entry pointing at it.
+	InfoStart int64
+	// TracksStart is the byte offset where the Tracks element begins.
+	TracksStart int64
 
 	// SegmentSizeOff is the offset of the Segment's reserved size VINT.
 	// Patched to the real Segment length on Close when seekable.
@@ -75,29 +82,9 @@ func WriteEBMLHeaderFor(w io.Writer, doctype string) error {
 // the WebM doctype declaration. The children are buffered so the master
 // element can be written with a known size up front.
 func WriteEBMLHeader(w io.Writer) error {
-	var buf trackedBuf
-	if err := writeUint(&buf, idEBMLVersion, 1); err != nil {
-		return err
-	}
-	if err := writeUint(&buf, idEBMLReadVersion, 1); err != nil {
-		return err
-	}
-	if err := writeUint(&buf, idEBMLMaxIDLength, 4); err != nil {
-		return err
-	}
-	if err := writeUint(&buf, idEBMLMaxSizeLen, 8); err != nil {
-		return err
-	}
-	if err := writeString(&buf, idDocType, "webm"); err != nil {
-		return err
-	}
-	if err := writeUint(&buf, idDocTypeVersion, 4); err != nil {
-		return err
-	}
-	if err := writeUint(&buf, idDocTypeReadVer, 2); err != nil {
-		return err
-	}
-	return writeElement(w, idEBML, buf.Bytes())
+	// Thin wrapper over WriteEBMLHeaderFor; kept for backward compatibility
+	// with tests and callers that default to the WebM doctype.
+	return WriteEBMLHeaderFor(w, DocTypeWebM)
 }
 
 // BeginSegment writes the Segment element header. For seekable sinks it
@@ -120,7 +107,10 @@ func BeginSegment(ws writeSeeker, seekable bool) (Header, error) {
 		}
 	} else {
 		// unknown-size sentinel (8 bytes).
-		b, _ := encodeUnknownSize(8)
+		b, err := ebml.EncodeVINTUnknown(8)
+		if err != nil {
+			return h, err
+		}
 		if _, err := ws.Write(b); err != nil {
 			return h, err
 		}
@@ -159,19 +149,15 @@ func WriteInfo(ws writeSeeker, h *Header, timecodeScale uint64, now time.Time) e
 		if err := writeSizeWidth(&buf, 8, 1); err != nil { // 8-byte payload size
 			return err
 		}
-		off, _ := ws.Seek(0, io.SeekCurrent)
-		// Account for the Info element header we have not yet written.
-		// We write the whole Info element atomically below, so the duration
-		// payload offset = current ws pos + Info header + buf-so-far.
-		// To keep it simple, flush buf as the Info element first, then patch
-		// by re-seeking. Instead, we record the offset after writing.
-		_ = off
-		// Write 8 zero bytes as the float placeholder.
+		// Write 8 zero bytes as the float placeholder; the payload offset is
+		// resolved after the Info element header is written below.
 		if _, err := buf.Write(make([]byte, 8)); err != nil {
 			return err
 		}
 		h.HasDuration = true
 	}
+	// Record the Info element start (absolute) before writing its header.
+	h.InfoStart, _ = ws.Seek(0, io.SeekCurrent)
 	// Write Info element: id + size + buf bytes.
 	if err := writeID(ws, idInfo); err != nil {
 		return err
@@ -194,22 +180,6 @@ func WriteInfo(ws writeSeeker, h *Header, timecodeScale uint64, now time.Time) e
 
 // matroskaEpoch is the Matroska/EBML date origin: 2001-01-01T00:00:00Z.
 var matroskaEpoch = time.Unix(978307200, 0).UTC()
-
-// encodeUnknownSize returns the unknown-size sentinel bytes of a width.
-func encodeUnknownSize(width int) ([]byte, error) {
-	// local import to avoid cycle: re-derive
-	marker := byte(0x80 >> uint(width-1))
-	out := make([]byte, width)
-	out[0] = marker
-	for i := 1; i < width; i++ {
-		out[i] = 0xFF
-	}
-	if width > 1 {
-		// set the byte0 data bits to 1 as well
-		out[0] = marker | byte((1<<uint(8-width))-1)
-	}
-	return out, nil
-}
 
 // trackedBuf is a bytes.Buffer-like that tracks written length.
 type trackedBuf struct {

@@ -68,7 +68,8 @@ type Session struct {
 	lastTcMs   uint64 // absolute ms of the last written packet (for duration)
 	maxRelTc   int64  // max relative timecode used in current cluster (ms)
 	cues       []webm.CuePoint
-	segmentTc0 time.Duration // first packet DTS, for duration calc
+	segmentTc0 time.Duration // first emitted packet DTS; cue timecodes are relative to this
+	segTc0Set  bool          // true once segmentTc0 has been captured from the first emitted packet
 	started    bool
 	closed     bool
 }
@@ -122,7 +123,9 @@ func (s *Session) AddTrack(t Track) (int, error) {
 	// Wire preprocessors for this track.
 	s.enforcers[num] = preprocessor.NewEnforcer(s.cfg.Preprocessor)
 	det := s.detectors.Detector(t.Codec)
-	s.aligners[num] = preprocessor.NewAligner(det, t.IsVideo)
+	// Audio tracks default to expecting a video sync; writeHeader re-evaluates
+	// once all tracks are known and clears the flag for audio-only sessions.
+	s.aligners[num] = preprocessor.NewAlignerForSession(det, t.IsVideo, !t.IsVideo)
 	return num, nil
 }
 
@@ -176,6 +179,12 @@ func (s *Session) WritePacket(p *core.Packet) error {
 			if err := s.writeBlock(trackNum, ap); err != nil {
 				return err
 			}
+			// writeBlock copies the payload into the container synchronously,
+			// so the pool-acquired packet is now safe to return. The Aligner
+			// already released any packet it dropped, and an emitted packet is
+			// the same pointer as pp (or a held one released below), so we
+			// release exactly once here per emitted packet.
+			core.ReleasePacket(ap)
 		}
 	}
 	return nil
@@ -184,13 +193,20 @@ func (s *Session) WritePacket(p *core.Packet) error {
 // writeBlock serializes a corrected packet into a Cluster/SimpleBlock.
 func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 	absMs := uint64(p.DTS / time.Millisecond)
-	if !s.started {
+	// Capture the segment origin from the first packet actually written.
+	// writeHeader runs before this (s.started is already true), so the old
+	// "if !s.started" branch here was dead code and segmentTc0 stayed 0.
+	if !s.segTc0Set {
 		s.segmentTc0 = p.DTS
+		s.segTc0Set = true
 	}
 
 	// Open a new cluster if none or if relative timecode would overflow int16.
 	segStartMs := uint64(s.segmentTc0 / time.Millisecond)
-	if s.cluster == nil || int64(absMs)-int64(s.clusterTc) > 30000 {
+	// Use signed int64 math: absMs may precede clusterTc after Enforcer
+	// reordering, and a uint64 subtraction would underflow.
+	relFromCluster := int64(absMs) - int64(s.clusterTc)
+	if s.cluster == nil || relFromCluster > 30000 || relFromCluster < -32768 {
 		if s.cluster != nil {
 			if err := s.cluster.Close(); err != nil {
 				return err
@@ -213,7 +229,7 @@ func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 		}
 	}
 
-	relTc := int16(absMs - s.clusterTc)
+	relTc := int16(relFromCluster)
 	s.lastTcMs = absMs
 	spec := s.tracks[s.trackByID[trackNum]]
 	return s.cluster.WriteSimpleBlock(spec.Number, relTc, p.IsKeyframe, p.Data)
@@ -236,10 +252,28 @@ func (s *Session) writeHeader() error {
 	if err := webm.WriteInfo(s.ws, &s.header, s.cfg.TimecodeScale, time.Now()); err != nil {
 		return err
 	}
+	s.header.TracksStart = int64(s.ws.offset())
 	if _, err := webm.WriteTracks(s.ws, s.tracks); err != nil {
 		return err
 	}
 	s.header.TracksEnd = int64(s.ws.offset())
+	// Now that all tracks are registered, decide whether audio aligners should
+	// hold for a video sync start. An audio-only session has no video track,
+	// so holding would never resolve. The first packet has not been processed
+	// yet (writeHeader runs before the pipeline), so pending queues are empty.
+	hasVideo := false
+	for _, spec := range s.tracks {
+		if spec.IsVideo {
+			hasVideo = true
+			break
+		}
+	}
+	if !hasVideo {
+		noemit := func(*core.Packet) {}
+		for _, al := range s.aligners {
+			al.SetExpectsVideoSync(false, noemit)
+		}
+	}
 	return nil
 }
 
@@ -277,6 +311,16 @@ func (s *Session) Close() error {
 		}
 		cuesPos = cp - int64(s.header.SegmentStart)
 	}
+	// SeekHead (seekable only): points at Info, Tracks, and Cues so players
+	// can locate them without scanning. ARCHITECTURE.md §5.C requires this;
+	// it was previously omitted despite the doc comment claiming it.
+	if s.ws.seekable {
+		infoPos := s.header.InfoStart - int64(s.header.SegmentStart)
+		tracksPos := s.header.TracksStart - int64(s.header.SegmentStart)
+		if err := webm.WriteSeekHead(s.ws, infoPos, tracksPos, cuesPos); err != nil {
+			return err
+		}
+	}
 	// Segment size patch (seekable only).
 	if s.ws.seekable {
 		end := s.ws.offset()
@@ -285,7 +329,6 @@ func (s *Session) Close() error {
 			return err
 		}
 	}
-	_ = cuesPos
 	return nil
 }
 

@@ -159,17 +159,13 @@ func scanAnnexBNALs(data []byte, headerBytes int, check func([]byte) bool) bool 
 // startCodeLenAt returns 3 or 4 if a start code (0x000001 / 0x00000001) begins
 // at i, else 0.
 func startCodeLenAt(data []byte, i int) int {
-	if i+3 <= len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
-		if i+4 <= len(data) && data[i+3] == 0 {
-			// 0x00000001 is also matched as a 4-byte start code, but the 3-byte
-			// form (0x000001) is a strict prefix; treat the leading zero as part
-			// of the run. We return 4 to consume the full 0x00000001.
-			return 3 // 3-byte 0x000001 already found; the extra 0x00 was consumed above
-		}
-		return 3
-	}
+	// Check the 4-byte form (0x00000001) first so it consumes the full
+	// leading zero run; otherwise the 3-byte form (0x000001) follows.
 	if i+4 <= len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
 		return 4
+	}
+	if i+3 <= len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+		return 3
 	}
 	return 0
 }

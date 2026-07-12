@@ -13,8 +13,10 @@ type Config struct {
 	// not been hit. Zero disables the duration limit.
 	MaxBufferDuration uint64
 	// InterpolationGapThreshold is the largest timestamp gap (in
-	// nanoseconds) the Enforcer will synthesize across. Larger gaps are
-	// left as discontinuities. Zero disables interpolation.
+	// nanoseconds) the Enforcer classifies as a detectable discontinuity.
+	// Gaps at or below this threshold are counted in DetectedGaps and
+	// emitted as-is (no synthetic packets are fabricated). Larger gaps are
+	// left as discontinuities without counting. Zero disables gap detection.
 	InterpolationGapThreshold uint64
 }
 
@@ -32,7 +34,12 @@ func DefaultConfig() Config {
 type Metrics struct {
 	DroppedOverflow    uint64 // packets dropped due to buffer overflow
 	DroppedOutOfOrder  uint64 // packets dropped as too-late out-of-order
-	InterpolatedGaps   uint64 // gaps synthesized by the Enforcer
+	// DetectedGaps counts timestamp gaps within the interpolatable range.
+	// The Enforcer does NOT synthesize replacement packets (no decoder, no
+	// sample counts); it only records that a gap was seen so callers can
+	// detect the discontinuity. The former name InterpolatedGaps was
+	// misleading because no interpolation actually occurs.
+	DetectedGaps uint64
 	AudioPacketsDropped uint64 // whole audio packets dropped by the Aligner
 	AudioPacketsDuped  uint64  // whole audio packets duplicated by the Aligner
 }

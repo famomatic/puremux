@@ -228,19 +228,11 @@ func (rd *Reader) readChildHeader() (ebml.Header, error) {
 	if err != nil {
 		return ebml.Header{}, err
 	}
-	// ReadHeader consumed ID bytes + size VINT bytes. Track both.
-	idWidth := ebml.VINTWidth(0)
-	// Determine ID width from the ID value (class 1..4).
-	switch {
-	case h.ID >= 0x81 && h.ID <= 0xFF:
-		idWidth = 1
-	case h.ID >= 0x4000 && h.ID <= 0x7FFF:
-		idWidth = 2
-	case h.ID >= 0x200000 && h.ID <= 0x3FFFFF:
-		idWidth = 3
-	case h.ID >= 0x10000000 && h.ID <= 0x1FFFFFFF:
-		idWidth = 4
-	}
+	// ReadHeader consumed ID bytes + size VINT bytes. Track both by deriving
+	// the ID width from the decoded ID value (the previous code called
+	// ebml.VINTWidth(0), a no-op that always returned 0, so pos tracking
+	// only worked because the switch overwrote it afterward).
+	idWidth := ebml.ElementIDWidth(h.ID)
 	rd.pos += int64(idWidth) + int64(h.SizeWidth)
 	return h, nil
 }

@@ -83,3 +83,39 @@ func TestNewReaderCorruptIsCorruptOrEOF(t *testing.T) {
 		// Accept any of the documented error types.
 	}
 }
+
+// TestReaderMoreSamplesThanChunks verifies that a track whose stts/stsz
+// declare more samples than the stco chunk table can hold stops cleanly
+// (EOF) instead of reading from a bogus recycled offset.
+func TestReaderMoreSamplesThanChunks(t *testing.T) {
+	// 3 samples declared in stts/stsz, but only 1 chunk in stco holding
+	// 1 sample per chunk (stsc). After the first sample, the chunk cursor
+	// is exhausted and chunkIdx+1 >= len(stco); the reader must yield EOF
+	// rather than fabricate an offset.
+	sizes := []uint32{4, 4, 4}
+	stts := []sttsEntry{{count: 3, delta: 33}}
+	stsc := []stscEntry{{firstChunk: 1, samplesPerChunk: 1}}
+	stss := []uint32{1}
+	mdatPayload := []byte{0xAA, 0xAA, 0xAA, 0xAA}
+	trak := buildTrak("vp09", 1000, stts, sizes, stsc, []uint32{0}, stss)
+	data, mdatPayloadOff := buildMP4([][]byte{trak}, mdatPayload)
+	trak = buildTrak("vp09", 1000, stts, sizes, stsc, []uint32{uint32(mdatPayloadOff)}, stss)
+	data, _ = buildMP4([][]byte{trak}, mdatPayload)
+
+	rd, err := NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	// First sample is fine (chunk 0 covers it).
+	s1, err := rd.NextSample()
+	if err != nil {
+		t.Fatalf("NextSample 1: %v", err)
+	}
+	if !bytes.Equal(s1.Data, mdatPayload) {
+		t.Errorf("s1 data = %v want %v", s1.Data, mdatPayload)
+	}
+	// No more chunks: the reader must return EOF, not panic or read garbage.
+	if _, err := rd.NextSample(); err != io.EOF {
+		t.Errorf("expected EOF after chunk table exhausted, got %v", err)
+	}
+}

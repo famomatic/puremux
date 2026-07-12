@@ -75,6 +75,29 @@ func TestVP9Detector(t *testing.T) {
 	}
 }
 
+// TestVP9DetectorProfile3 verifies the detector handles profile 3, which
+// inserts an extra reserved_zero bit between profile_high_bit and
+// show_existing_frame, shifting frame_type by one bit position.
+func TestVP9DetectorProfile3(t *testing.T) {
+	d := vp9Detector{}
+	// profile 3: profile_low=1, profile_high=1 => profile bits = 0b11.
+	// Bit layout (LSB-first): [1:0]=10(marker), [2]=1(profLow),
+	// [3]=1(profHigh), [4]=0(reserved for profile 3),
+	// [5]=0(show_existing_frame), [6]=0(frame_type=KEY) => 0b00001110 = 0x0E.
+	if !d.IsKeyframe([]byte{0x0E}) {
+		t.Error("profile 3 KEY_FRAME (0x0E) should be keyframe")
+	}
+	// profile 3 INTER: frame_type=1 at bit 6 => 0b01001110 = 0x4E.
+	if d.IsKeyframe([]byte{0x4E}) {
+		t.Error("profile 3 INTER (0x4E) should not be keyframe")
+	}
+	// profile 3 with show_existing_frame=1 at bit 5 => 0b00101110 = 0x2E.
+	// show_existing_frame references a prior frame, not a sync frame.
+	if d.IsKeyframe([]byte{0x2E}) {
+		t.Error("profile 3 show_existing_frame (0x2E) should not be keyframe")
+	}
+}
+
 // AV1 OBU header byte builder (MSB-first, has_size=1, no extension).
 func obuHeader(obuType int) byte {
 	return byte((0 << 7) | (obuType << 3) | (0 << 2) | (1 << 1) | (0 << 0))

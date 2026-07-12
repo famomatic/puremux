@@ -18,15 +18,54 @@ import (
 type Aligner struct {
 	detector core.CodecKeyframeDetector
 	video    bool
-	syncStart time.Duration // DTS of the first accepted keyframe
-	started   bool
-	metrics   Metrics
+	syncStart        time.Duration // DTS of the first accepted keyframe
+	started          bool
+	// expectsVideoSync is true for audio tracks in a session that also has a
+	// video track. Such audio is held until SetVideoSyncStart arrives, so
+	// packets before the video sync point are dropped instead of leaking out.
+	expectsVideoSync bool
+	// pending holds audio packets that arrived before the video sync start
+	// was locked. Bounded by maxPending; overflow drops the oldest.
+	pending    []*core.Packet
+	maxPending int
+	metrics    Metrics
 }
 
 // NewAligner builds an Aligner for a track of the given kind. video tracks
 // require a non-nil detector; audio tracks pass a noop detector.
 func NewAligner(detector core.CodecKeyframeDetector, isVideo bool) *Aligner {
 	return &Aligner{detector: detector, video: isVideo}
+}
+
+// NewAlignerForSession builds an Aligner that knows whether the session also
+// contains a video track. When expectsVideoSync is true, audio packets are
+// held in a bounded pending queue until SetVideoSyncStart arrives rather than
+// being emitted before the video sync point. maxPending bounds the queue; a
+// value <= 0 defaults to 64.
+func NewAlignerForSession(detector core.CodecKeyframeDetector, isVideo, expectsVideoSync bool) *Aligner {
+	a := NewAligner(detector, isVideo)
+	a.expectsVideoSync = expectsVideoSync
+	a.maxPending = 64
+	if a.maxPending <= 0 {
+		a.maxPending = 64
+	}
+	return a
+}
+
+// SetExpectsVideoSync configures whether this audio aligner should hold
+// packets until the video sync start arrives. The session sets this to false
+// for audio-only streams once all tracks are registered, so audio is not held
+// indefinitely. If switched from true to false, any held pending packets are
+// flushed via emit.
+func (a *Aligner) SetExpectsVideoSync(expect bool, emit func(*core.Packet)) {
+	if a.video {
+		return // video aligners are unaffected
+	}
+	if a.expectsVideoSync && !expect {
+		// No video sync will arrive; release held packets in order.
+		a.drainPendingPassthrough(emit)
+	}
+	a.expectsVideoSync = expect
 }
 
 // Process applies alignment rules to inbound.
@@ -66,11 +105,25 @@ func (a *Aligner) processVideo(inbound *core.Packet, emit func(*core.Packet)) er
 
 func (a *Aligner) processAudio(inbound *core.Packet, emit func(*core.Packet)) error {
 	if !a.started {
-		// Audio alignment waits for the video sync start to be set.
-		// If unset, pass through (audio-only stream).
+		if a.expectsVideoSync {
+			// Hold this packet until the video sync start arrives. Bounded
+			// so a missing keyframe cannot grow the queue unboundedly.
+			a.pending = append(a.pending, inbound)
+			if len(a.pending) > a.maxPending {
+				dropped := a.pending[0]
+				copy(a.pending, a.pending[1:])
+				a.pending[len(a.pending)-1] = nil
+				a.pending = a.pending[:len(a.pending)-1]
+				a.metrics.AudioPacketsDropped++
+				core.ReleasePacket(dropped)
+			}
+			return nil
+		}
+		// Audio-only stream: no video sync to wait for, pass through.
 		emit(inbound)
 		return nil
 	}
+	a.drainPending(emit)
 	// Packet-granular drop only: drop whole packets before syncStart.
 	// We MUST NOT trim within a packet (§5.B).
 	if inbound.DTS < a.syncStart {
@@ -80,6 +133,36 @@ func (a *Aligner) processAudio(inbound *core.Packet, emit func(*core.Packet)) er
 	}
 	emit(inbound)
 	return nil
+}
+
+// drainPending emits or drops the held audio packets relative to syncStart.
+func (a *Aligner) drainPending(emit func(*core.Packet)) {
+	for _, p := range a.pending {
+		if p.DTS < a.syncStart {
+			a.metrics.AudioPacketsDropped++
+			core.ReleasePacket(p)
+			continue
+		}
+		emit(p)
+	}
+	// Clear references so the packets are not retained by the backing array.
+	for i := range a.pending {
+		a.pending[i] = nil
+	}
+	a.pending = a.pending[:0]
+}
+
+// drainPendingPassthrough releases held packets without sync filtering, used
+// when the session turns out to be audio-only.
+func (a *Aligner) drainPendingPassthrough(emit func(*core.Packet)) {
+	for _, p := range a.pending {
+		emit(p)
+	}
+	for i := range a.pending {
+		a.pending[i] = nil
+	}
+	a.pending = a.pending[:0]
+	a.started = true // mark started so audio passes through directly now
 }
 
 // SetVideoSyncStart propagates the video keyframe DTS so the audio aligner
@@ -95,6 +178,10 @@ func (a *Aligner) Metrics() Metrics { return a.metrics }
 
 // Reset clears all internal state for reuse on a fresh stream.
 func (a *Aligner) Reset() {
+	for _, p := range a.pending {
+		core.ReleasePacket(p)
+	}
+	a.pending = a.pending[:0]
 	a.started = false
 	a.syncStart = 0
 	a.metrics = Metrics{}

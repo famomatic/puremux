@@ -90,6 +90,12 @@ func (t *trackState) peekNext() bool {
 		t.chunkOff = int64(t.stco[t.chunkIdx])
 		t.chunkSampleLeft = samplesPerChunkFor(t.stsc, uint32(t.chunkIdx+1))
 	}
+	// If the chunk cursor is exhausted but samples remain, the sample table is
+	// inconsistent (more samples than chunk slots). Stop rather than reading
+	// from a bogus offset (the old code reused the last chunk's tail offset).
+	if t.chunkSampleLeft == 0 && t.chunkIdx+1 >= len(t.stco) {
+		return false
+	}
 	off := t.chunkOff
 
 	// Keyframe: stss lists 1-based sync sample numbers. Advance the stss

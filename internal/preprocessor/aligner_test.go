@@ -137,3 +137,70 @@ func TestAlignerReset(t *testing.T) {
 		t.Error("Reset should clear metrics")
 	}
 }
+
+// TestAlignerAudioHoldsUntilVideoSync verifies that an audio aligner built
+// with expectsVideoSync=true holds packets until SetVideoSyncStart arrives,
+// then drops those before the sync point and emits those at/after it.
+func TestAlignerAudioHoldsUntilVideoSync(t *testing.T) {
+	a := NewAlignerForSession(fakeDetector{}, false, true)
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+
+	// Audio before the video sync start: must be held, not emitted yet.
+	early := core.AcquirePacket()
+	early.DTS = 10 * time.Millisecond
+	early.Data = []byte{0x01}
+	a.Process(early, emit)
+	if len(got) != 0 {
+		t.Fatalf("audio before sync should be held, got %d emitted", len(got))
+	}
+
+	// Lock the video sync start at 50ms.
+	a.SetVideoSyncStart(50 * time.Millisecond)
+
+	// Audio at/after sync: emitted.
+	onTime := core.AcquirePacket()
+	onTime.DTS = 50 * time.Millisecond
+	onTime.Data = []byte{0x02}
+	a.Process(onTime, emit)
+
+	// The held early packet (10ms < 50ms) must have been dropped, and the
+	// on-time packet emitted: exactly one packet in got.
+	if len(got) != 1 {
+		t.Fatalf("after sync, want 1 emitted (on-time), got %d", len(got))
+	}
+	if string(got[0].Data) != "\x02" {
+		t.Error("emitted packet was not the on-time packet")
+	}
+	if a.Metrics().AudioPacketsDropped != 1 {
+		t.Errorf("want 1 dropped (the held early packet), got %d", a.Metrics().AudioPacketsDropped)
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}
+
+// TestAlignerAudioOnlySessionFlushesPending verifies that an audio-only
+// session (no video track) does not hold packets indefinitely: SetExpectsVideoSync
+// releases the held packets once the session determines it has no video.
+func TestAlignerAudioOnlySessionFlushesPending(t *testing.T) {
+	a := NewAlignerForSession(fakeDetector{}, false, true)
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+
+	p1 := core.AcquirePacket()
+	p1.DTS = 10 * time.Millisecond
+	a.Process(p1, emit)
+	if len(got) != 0 {
+		t.Fatal("held packet should not be emitted before decision")
+	}
+
+	// Session resolves to audio-only: flip the flag and flush.
+	a.SetExpectsVideoSync(false, emit)
+	if len(got) != 1 {
+		t.Fatalf("audio-only should flush held packet, got %d", len(got))
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}

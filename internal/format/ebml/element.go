@@ -69,6 +69,24 @@ func DecodeElementID(src []byte) (id uint32, width int, err error) {
 	return v, w, nil
 }
 
+// ElementIDWidth returns the encoded width (1..4) of a decoded Element ID,
+// derived from the class marker bit position. Returns 0 for an ID that does
+// not fall in any valid EBML class range.
+func ElementIDWidth(id uint32) int {
+	switch {
+	case id >= 0x81 && id <= 0xFF:
+		return 1
+	case id >= 0x4000 && id <= 0x7FFF:
+		return 2
+	case id >= 0x200000 && id <= 0x3FFFFF:
+		return 3
+	case id >= 0x10000000 && id <= 0x1FFFFFFF:
+		return 4
+	default:
+		return 0
+	}
+}
+
 // Element is a typed EBML element: ID + size + payload bytes.
 type Element struct {
 	ID      uint32

@@ -67,7 +67,12 @@ func (e *Enforcer) insertOrdered(p *core.Packet) {
 	// Enforce size bound: if over capacity, drop the oldest (index 0).
 	if len(e.buf) > e.cfg.MaxBufferSize {
 		dropped := e.buf[0]
-		e.buf = e.buf[1:]
+		// Shift the remaining packets forward and clear the vacated tail so
+		// the dropped pointer does not linger in the backing array (the old
+		// e.buf = e.buf[1:] form left it referenced until a reallocation).
+		copy(e.buf, e.buf[1:])
+		e.buf[len(e.buf)-1] = nil
+		e.buf = e.buf[:len(e.buf)-1]
 		e.metrics.DroppedOverflow++
 		core.ReleasePacket(dropped)
 	}
@@ -93,7 +98,13 @@ func (e *Enforcer) flushReady(emit func(*core.Packet)) {
 		e.emitOne(p, emit)
 		i++
 	}
-	e.buf = e.buf[i:]
+	// Compact the buffer so emitted pointers do not linger in the backing
+	// array (the old e.buf = e.buf[i:] form kept them referenced).
+	copy(e.buf, e.buf[i:])
+	for j := len(e.buf) - i; j < len(e.buf); j++ {
+		e.buf[j] = nil
+	}
+	e.buf = e.buf[:len(e.buf)-i]
 }
 
 // Flush emits all remaining buffered packets. The facade calls this after
@@ -112,7 +123,7 @@ func (e *Enforcer) emitOne(p *core.Packet, emit func(*core.Packet)) {
 		// Synthesize across small gaps only; leave large gaps as discontinuities.
 		gapThreshold := time.Duration(e.cfg.InterpolationGapThreshold)
 		if gapThreshold > 0 && gap > 0 && gap <= gapThreshold && gap >= time.Millisecond {
-			e.metrics.InterpolatedGaps++
+			e.metrics.DetectedGaps++
 			// We do not fabricate synthetic packets (no decoder, no sample
 			// counts); we just note the gap was within the interpolatable
 			// range and emit the real packet. The gap metric lets callers

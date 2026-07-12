@@ -1,6 +1,7 @@
 package webm
 
 import (
+	"github.com/famomatic/puremux/internal/format/ebml"
 	"io"
 )
 
@@ -45,7 +46,10 @@ func BeginCluster(ws writeSeeker, seekable bool, absTimecodeMs uint64) (*Cluster
 		cw.sizeWidth = 4
 	} else {
 		// unknown-size sentinel width 4.
-		b, _ := encodeUnknownSize(4)
+		b, err := ebml.EncodeVINTUnknown(4)
+		if err != nil {
+			return nil, err
+		}
 		if _, err := ws.Write(b); err != nil {
 			return nil, err
 		}

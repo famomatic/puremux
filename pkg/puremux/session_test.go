@@ -150,3 +150,48 @@ func TestSessionCloseIdempotent(t *testing.T) {
 		t.Errorf("double close should be safe, got %v", err)
 	}
 }
+
+// TestSessionSeekHeadWritten verifies that seekable output contains a
+// SeekHead element pointing at Info, Tracks, and Cues (ARCHITECTURE.md §5.C).
+// This was previously omitted despite Close() claiming to write it.
+func TestSessionSeekHeadWritten(t *testing.T) {
+	var buf seekBuf
+	cfg := DefaultConfig()
+	s, _ := NewSession(&buf, cfg)
+	s.AddTrack(Track{Codec: core.CodecVP9, IsVideo: true, Width: 320, Height: 240})
+	s.WritePacket(&core.Packet{TrackID: 1, DTS: 0, PTS: 0, IsKeyframe: true, Codec: core.CodecVP9, Data: []byte{0xAA}})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.Bytes()
+	// SeekHead element ID is 0x114D9B74 (4 bytes: 11 4D 9B 74).
+	if !bytes.Contains(out, []byte{0x11, 0x4D, 0x9B, 0x74}) {
+		t.Error("seekable output should contain a SeekHead element")
+	}
+	// Cues element ID is 0x1C53BB6B.
+	if !bytes.Contains(out, []byte{0x1C, 0x53, 0xBB, 0x6B}) {
+		t.Error("seekable output should contain a Cues element")
+	}
+}
+
+// TestSessionSegmentTc0NonZeroStart verifies cue timecodes are relative to
+// the first packet's DTS (segmentTc0), not absolute. Previously segmentTc0
+// was never set (dead code) so cues carried absolute timecodes.
+func TestSessionSegmentTc0NonZeroStart(t *testing.T) {
+	var buf seekBuf
+	cfg := DefaultConfig()
+	s, _ := NewSession(&buf, cfg)
+	s.AddTrack(Track{Codec: core.CodecVP9, IsVideo: true, Width: 320, Height: 240})
+	// First packet at DTS=1000ms (non-zero segment start).
+	s.WritePacket(&core.Packet{
+		TrackID: 1, DTS: 1000 * time.Millisecond, PTS: 1000 * time.Millisecond,
+		IsKeyframe: true, Codec: core.CodecVP9, Data: []byte{0xAA},
+	})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// segmentTc0 must be captured from the first packet, not left at 0.
+	if !s.segTc0Set || s.segmentTc0 != 1000*time.Millisecond {
+		t.Errorf("segmentTc0 = %v (set=%v), want 1s", s.segmentTc0, s.segTc0Set)
+	}
+}
