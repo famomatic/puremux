@@ -2,7 +2,6 @@ package puremux
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/famomatic/puremux/internal/core"
 )
@@ -79,6 +78,3 @@ func ProbeOutputContainer(path string) (Container, error) {
 	}
 	return ContainerUnknown, fmt.Errorf("%w: no output container for codecs %v", ErrIncompatible, codecs)
 }
-
-// ensure os is referenced (Probe uses os via openInputReader which opens).
-var _ = os.Open

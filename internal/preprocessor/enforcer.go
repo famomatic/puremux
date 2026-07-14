@@ -112,6 +112,7 @@ func (e *Enforcer) flushReady(emit func(*core.Packet)) {
 func (e *Enforcer) Flush(emit func(*core.Packet)) {
 	for i := 0; i < len(e.buf); i++ {
 		e.emitOne(e.buf[i], emit)
+		e.buf[i] = nil // don't retain emitted (now caller-owned) pointers
 	}
 	e.buf = e.buf[:0]
 }
@@ -144,8 +145,9 @@ func (e *Enforcer) Metrics() Metrics { return e.metrics }
 
 // Reset clears all internal state for reuse on a fresh stream.
 func (e *Enforcer) Reset() {
-	for _, p := range e.buf {
+	for i, p := range e.buf {
 		core.ReleasePacket(p)
+		e.buf[i] = nil
 	}
 	e.buf = e.buf[:0]
 	e.metrics = Metrics{}

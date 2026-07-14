@@ -133,7 +133,10 @@ func scanAnnexBNALs(data []byte, headerBytes int, check func([]byte) bool) bool 
 		scLen := startCodeLenAt(data, i)
 		if scLen == 0 {
 			// Advance to the next zero byte that could begin a start code.
-			next := nextZeroRun(data, i)
+			// Search from i+1: when data[i] is itself 0x00 but not the start of
+			// a start code, nextZeroRun(data, i) would return i unchanged and
+			// spin forever. Starting at i+1 guarantees forward progress.
+			next := nextZeroRun(data, i+1)
 			if next < 0 {
 				break
 			}

@@ -19,9 +19,7 @@ type Reader struct {
 	r        io.Reader
 	tracks   []ReadTrack
 	pos      int64
-	segmentEnd int64 // -1 if unknown size
 	pending  []*Block // blocks read from current cluster, awaiting yield
-	curClusterEnd int64
 }
 
 // ReadTrack is a track parsed from the input WebM's Tracks element.
@@ -47,7 +45,7 @@ type Block struct {
 
 // NewReader wraps a WebM input stream.
 func NewReader(r io.Reader) (*Reader, error) {
-	rd := &Reader{r: r, segmentEnd: -1}
+	rd := &Reader{r: r}
 	if err := rd.parseHeader(); err != nil {
 		return nil, err
 	}
@@ -182,19 +180,38 @@ func (rd *Reader) parseBlockGroup(ch ebml.Header, clusterTC uint64) (*Block, err
 	return nil, nil
 }
 
-// parseSimpleBlock reads a SimpleBlock payload and decodes its header.
-func (rd *Reader) parseSimpleBlock(ch ebml.Header, clusterTC uint64) (*Block, error) {
-	payload := make([]byte, ch.Size)
-	if _, err := io.ReadFull(rd.r, payload); err != nil {
+// maxElementSize bounds a single element's payload allocation. Element sizes
+// come straight from the file's size VINT; a corrupt size (up to 2^56) would
+// otherwise make `make([]byte, size)` panic or attempt a huge OOM allocation.
+// No real SimpleBlock/CodecPrivate approaches this bound.
+const maxElementSize = 256 << 20 // 256 MiB
+
+// readElementPayload reads size bytes, guarding against an attacker-controlled
+// size that would panic or OOM the allocation.
+func (rd *Reader) readElementPayload(size uint64) ([]byte, error) {
+	if size > maxElementSize {
+		return nil, errors.New("webm: element size exceeds maximum")
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(rd.r, buf); err != nil {
 		return nil, err
 	}
-	rd.pos += int64(len(payload))
+	rd.pos += int64(len(buf))
+	return buf, nil
+}
+
+// parseSimpleBlock reads a SimpleBlock payload and decodes its header.
+func (rd *Reader) parseSimpleBlock(ch ebml.Header, clusterTC uint64) (*Block, error) {
+	payload, err := rd.readElementPayload(ch.Size)
+	if err != nil {
+		return nil, err
+	}
 	return decodeSimpleBlock(payload, clusterTC)
 }
 
 // decodeSimpleBlock parses the Block header (track VINT + int16 tc + flags).
 func decodeSimpleBlock(payload []byte, clusterTC uint64) (*Block, error) {
-	if len(payload) < 4 {
+	if len(payload) < 1 {
 		return nil, errors.New("webm: SimpleBlock too short")
 	}
 	// Track number VINT (width 1 or 2).
@@ -203,11 +220,24 @@ func decodeSimpleBlock(payload []byte, clusterTC uint64) (*Block, error) {
 	if w == 0 || w > 2 {
 		return nil, errors.New("webm: bad SimpleBlock track VINT")
 	}
+	// A SimpleBlock header is: track VINT (w bytes) + int16 timecode (2) +
+	// flags (1). The old guard hardcoded 4, which is too short for a width-2
+	// track VINT (needs 5) and panicked reading payload[w+2]/payload[w+3:].
+	if len(payload) < w+3 {
+		return nil, errors.New("webm: SimpleBlock too short")
+	}
 	var trackNum int
 	if w == 1 {
 		trackNum = int(b0 & 0x7F)
 	} else {
 		trackNum = int(b0&0x3F)<<8 | int(payload[1])
+	}
+	if flags := payload[w+2]; flags&flagLacing != 0 {
+		// Laced blocks pack multiple frames behind a lace header. We copy
+		// payloads verbatim (opacity invariant) and have no unlacer, so
+		// emitting the raw remainder would corrupt the frames. Reject loudly
+		// rather than silently produce a broken stream.
+		return nil, errors.New("webm: laced SimpleBlock not supported")
 	}
 	tc := int16(uint16(payload[w])<<8 | uint16(payload[w+1]))
 	flags := payload[w+2]
@@ -319,18 +349,16 @@ func (rd *Reader) parseTrackEntry(ch ebml.Header) error {
 			}
 			t.IsVideo = v == 1
 		case idCodecID:
-			buf := make([]byte, cch.Size)
-			if _, err := io.ReadFull(rd.r, buf); err != nil {
+			buf, err := rd.readElementPayload(cch.Size)
+			if err != nil {
 				return err
 			}
-			rd.pos += int64(cch.Size)
 			t.Codec = codecTypeFromString(string(buf))
 		case idCodecPrivate:
-			buf := make([]byte, cch.Size)
-			if _, err := io.ReadFull(rd.r, buf); err != nil {
+			buf, err := rd.readElementPayload(cch.Size)
+			if err != nil {
 				return err
 			}
-			rd.pos += int64(cch.Size)
 			t.CodecPrivate = buf
 		case idVideo:
 			if err := rd.parseVideo(cch, &t); err != nil {
@@ -430,11 +458,6 @@ func codecTypeFromString(s string) core.CodecType {
 		return core.CodecUnknown
 	}
 }
-
-// countingWriter is a no-op Writer used to satisfy io.TeeReader typing.
-type countingWriter struct{}
-
-func (countingWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 // AbsTimecode returns the block's absolute timecode in milliseconds.
 func (b *Block) AbsTimecode() uint64 {

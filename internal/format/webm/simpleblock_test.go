@@ -5,6 +5,27 @@ import (
 	"testing"
 )
 
+// TestDecodeSimpleBlockShortWidth2 is a regression test: a width-2 track VINT
+// needs a 5-byte header (2 + int16 tc + flags), but the old guard only required
+// 4 bytes, so a 4-byte payload indexed out of range and panicked.
+func TestDecodeSimpleBlockShortWidth2(t *testing.T) {
+	// 0x40 => VINT width 2, so the block needs >=5 bytes; give it exactly 4.
+	_, err := decodeSimpleBlock([]byte{0x40, 0x01, 0x00, 0x00}, 0)
+	if err == nil {
+		t.Error("width-2 track VINT with a 4-byte payload should error, not panic")
+	}
+}
+
+// TestDecodeSimpleBlockLacedRejected verifies laced blocks are rejected rather
+// than emitted as corrupt single frames (no unlacer under the opacity rule).
+func TestDecodeSimpleBlockLacedRejected(t *testing.T) {
+	// width-1 track (0x81), tc 0x0000, flags with lacing bit (0x06) set.
+	_, err := decodeSimpleBlock([]byte{0x81, 0x00, 0x00, 0x06, 0xAA}, 0)
+	if err == nil {
+		t.Error("laced SimpleBlock should be rejected")
+	}
+}
+
 func TestEncodeSimpleBlockTrack1Keyframe(t *testing.T) {
 	payload := []byte{0xAA, 0xBB}
 	got := EncodeSimpleBlock(1, 100, true, payload)

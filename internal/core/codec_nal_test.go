@@ -106,6 +106,24 @@ func TestH264MalformedAVCCLength(t *testing.T) {
 	}
 }
 
+// TestH264AnnexBLeadingZeroNoStartCode is a regression test for an infinite
+// loop in scanAnnexBNALs: a leading 0x00 byte that does not begin a start code
+// made nextZeroRun return the same index, spinning forever. The scan must make
+// progress and terminate.
+func TestH264AnnexBLeadingZeroNoStartCode(t *testing.T) {
+	// Byte 0 is 0x00 but 00 05 is not a start code; a real 3-byte start code
+	// (00 00 01) begins at offset 2, followed by an IDR NAL (0x65).
+	p := []byte{0x00, 0x05, 0x00, 0x00, 0x01, 0x65}
+	if !(h264Detector{}).IsKeyframe(p) {
+		t.Error("crafted Annex B with leading non-start-code zero should still find the IDR")
+	}
+	// Same shape but a non-IDR NAL: must terminate and report non-keyframe.
+	p2 := []byte{0x00, 0x05, 0x00, 0x00, 0x01, 0x41}
+	if (h264Detector{}).IsKeyframe(p2) {
+		t.Error("crafted Annex B non-IDR should not be keyframe")
+	}
+}
+
 // HEVC NAL header (ITU-T H.265 section 7.3.1):
 //   byte0: forbidden_zero_bit(1) | nal_unit_type(6) | nuh_layer_id_high(1)
 //   byte1: nuh_layer_id_low(5) | nuh_temporal_id_plus1(3)

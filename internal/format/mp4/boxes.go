@@ -120,7 +120,12 @@ func readBox(r io.Reader) (box, error) {
 
 func skipBox(r io.Reader, b box) error {
 	if b.payload < 0 {
-		return io.EOF
+		// size==0: the box extends to EOF (or to the end of the enclosing
+		// buffer). This is legal for the last box (commonly mdat). Drain the
+		// remainder; io.Copy returns nil at EOF so the caller sees normal
+		// termination rather than a spurious error.
+		_, err := io.Copy(io.Discard, r)
+		return err
 	}
 	_, err := io.CopyN(io.Discard, r, b.payload)
 	return err

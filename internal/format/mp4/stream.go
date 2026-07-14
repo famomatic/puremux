@@ -102,18 +102,24 @@ func (t *trackState) peekNext() bool {
 	// cursor past any sync numbers below the current sample, then check if the
 	// current sample (consumed+1) matches the next sync entry.
 	sampleNum := t.consumed + 1
-	isKey := t.info.IsVideo
-	if isKey && len(t.stss) > 0 {
+	var isKey bool
+	switch {
+	case !t.info.IsVideo:
+		// Audio frames are each independently decodable, so every audio sample
+		// is a sync (key) sample. The old code hardcoded isKey=false for audio,
+		// marking every audio SimpleBlock non-keyframe, which is semantically
+		// wrong and breaks seeking/indexing in strict players.
+		isKey = true
+	case len(t.stss) == 0:
+		// No stss on a video track: every sample is a sync sample (all-intra).
+		isKey = true
+	default:
+		// stss lists 1-based sync sample numbers. Advance the cursor past any
+		// sync numbers below the current sample, then check for a match.
 		for t.stssIdx < len(t.stss) && t.stss[t.stssIdx] < sampleNum {
 			t.stssIdx++
 		}
 		isKey = t.stssIdx < len(t.stss) && t.stss[t.stssIdx] == sampleNum
-	} else if isKey && len(t.stss) == 0 {
-		// No stss: every sample is a sync sample (all-intra). Audio is handled
-		// by isKey being false (t.info.IsVideo == false).
-		isKey = true
-	} else {
-		isKey = false
 	}
 
 	t.peek = samplePeek{

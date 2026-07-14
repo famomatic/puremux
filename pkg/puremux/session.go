@@ -83,6 +83,13 @@ func NewSession(w io.Writer, cfg Config) (*Session, error) {
 		ws.seekable = true
 		ws.s = w.(io.Seeker)
 	}
+	// The block writer emits timecodes in milliseconds, which only agrees with
+	// the Info TimecodeScale when the scale is 1ms (1_000_000 ns). A caller who
+	// builds Config{} directly (bypassing DefaultConfig) leaves it 0, which is
+	// an invalid WebM scale; normalize it here so the header and blocks agree.
+	if cfg.TimecodeScale == 0 {
+		cfg.TimecodeScale = 1_000_000
+	}
 	s := &Session{
 		ws:        ws,
 		cfg:       cfg,
@@ -97,6 +104,12 @@ func NewSession(w io.Writer, cfg Config) (*Session, error) {
 // AddTrack registers a media track. Returns the assigned track number (1-based)
 // to use in Packet.TrackID. Must be called before the first WritePacket.
 func (s *Session) AddTrack(t Track) (int, error) {
+	// Tracks are serialized into the header on the first WritePacket; adding one
+	// afterward would produce SimpleBlocks referencing a track number absent
+	// from the header (an invalid file).
+	if s.started {
+		return 0, errTrackAfterStart
+	}
 	out := s.cfg.OutputContainer
 	if out == ContainerUnknown {
 		out = ContainerWebM
@@ -152,40 +165,57 @@ func (s *Session) WritePacket(p *core.Packet) error {
 	if !ok {
 		return errUnknownTrack
 	}
-	al := s.aligners[trackNum]
 
-	// Pipeline: Enforcer (monotonic DTS) -> Aligner (keyframe sync).
+	// Pipeline: Enforcer (monotonic DTS, jitter reorder) -> Aligner (keyframe
+	// sync). The Enforcer is NOT flushed per packet: its reorder window holds
+	// slightly-out-of-order packets so a late successor can still slot ahead.
+	// Held packets are committed by the flush in Close. (The old per-packet
+	// Flush drained the whole buffer every call, defeating reordering and
+	// causing any out-of-order packet to be dropped instead of reordered.)
 	var processed []*core.Packet
 	emit := func(out *core.Packet) { processed = append(processed, out) }
 	if err := enf.Process(p, emit); err != nil {
 		return err
 	}
-	enf.Flush(emit)
 	for _, pp := range processed {
-		// Propagate video sync start to audio aligners.
-		if al != nil && pp.IsKeyframe && s.tracks[s.trackByID[trackNum]].IsVideo {
-			for tn, other := range s.aligners {
-				if tn != trackNum {
-					other.SetVideoSyncStart(pp.DTS)
-				}
+		if err := s.pushThroughAligner(trackNum, pp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pushThroughAligner runs one Enforcer-emitted packet through the track's
+// Aligner and writes the aligned output as SimpleBlocks. Emitted packets are
+// released back to the pool after being copied into the container.
+func (s *Session) pushThroughAligner(trackNum int, pp *core.Packet) error {
+	al := s.aligners[trackNum]
+	// Propagate video sync start to the (audio) aligners of other tracks. The
+	// SetVideoSyncStart guards make this a no-op for other video tracks and
+	// idempotent after the first keyframe.
+	if al != nil && pp.IsKeyframe && s.tracks[s.trackByID[trackNum]].IsVideo {
+		for tn, other := range s.aligners {
+			if tn != trackNum {
+				other.SetVideoSyncStart(pp.DTS)
 			}
 		}
-		var aligned []*core.Packet
-		aemit := func(out *core.Packet) { aligned = append(aligned, out) }
+	}
+	var aligned []*core.Packet
+	aemit := func(out *core.Packet) { aligned = append(aligned, out) }
+	if al != nil {
 		if err := al.Process(pp, aemit); err != nil {
 			return err
 		}
-		for _, ap := range aligned {
-			if err := s.writeBlock(trackNum, ap); err != nil {
-				return err
-			}
-			// writeBlock copies the payload into the container synchronously,
-			// so the pool-acquired packet is now safe to return. The Aligner
-			// already released any packet it dropped, and an emitted packet is
-			// the same pointer as pp (or a held one released below), so we
-			// release exactly once here per emitted packet.
-			core.ReleasePacket(ap)
+	} else {
+		aligned = append(aligned, pp)
+	}
+	for _, ap := range aligned {
+		if err := s.writeBlock(trackNum, ap); err != nil {
+			return err
 		}
+		// writeBlock copies the payload into the container synchronously, so the
+		// pool-acquired packet is now safe to return.
+		core.ReleasePacket(ap)
 	}
 	return nil
 }
@@ -194,43 +224,57 @@ func (s *Session) WritePacket(p *core.Packet) error {
 func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 	absMs := uint64(p.DTS / time.Millisecond)
 	// Capture the segment origin from the first packet actually written.
-	// writeHeader runs before this (s.started is already true), so the old
-	// "if !s.started" branch here was dead code and segmentTc0 stayed 0.
 	if !s.segTc0Set {
 		s.segmentTc0 = p.DTS
 		s.segTc0Set = true
 	}
 
-	// Open a new cluster if none or if relative timecode would overflow int16.
+	// Normalize the output timeline to start at 0 (the first written packet).
+	// Packets are monotonic post-Enforcer, so absMs >= segStartMs; clamp to be
+	// safe. Both the Cluster Timestamp and the Cue time use this normalized
+	// value so they agree (a prerequisite for correct seeking).
 	segStartMs := uint64(s.segmentTc0 / time.Millisecond)
-	// Use signed int64 math: absMs may precede clusterTc after Enforcer
-	// reordering, and a uint64 subtraction would underflow.
-	relFromCluster := int64(absMs) - int64(s.clusterTc)
+	normMs := uint64(0)
+	if absMs > segStartMs {
+		normMs = absMs - segStartMs
+	}
+
+	// Open a new cluster if none, or if the relative timecode would overflow
+	// the SimpleBlock int16 range. Use signed math: normMs may precede the
+	// cluster timecode after Enforcer reordering.
+	relFromCluster := int64(normMs) - int64(s.clusterTc)
 	if s.cluster == nil || relFromCluster > 30000 || relFromCluster < -32768 {
 		if s.cluster != nil {
 			if err := s.cluster.Close(); err != nil {
 				return err
 			}
 		}
-		s.clusterTc = absMs
-		cw, err := webm.BeginCluster(s.ws, s.ws.seekable, absMs)
+		s.clusterTc = normMs
+		cw, err := webm.BeginCluster(s.ws, s.ws.seekable, normMs)
 		if err != nil {
 			return err
 		}
 		s.cluster = cw
-		// Record cue for seekable mode.
+		// Record cue for seekable mode. ClusterPosition must point at the
+		// Cluster element start (captured before its header was written), not
+		// at the post-header offset.
 		if s.ws.seekable {
-			relPos := uint64(s.ws.offset() - int64(s.header.SegmentStart))
+			relPos := uint64(cw.StartOffset() - int64(s.header.SegmentStart))
 			s.cues = append(s.cues, webm.CuePoint{
-				Timecode:         absMs - segStartMs,
-				Track:            uint64(trackNum),
-				ClusterPosition:  relPos,
+				Timecode:        normMs,
+				Track:           uint64(trackNum),
+				ClusterPosition: relPos,
 			})
 		}
+		// Recompute now that the cluster timecode is normMs (relTc = 0 for the
+		// cluster's first block). The old code left relFromCluster stale, so the
+		// first block of every new cluster carried the pre-rollover relative
+		// timecode (e.g. ~30001), roughly doubling its absolute time.
+		relFromCluster = int64(normMs) - int64(s.clusterTc)
 	}
 
 	relTc := int16(relFromCluster)
-	s.lastTcMs = absMs
+	s.lastTcMs = normMs
 	spec := s.tracks[s.trackByID[trackNum]]
 	return s.cluster.WriteSimpleBlock(spec.Number, relTc, p.IsKeyframe, p.Data)
 }
@@ -285,6 +329,37 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	// If no packet was ever written, no header/Segment exists. Finalizing would
+	// write a stray SeekHead and patch a non-existent Segment size at offset 0,
+	// producing a malformed file. Nothing to do.
+	if !s.started {
+		return nil
+	}
+	// Flush the per-track Enforcer reorder buffers (their newest packet is held
+	// until now), then any audio still held in the Aligner pending queues, so
+	// no tail packets are lost. Enforcers are drained first because a flushed
+	// video keyframe may unlock the audio aligners' sync start.
+	for trackNum, enf := range s.enforcers {
+		var processed []*core.Packet
+		emit := func(out *core.Packet) { processed = append(processed, out) }
+		enf.Flush(emit)
+		for _, pp := range processed {
+			if err := s.pushThroughAligner(trackNum, pp); err != nil {
+				return err
+			}
+		}
+	}
+	for trackNum, al := range s.aligners {
+		var flushed []*core.Packet
+		emit := func(out *core.Packet) { flushed = append(flushed, out) }
+		al.Flush(emit)
+		for _, ap := range flushed {
+			if err := s.writeBlock(trackNum, ap); err != nil {
+				return err
+			}
+			core.ReleasePacket(ap)
+		}
+	}
 	if s.cluster != nil {
 		if err := s.cluster.Close(); err != nil {
 			return err
@@ -369,6 +444,7 @@ var (
 	errUnknownTrack    = errPtr("unknown track")
 	errUnsupportedCodec = errPtr("codec not permitted in output container")
 	errNotSeekable  = errPtr("writer is not seekable")
+	errTrackAfterStart = errPtr("AddTrack called after first WritePacket")
 )
 
 type errPtr string

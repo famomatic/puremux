@@ -70,17 +70,14 @@ func EncodeVINT(val uint64) ([]byte, error) {
 		if val>>dataBits != 0 {
 			continue // does not fit in this width
 		}
+		// EBML reserves the all-ones VINT_DATA value as the "unknown size"
+		// sentinel. If val is exactly that, this width would encode it as the
+		// sentinel; step up to a wider width so the value round-trips as a
+		// known size (RFC 8794 section 4).
+		if val == (uint64(1)<<dataBits)-1 {
+			continue
+		}
 		out := make([]byte, width)
-		// marker: set bit (8-width) of byte 0.
-		out[0] = byte(0x80 >> uint(width-1))
-		// data fills the remaining bits MSB-first.
-		// The data occupies bits [dataBits-1 .. 0] of val; spread across the
-		// VINT with the low dataBits of byte 0..width-1 (byte 0 has
-		// 8-(width) leading marker/reserved bits + (7-(width-1)) = 8-width
-		// ... simpler: byte0 holds top (7-(width-1)) data bits, then full bytes.
-		topBits := uint(8 - width) // data bits living in byte 0
-		_ = topBits
-		// Place data: byte 0's low (8-width... no). Recompute cleanly below.
 		encodeVINTInto(out, val, width)
 		return out, nil
 	}

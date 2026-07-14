@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 
 	"github.com/famomatic/puremux/internal/core"
 	"github.com/famomatic/puremux/internal/format/webm"
@@ -107,11 +106,10 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 		next   *InputBlock
 	}
 	var srcs []*source
-	trackIDMap := map[int]int{} // (srcIdx, srcTrackNum) -> output track number
-
-	for _, path := range inputs {
-		_ = path
-	}
+	// Keyed by (srcIdx, srcTrackNum) -> output track number. A struct key
+	// avoids the collision the old srcIdx*1000+trackNum scheme had for track
+	// numbers >= 1000 (legal in Matroska/MP4).
+	trackIDMap := map[[2]int]int{}
 
 	// Open all inputs.
 	for i, path := range inputs {
@@ -149,7 +147,7 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 			if err != nil {
 				return err
 			}
-			trackIDMap[srcIdx*1000+t.Number] = num
+			trackIDMap[[2]int{srcIdx, t.Number}] = num
 		}
 	}
 
@@ -185,7 +183,7 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 		}
 		src := srcs[pick]
 		blk := src.next
-		outTrack := trackIDMap[pick*1000+blk.TrackNum]
+		outTrack := trackIDMap[[2]int{pick, blk.TrackNum}]
 		p := &core.Packet{
 			TrackID:    outTrack,
 			DTS:        blk.Duration(),
@@ -211,12 +209,4 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 		return fmt.Errorf("puremux: close: %w", err)
 	}
 	return nil
-}
-
-// mergeByTime sorts blocks across sources by absolute timecode for stable
-// merge ordering. (Currently inline above; kept for future batching.)
-func mergeByTime(blocks []*InputBlock) {
-	sort.SliceStable(blocks, func(i, j int) bool {
-		return blocks[i].AbsTimecode() < blocks[j].AbsTimecode()
-	})
 }

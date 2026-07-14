@@ -3,10 +3,12 @@ package puremux
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/webm"
 )
 
 // seekBuf is an in-memory io.WriteSeeker for seekable-mode tests.
@@ -101,6 +103,84 @@ func TestSessionSeekableVP9Opus(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte{0xA3}) {
 		t.Error("missing SimpleBlock")
+	}
+}
+
+// TestSessionClusterRolloverTimecodes muxes video packets that span a cluster
+// rollover (relative timecode would overflow int16) and reads the result back,
+// verifying every block's absolute timecode round-trips. This locks in the
+// fix for the stale relative-timecode bug where the first block of each new
+// cluster carried the pre-rollover offset instead of 0.
+func TestSessionClusterRolloverTimecodes(t *testing.T) {
+	var buf seekBuf
+	s, err := NewSession(&buf, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	vnum, err := s.AddTrack(Track{Codec: core.CodecVP9, IsVideo: true, Width: 320, Height: 240})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 40000ms and 40033ms force a second cluster (relTc would exceed 32767).
+	wantMs := []uint64{0, 33, 66, 40000, 40033}
+	for i, dms := range wantMs {
+		if err := s.WritePacket(&core.Packet{
+			TrackID:    vnum,
+			DTS:        time.Duration(dms) * time.Millisecond,
+			PTS:        time.Duration(dms) * time.Millisecond,
+			IsKeyframe: i == 0,
+			Codec:      core.CodecVP9,
+			Data:       []byte{byte(i), 0xBB},
+		}); err != nil {
+			t.Fatalf("WritePacket %d: %v", i, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rd, err := webm.NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var got []uint64
+	for {
+		blk, err := rd.NextBlock()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("NextBlock: %v", err)
+		}
+		got = append(got, blk.AbsTimecode())
+	}
+	if len(got) != len(wantMs) {
+		t.Fatalf("read %d blocks want %d: %v", len(got), len(wantMs), got)
+	}
+	for i := range wantMs {
+		if got[i] != wantMs[i] {
+			t.Errorf("block %d timecode = %d want %d", i, got[i], wantMs[i])
+		}
+	}
+}
+
+// TestSessionCloseNoPackets verifies closing a session that never wrote a
+// packet produces no output (rather than a malformed stray SeekHead + a patch
+// at a non-existent Segment size).
+func TestSessionCloseNoPackets(t *testing.T) {
+	var buf seekBuf
+	s, err := NewSession(&buf, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddTrack(Track{Codec: core.CodecVP9, IsVideo: true, Width: 16, Height: 16}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(buf.Bytes()) != 0 {
+		t.Errorf("empty session produced %d bytes, want 0", len(buf.Bytes()))
 	}
 }
 

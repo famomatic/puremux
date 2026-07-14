@@ -68,16 +68,25 @@ func Merge(ctx context.Context, inputs []string, outputPath string, cfg Config) 
 	if err != nil {
 		return fmt.Errorf("puremux: open output %s: %w", outputPath, err)
 	}
-	defer f.Close()
 
 	// Pass the chosen output container down through the config so the session
 	// writes the correct EBML doctype and codec set. RemuxInputs re-derives
 	// tracks from the inputs; the container only affects header writing.
 	cfg.OutputContainer = out
 
-	if err := remuxInputs(inputs, inContainers, f, cfg); err != nil {
+	if rerr := remuxInputs(inputs, inContainers, f, cfg); rerr != nil {
+		// Close before removing: Windows refuses to unlink an open file, so a
+		// deferred close would leave a partial output on disk.
+		_ = f.Close()
 		_ = os.Remove(outputPath)
-		return err
+		return rerr
+	}
+	// A close-time flush error (disk full, network FS) means the output is
+	// truncated; surface it as a failure and remove the partial file rather
+	// than reporting success on a bad file.
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(outputPath)
+		return fmt.Errorf("puremux: close output %s: %w", outputPath, cerr)
 	}
 	return nil
 }

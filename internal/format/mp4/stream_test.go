@@ -89,7 +89,8 @@ func TestStreamingMultiSTTSEntries(t *testing.T) {
 }
 
 func TestStreamingAudioNoStss(t *testing.T) {
-	// Audio track: no stss. Keyframe must be false for every sample.
+	// Audio track: no stss. Every audio frame is independently decodable, so
+	// every sample must be flagged as a keyframe (sync sample).
 	sizes := []uint32{4, 4}
 	stts := []sttsEntry{{count: 2, delta: 20}}
 	stsc := []stscEntry{{firstChunk: 1, samplesPerChunk: 2}}
@@ -108,8 +109,8 @@ func TestStreamingAudioNoStss(t *testing.T) {
 		if err != nil {
 			t.Fatalf("sample %d: %v", i, err)
 		}
-		if s.Keyframe {
-			t.Errorf("audio sample %d should not be keyframe", i)
+		if !s.Keyframe {
+			t.Errorf("audio sample %d should be a keyframe (independently decodable)", i)
 		}
 	}
 }

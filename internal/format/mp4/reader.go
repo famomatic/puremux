@@ -22,7 +22,13 @@ type Track struct {
 // Sample is a decoded media sample from the input, equivalent to a Block.
 type Sample struct {
 	TrackNum int
-	// AbsMs is the sample's absolute presentation time in milliseconds.
+	// AbsMs is the sample's absolute time in milliseconds, derived from the
+	// stts decode deltas. NOTE: the composition-offset table (ctts) is not
+	// applied, so for streams with B-frame reordering (H.264/HEVC/AV1) this is
+	// the decode timestamp (DTS), not the presentation timestamp (PTS).
+	// All-intra video and audio are unaffected. Applying ctts requires
+	// carrying separate DTS/PTS through the whole pipeline (the current model
+	// conflates them), so it is intentionally deferred.
 	AbsMs    uint64
 	Keyframe bool
 	Data     []byte
@@ -375,13 +381,16 @@ func (rd *Reader) parseStbl(r io.Reader, b box, t *trackState) error {
 }
 
 func (rd *Reader) parseStsd(r io.Reader, b box, t *trackState) error {
+	if b.payload < 8 {
+		return ErrCorrupt
+	}
 	hdr := make([]byte, 8)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return err
 	}
 	entryCount := binary.BigEndian.Uint32(hdr[4:8])
-	if entryCount == 0 {
-		remaining := int64(b.payload) - 8
+	remaining := int64(b.payload) - 8
+	if entryCount == 0 || remaining < 8 {
 		if remaining > 0 {
 			if _, err := io.CopyN(io.Discard, r, remaining); err != nil {
 				return err
@@ -389,13 +398,35 @@ func (rd *Reader) parseStsd(r io.Reader, b box, t *trackState) error {
 		}
 		return nil
 	}
+	// First sample entry: size(4) + type(4) + entry body.
 	var se [8]byte
 	if _, err := io.ReadFull(r, se[:]); err != nil {
 		return err
 	}
+	remaining -= 8
+	entrySize := int64(binary.BigEndian.Uint32(se[0:4]))
 	codecType := string(se[4:8])
 	t.info = codecFromSampleEntry(codecType, t.info.Number)
-	remaining := int64(b.payload) - 8 - 8
+	// Read this sample entry's body (after size+type), bounded by the bytes
+	// actually remaining in the stsd box.
+	bodyLen := entrySize - 8
+	if bodyLen < 0 || bodyLen > remaining {
+		bodyLen = remaining
+	}
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return err
+	}
+	remaining -= bodyLen
+	if t.info.IsVideo && len(body) >= 28 {
+		// VisualSampleEntry layout after size+type: reserved(6) +
+		// data_reference_index(2) [8], then pre_defined(2) + reserved(2) +
+		// pre_defined[3](12) [16], then width(2) + height(2) at body offset 24.
+		// Previously width/height were never parsed, so remuxed video tracks
+		// carried PixelWidth/PixelHeight = 0.
+		t.info.Width = int(binary.BigEndian.Uint16(body[24:26]))
+		t.info.Height = int(binary.BigEndian.Uint16(body[26:28]))
+	}
 	if remaining > 0 {
 		if _, err := io.CopyN(io.Discard, r, remaining); err != nil {
 			return err

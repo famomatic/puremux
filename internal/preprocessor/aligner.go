@@ -168,9 +168,37 @@ func (a *Aligner) drainPendingPassthrough(emit func(*core.Packet)) {
 // SetVideoSyncStart propagates the video keyframe DTS so the audio aligner
 // can drop audio packets that precede the video sync point. Called by the
 // pipeline coordinator once the video aligner locks its sync start.
+//
+// It latches exactly once and only affects audio aligners:
+//   - Video guard: without it, one video track's keyframe would force another
+//     video aligner's started=true, making it emit mid-GOP (undecodable head).
+//   - Idempotency: the coordinator calls this for every emitted video keyframe;
+//     re-latching to a later keyframe's DTS would drop audio in [old, new),
+//     chopping audio at each GOP boundary.
 func (a *Aligner) SetVideoSyncStart(start time.Duration) {
+	if a.video {
+		return
+	}
+	if a.started {
+		return
+	}
 	a.syncStart = start
 	a.started = true
+}
+
+// Flush emits any audio packets still held in the pending queue. Called at
+// end-of-stream so held audio is not lost. If a video sync start was locked,
+// held packets are filtered against it; otherwise (no video keyframe ever
+// arrived) they are released as passthrough rather than dropped.
+func (a *Aligner) Flush(emit func(*core.Packet)) {
+	if len(a.pending) == 0 {
+		return
+	}
+	if a.started {
+		a.drainPending(emit)
+	} else {
+		a.drainPendingPassthrough(emit)
+	}
 }
 
 // Metrics returns a snapshot of observable side effects.

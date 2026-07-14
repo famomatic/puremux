@@ -58,14 +58,15 @@ func TestVP8Detector(t *testing.T) {
 
 func TestVP9Detector(t *testing.T) {
 	d := vp9Detector{}
-	// frame_marker 0b10 => low two bits == 0x02. Profile 0,
-	// show_existing_frame=0, frame_type=0 (KEY) at bit 5 => byte 0x02.
-	if !d.IsKeyframe([]byte{0x02}) {
-		t.Error("0x02 should be VP9 keyframe")
+	// VP9 header is MSB-first. Profile 0 keyframe byte:
+	//   bits 10 00 0 0 xx = frame_marker(10) profLow(0) profHigh(0)
+	//   show_existing_frame(0) frame_type(0=KEY) => 0b10000000 = 0x80.
+	if !d.IsKeyframe([]byte{0x80}) {
+		t.Error("0x80 should be VP9 keyframe")
 	}
-	// frame_type=1 (INTER) at bit 5 => byte 0x22.
-	if d.IsKeyframe([]byte{0x22}) {
-		t.Error("0x22 should be VP9 interframe")
+	// frame_type=1 (INTER): bit2 set => 0b10000100 = 0x84.
+	if d.IsKeyframe([]byte{0x84}) {
+		t.Error("0x84 should be VP9 interframe")
 	}
 	if d.IsKeyframe([]byte{0x00}) {
 		t.Error("invalid frame_marker should not be keyframe")
@@ -80,21 +81,20 @@ func TestVP9Detector(t *testing.T) {
 // show_existing_frame, shifting frame_type by one bit position.
 func TestVP9DetectorProfile3(t *testing.T) {
 	d := vp9Detector{}
-	// profile 3: profile_low=1, profile_high=1 => profile bits = 0b11.
-	// Bit layout (LSB-first): [1:0]=10(marker), [2]=1(profLow),
-	// [3]=1(profHigh), [4]=0(reserved for profile 3),
-	// [5]=0(show_existing_frame), [6]=0(frame_type=KEY) => 0b00001110 = 0x0E.
-	if !d.IsKeyframe([]byte{0x0E}) {
-		t.Error("profile 3 KEY_FRAME (0x0E) should be keyframe")
+	// profile 3: profile_low=1, profile_high=1. MSB-first bit layout:
+	//   [7:6]=10(marker) [5]=1(profLow) [4]=1(profHigh) [3]=0(reserved)
+	//   [2]=0(show_existing_frame) [1]=0(frame_type=KEY) => 0b10110000 = 0xB0.
+	if !d.IsKeyframe([]byte{0xB0}) {
+		t.Error("profile 3 KEY_FRAME (0xB0) should be keyframe")
 	}
-	// profile 3 INTER: frame_type=1 at bit 6 => 0b01001110 = 0x4E.
-	if d.IsKeyframe([]byte{0x4E}) {
-		t.Error("profile 3 INTER (0x4E) should not be keyframe")
+	// profile 3 INTER: frame_type=1 at bit1 => 0b10110010 = 0xB2.
+	if d.IsKeyframe([]byte{0xB2}) {
+		t.Error("profile 3 INTER (0xB2) should not be keyframe")
 	}
-	// profile 3 with show_existing_frame=1 at bit 5 => 0b00101110 = 0x2E.
+	// profile 3 show_existing_frame=1 at bit2 => 0b10110100 = 0xB4.
 	// show_existing_frame references a prior frame, not a sync frame.
-	if d.IsKeyframe([]byte{0x2E}) {
-		t.Error("profile 3 show_existing_frame (0x2E) should not be keyframe")
+	if d.IsKeyframe([]byte{0xB4}) {
+		t.Error("profile 3 show_existing_frame (0xB4) should not be keyframe")
 	}
 }
 
@@ -215,11 +215,11 @@ func TestDetectorRegistry(t *testing.T) {
 	if r.Detector(CodecUnknown).IsKeyframe([]byte{0xFF}) {
 		t.Error("Unknown codec falls back to noop, not keyframe")
 	}
-	if !r.Detector(CodecVP9).IsKeyframe([]byte{0x02}) {
+	if !r.Detector(CodecVP9).IsKeyframe([]byte{0x80}) {
 		t.Error("VP9 detector not wired in registry")
 	}
 	r.Register(CodecVP9, nil)
-	if r.Detector(CodecVP9).IsKeyframe([]byte{0x02}) {
+	if r.Detector(CodecVP9).IsKeyframe([]byte{0x80}) {
 		t.Error("cleared VP9 detector should fall back to noop")
 	}
 }

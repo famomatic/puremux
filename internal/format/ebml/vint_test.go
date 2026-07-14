@@ -114,6 +114,28 @@ func TestVINTRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeVINTAvoidsUnknownSentinel is a regression test: EncodeVINT must not
+// emit the all-ones "unknown size" sentinel for a value that merely fits in a
+// width (e.g. 127 => 0xFF). Such a size field would make a demuxer read the
+// element as unknown-length and mis-parse the rest of the file.
+func TestEncodeVINTAvoidsUnknownSentinel(t *testing.T) {
+	// All-ones data values for widths 1..4.
+	for _, v := range []uint64{127, 16383, 2097151, 268435455} {
+		enc, err := EncodeVINT(v)
+		if err != nil {
+			t.Errorf("EncodeVINT(%d) err: %v", v, err)
+			continue
+		}
+		if IsUnknownSize(enc, len(enc)) {
+			t.Errorf("EncodeVINT(%d) = % X is the unknown-size sentinel", v, enc)
+		}
+		dec, w, err := DecodeVINT(enc)
+		if err != nil || dec != v || w != len(enc) {
+			t.Errorf("EncodeVINT(%d) round-trip: dec=%d w=%d err=%v", v, dec, w, err)
+		}
+	}
+}
+
 func TestEncodeVINTOverflow(t *testing.T) {
 	// value exceeds max width-8 data (56 bits).
 	_, err := EncodeVINT(uint64(1) << 57)
