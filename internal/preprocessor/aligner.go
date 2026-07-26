@@ -16,10 +16,10 @@ import (
 // The Aligner depends on a CodecKeyframeDetector; it never probes codec bytes
 // directly (§5.A).
 type Aligner struct {
-	detector core.CodecKeyframeDetector
-	video    bool
-	syncStart        time.Duration // DTS of the first accepted keyframe
-	started          bool
+	detector  core.CodecKeyframeDetector
+	video     bool
+	syncStart time.Duration // DTS of the first accepted keyframe
+	started   bool
 	// expectsVideoSync is true for audio tracks in a session that also has a
 	// video track. Such audio is held until SetVideoSyncStart arrives, so
 	// packets before the video sync point are dropped instead of leaking out.
@@ -28,27 +28,40 @@ type Aligner struct {
 	// was locked. Bounded by maxPending; overflow drops the oldest.
 	pending    []*core.Packet
 	maxPending int
+	// cfgPending holds pre-keyframe VIDEO packets that carry only decoder
+	// configuration (SPS/PPS parameter sets, per CodecConfigOnlyDetector).
+	// They are emitted ahead of the first keyframe instead of being dropped:
+	// if the sync frame does not repeat the parameter sets in-band, dropping
+	// them would leave the whole stream undecodable. Bounded; overflow drops
+	// the oldest (the newest configuration is the one that matters).
+	cfgPending []*core.Packet
+	cfgOnly    core.CodecConfigOnlyDetector // nil when the codec has no notion
 	metrics    Metrics
 }
 
 // NewAligner builds an Aligner for a track of the given kind. video tracks
 // require a non-nil detector; audio tracks pass a noop detector.
 func NewAligner(detector core.CodecKeyframeDetector, isVideo bool) *Aligner {
-	return &Aligner{detector: detector, video: isVideo}
+	a := &Aligner{detector: detector, video: isVideo}
+	if cfg, ok := detector.(core.CodecConfigOnlyDetector); ok {
+		a.cfgOnly = cfg
+	}
+	return a
 }
+
+// maxCfgPending bounds the held configuration packets; parameter sets are a
+// handful of small NALs, so a short queue holds every realistic burst.
+const maxCfgPending = 8
 
 // NewAlignerForSession builds an Aligner that knows whether the session also
 // contains a video track. When expectsVideoSync is true, audio packets are
-// held in a bounded pending queue until SetVideoSyncStart arrives rather than
-// being emitted before the video sync point. maxPending bounds the queue; a
-// value <= 0 defaults to 64.
+// held in a bounded pending queue (64 packets; overflow drops the oldest)
+// until SetVideoSyncStart arrives rather than being emitted before the video
+// sync point.
 func NewAlignerForSession(detector core.CodecKeyframeDetector, isVideo, expectsVideoSync bool) *Aligner {
 	a := NewAligner(detector, isVideo)
 	a.expectsVideoSync = expectsVideoSync
 	a.maxPending = 64
-	if a.maxPending <= 0 {
-		a.maxPending = 64
-	}
 	return a
 }
 
@@ -91,6 +104,21 @@ func (a *Aligner) processVideo(inbound *core.Packet, emit func(*core.Packet)) er
 	if !a.started {
 		// Use the detector (never inline byte probing, §5.A).
 		if !a.detector.IsKeyframe(inbound.Data) && !inbound.IsKeyframe {
+			// A configuration-only packet (standalone SPS/PPS) is decoder
+			// state, not a frame: hold it for the sync point instead of
+			// dropping it with the undecodable pre-keyframe pictures.
+			if a.cfgOnly != nil && a.cfgOnly.IsConfigOnly(inbound.Data) {
+				a.cfgPending = append(a.cfgPending, inbound)
+				if len(a.cfgPending) > maxCfgPending {
+					dropped := a.cfgPending[0]
+					copy(a.cfgPending, a.cfgPending[1:])
+					a.cfgPending[len(a.cfgPending)-1] = nil
+					a.cfgPending = a.cfgPending[:len(a.cfgPending)-1]
+					a.metrics.DroppedOutOfOrder++
+					core.ReleasePacket(dropped)
+				}
+				return nil
+			}
 			// Drop packets before the first IDR.
 			a.metrics.DroppedOutOfOrder++
 			core.ReleasePacket(inbound)
@@ -98,6 +126,14 @@ func (a *Aligner) processVideo(inbound *core.Packet, emit func(*core.Packet)) er
 		}
 		a.started = true
 		a.syncStart = inbound.DTS
+		// Replay the held configuration ahead of the first keyframe so the
+		// decoder is initialized even when the keyframe does not repeat the
+		// parameter sets in-band.
+		for i, cfg := range a.cfgPending {
+			emit(cfg)
+			a.cfgPending[i] = nil
+		}
+		a.cfgPending = a.cfgPending[:0]
 	}
 	emit(inbound)
 	return nil
@@ -191,6 +227,13 @@ func (a *Aligner) SetVideoSyncStart(start time.Duration) {
 // held packets are filtered against it; otherwise (no video keyframe ever
 // arrived) they are released as passthrough rather than dropped.
 func (a *Aligner) Flush(emit func(*core.Packet)) {
+	// A video stream that ended without ever producing a keyframe leaves its
+	// held configuration packets unusable; release them.
+	for i, p := range a.cfgPending {
+		core.ReleasePacket(p)
+		a.cfgPending[i] = nil
+	}
+	a.cfgPending = a.cfgPending[:0]
 	if len(a.pending) == 0 {
 		return
 	}
@@ -210,6 +253,11 @@ func (a *Aligner) Reset() {
 		core.ReleasePacket(p)
 	}
 	a.pending = a.pending[:0]
+	for i, p := range a.cfgPending {
+		core.ReleasePacket(p)
+		a.cfgPending[i] = nil
+	}
+	a.cfgPending = a.cfgPending[:0]
 	a.started = false
 	a.syncStart = 0
 	a.metrics = Metrics{}

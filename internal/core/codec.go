@@ -20,6 +20,19 @@ type noopDetector struct{}
 
 func (noopDetector) IsKeyframe([]byte) bool { return false }
 
+// CodecConfigOnlyDetector is an optional extension of CodecKeyframeDetector
+// for codecs whose streams may carry decoder configuration (parameter sets)
+// in standalone packets: an H.264/HEVC AU holding only SPS/PPS(/VPS/SEI)
+// NALs, no coded slice. The keyframe Aligner uses it to preserve such
+// packets across its pre-keyframe drop — losing them would leave the stream
+// undecodable when the sync frame does not repeat the parameter sets
+// in-band. Like IsKeyframe it inspects NAL header bytes only.
+type CodecConfigOnlyDetector interface {
+	// IsConfigOnly reports whether the packet consists of configuration /
+	// non-picture NAL units only (and holds at least one parameter set).
+	IsConfigOnly(data []byte) bool
+}
+
 // DetectorRegistry maps a CodecType to its keyframe detector. It is the only
 // sanctioned lookup path for codec-specific header inspection.
 type DetectorRegistry struct {

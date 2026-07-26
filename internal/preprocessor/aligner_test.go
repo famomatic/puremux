@@ -204,3 +204,106 @@ func TestAlignerAudioOnlySessionFlushesPending(t *testing.T) {
 		core.ReleasePacket(p)
 	}
 }
+
+// h264AU builds an Annex-B AU from raw NAL bodies (header byte included).
+func h264AU(nals ...[]byte) []byte {
+	var out []byte
+	for _, n := range nals {
+		out = append(out, 0x00, 0x00, 0x00, 0x01)
+		out = append(out, n...)
+	}
+	return out
+}
+
+var (
+	nalSPS    = []byte{0x67, 0x42, 0x00, 0x1E, 0xEC, 0xA0, 0xA0, 0xFC}
+	nalPPS    = []byte{0x68, 0xC8}
+	nalIDR    = []byte{0x65, 0x88, 0x84, 0x08}
+	nalNonIDR = []byte{0x41, 0xE2, 0x44}
+)
+
+func TestAlignerPreservesParameterSetsBeforeKeyframe(t *testing.T) {
+	// A live join: standalone SPS/PPS AU arrives first, then pre-keyframe
+	// P-frames (undecodable, dropped), then the IDR. The parameter sets must
+	// come out ahead of the IDR instead of dying with the dropped frames —
+	// without them the whole stream is undecodable when the IDR does not
+	// repeat them in-band.
+	det := core.NewDetectorRegistry().Detector(core.CodecH264)
+	a := NewAligner(det, true)
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+
+	cfg := core.AcquirePacket()
+	cfg.Data = append(cfg.Data[:0], h264AU(nalSPS, nalPPS)...)
+	cfg.DTS = 0
+	a.Process(cfg, emit)
+
+	pre := core.AcquirePacket()
+	pre.Data = append(pre.Data[:0], h264AU(nalNonIDR)...)
+	pre.DTS = 10 * time.Millisecond
+	a.Process(pre, emit)
+
+	if len(got) != 0 {
+		t.Fatalf("nothing may leak before the keyframe, got %d", len(got))
+	}
+
+	idr := core.AcquirePacket()
+	idr.Data = append(idr.Data[:0], h264AU(nalIDR)...)
+	idr.DTS = 20 * time.Millisecond
+	a.Process(idr, emit)
+
+	if len(got) != 2 {
+		t.Fatalf("want cfg + IDR emitted, got %d packets", len(got))
+	}
+	if got[0] != cfg || got[1] != idr {
+		t.Fatal("emission order wrong: parameter sets must precede the IDR")
+	}
+	if a.Metrics().DroppedOutOfOrder != 1 {
+		t.Fatalf("want exactly the P-frame dropped, got %d", a.Metrics().DroppedOutOfOrder)
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}
+
+func TestAlignerParameterSetQueueBounded(t *testing.T) {
+	det := core.NewDetectorRegistry().Detector(core.CodecH264)
+	a := NewAligner(det, true)
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+	for i := range maxCfgPending + 3 {
+		cfg := core.AcquirePacket()
+		cfg.Data = append(cfg.Data[:0], h264AU(nalSPS, nalPPS)...)
+		cfg.DTS = time.Duration(i) * time.Millisecond
+		a.Process(cfg, emit)
+	}
+	idr := core.AcquirePacket()
+	idr.Data = append(idr.Data[:0], h264AU(nalIDR)...)
+	a.Process(idr, emit)
+	if len(got) != maxCfgPending+1 {
+		t.Fatalf("want %d held cfg + IDR, got %d", maxCfgPending, len(got))
+	}
+	// The oldest overflowed; the newest configuration survived.
+	if got[len(got)-2].DTS != time.Duration(maxCfgPending+2)*time.Millisecond {
+		t.Fatal("bounded queue dropped the newest configuration instead of the oldest")
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}
+
+func TestAlignerParameterSetsReleasedWithoutKeyframe(t *testing.T) {
+	// Stream ends with configuration held but no keyframe ever: Flush must
+	// not emit orphaned parameter sets (there is no stream to configure).
+	det := core.NewDetectorRegistry().Detector(core.CodecH264)
+	a := NewAligner(det, true)
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+	cfg := core.AcquirePacket()
+	cfg.Data = append(cfg.Data[:0], h264AU(nalSPS, nalPPS)...)
+	a.Process(cfg, emit)
+	a.Flush(emit)
+	if len(got) != 0 {
+		t.Fatalf("orphaned parameter sets emitted: %d", len(got))
+	}
+}

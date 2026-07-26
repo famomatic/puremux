@@ -26,6 +26,28 @@ func (h264Detector) IsKeyframe(data []byte) bool {
 	return scanNALs(data, 1, h264NALIsKeyframe)
 }
 
+// IsConfigOnly reports an AU carrying only non-VCL NALs (SPS/PPS/SEI/AUD…)
+// with at least one parameter set — decoder configuration the Aligner must
+// not lose to its pre-keyframe drop (CodecConfigOnlyDetector).
+func (h264Detector) IsConfigOnly(data []byte) bool {
+	hasParamSet, hasVCL, any := false, false, false
+	forEachNAL(data, func(nal []byte) bool {
+		if len(nal) < 1 || nal[0]&0x80 != 0 {
+			return true
+		}
+		any = true
+		switch nalType := nal[0] & 0x1F; {
+		case nalType >= 1 && nalType <= 5: // coded slices (VCL)
+			hasVCL = true
+			return false
+		case nalType == h264NalTypeSPS || nalType == h264NalTypePPS:
+			hasParamSet = true
+		}
+		return true
+	})
+	return any && hasParamSet && !hasVCL
+}
+
 // h264NALIsKeyframe inspects a single NAL unit's first byte. It reads the
 // nal_unit_type from the low 5 bits and reports true for IDR (5).
 func h264NALIsKeyframe(nal []byte) bool {
@@ -68,6 +90,27 @@ func (hevcDetector) IsKeyframe(data []byte) bool {
 	return scanNALs(data, 2, hevcNALIsKeyframe)
 }
 
+// IsConfigOnly reports an AU carrying only non-VCL NALs with at least one
+// parameter set (VPS 32 / SPS 33 / PPS 34) — see CodecConfigOnlyDetector.
+func (hevcDetector) IsConfigOnly(data []byte) bool {
+	hasParamSet, hasVCL, any := false, false, false
+	forEachNAL(data, func(nal []byte) bool {
+		if len(nal) < 2 || nal[0]&0x80 != 0 {
+			return true
+		}
+		any = true
+		switch nalType := (nal[0] >> 1) & 0x3F; {
+		case nalType <= 31: // coded slices (VCL)
+			hasVCL = true
+			return false
+		case nalType >= 32 && nalType <= 34: // VPS/SPS/PPS
+			hasParamSet = true
+		}
+		return true
+	})
+	return any && hasParamSet && !hasVCL
+}
+
 // hevcNALIsKeyframe inspects a NAL unit's first two header bytes. The
 // nal_unit_type occupies bits [6:1] of byte 0 (after the forbidden bit).
 func hevcNALIsKeyframe(nal []byte) bool {
@@ -98,15 +141,30 @@ func hevcNALIsKeyframe(nal []byte) bool {
 // fall back to the AVCC length-prefix interpretation with the conventional
 // 4-byte prefix.
 func scanNALs(data []byte, headerBytes int, check func([]byte) bool) bool {
+	stop := false
+	forEachNAL(data, func(nal []byte) bool {
+		if len(nal) >= headerBytes && check(nal[:headerBytes]) {
+			stop = true
+			return false
+		}
+		return true
+	})
+	return stop
+}
+
+// forEachNAL walks every NAL unit in a packet payload (Annex-B or AVCC
+// framing, auto-detected like scanNALs) and passes the FULL NAL bytes
+// (header + payload, no start code / length prefix) to fn. Returning false
+// from fn stops the walk. Malformed framing ends the walk safely.
+func forEachNAL(data []byte, fn func(nal []byte) bool) {
 	if len(data) == 0 {
-		return false
+		return
 	}
-	// Annex B path: look for start codes.
 	if hasAnnexBStartCode(data) {
-		return scanAnnexBNALs(data, headerBytes, check)
+		forEachAnnexBNAL(data, fn)
+		return
 	}
-	// AVCC path: 4-byte big-endian length prefixes.
-	return scanAVCCNALs(data, headerBytes, check)
+	forEachAVCCNAL(data, fn)
 }
 
 // hasAnnexBStartCode reports whether data begins with (or contains early) an
@@ -125,8 +183,8 @@ func hasAnnexBStartCode(data []byte) bool {
 	return false
 }
 
-// scanAnnexBNALs splits on start codes and applies check to each NAL header.
-func scanAnnexBNALs(data []byte, headerBytes int, check func([]byte) bool) bool {
+// forEachAnnexBNAL splits on start codes and passes each full NAL to fn.
+func forEachAnnexBNAL(data []byte, fn func(nal []byte) bool) {
 	i := 0
 	for i < len(data) {
 		// Locate the next start code beginning at or after i.
@@ -149,14 +207,13 @@ func scanAnnexBNALs(data []byte, headerBytes int, check func([]byte) bool) bool 
 		if nalEnd < 0 {
 			nalEnd = len(data)
 		}
-		if nalStart+headerBytes <= nalEnd {
-			if check(data[nalStart : nalStart+headerBytes]) {
-				return true
+		if nalStart < nalEnd {
+			if !fn(data[nalStart:nalEnd]) {
+				return
 			}
 		}
 		i = nalEnd
 	}
-	return false
 }
 
 // startCodeLenAt returns 3 or 4 if a start code (0x000001 / 0x00000001) begins
@@ -199,9 +256,9 @@ func findNextStartCode(data []byte, from int) int {
 	return -1
 }
 
-// scanAVCCNALs walks NAL units prefixed by 4-byte big-endian lengths and
-// applies check to each header.
-func scanAVCCNALs(data []byte, headerBytes int, check func([]byte) bool) bool {
+// forEachAVCCNAL walks NAL units prefixed by 4-byte big-endian lengths and
+// passes each full NAL to fn.
+func forEachAVCCNAL(data []byte, fn func(nal []byte) bool) {
 	i := 0
 	for i+4 <= len(data) {
 		length := int(data[i])<<24 | int(data[i+1])<<16 | int(data[i+2])<<8 | int(data[i+3])
@@ -209,14 +266,11 @@ func scanAVCCNALs(data []byte, headerBytes int, check func([]byte) bool) bool {
 		nalEnd := nalStart + length
 		if length <= 0 || nalEnd > len(data) {
 			// Malformed length: stop scanning safely rather than panic.
-			return false
+			return
 		}
-		if nalStart+headerBytes <= nalEnd {
-			if check(data[nalStart : nalStart+headerBytes]) {
-				return true
-			}
+		if !fn(data[nalStart:nalEnd]) {
+			return
 		}
 		i = nalEnd
 	}
-	return false
 }

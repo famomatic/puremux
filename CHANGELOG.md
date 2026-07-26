@@ -3,6 +3,100 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## v0.0.9 — 2026-07-27
+
+### Fixed
+
+- **`WriteVideo` + MPEG-TS: fatal non-monotonic timeline on H.264/HEVC with
+  B-frames — fixed with POC-derived presentation timestamps (the complete
+  fix, implemented for both H.264 and HEVC; not the minimum monotonic-DTS
+  fallback).** The live caller feeds decode-order access units stamped with
+  a monotonic *decode* clock (`PTS == DTS == t`). For bitstreams with
+  B-frames the display order differs from decode order (it lives in the
+  bitstream picture order count, never in `t`), so emitting `t` as the PES
+  PTS produced presentation timestamps that were non-monotonic in display
+  order: ffmpeg failed with "Application provided invalid, non monotonically
+  increasing dts to muxer in stream 0" and mpv flooded "Invalid video
+  timestamp" and dropped frames (~80 of every 240 in field captures).
+
+  Now each AU's POC is parsed from the SPS/PPS/slice headers and the PES
+  carries: **DTS = the input decode clock, untouched** (strictly monotonic
+  by construction) and **PTS = the frame's display slot on that clock**
+  (picture with display rank d gets slot `t[d + D]`, D = observed reorder
+  depth — the causality delay). PES packets carry a distinct PTS/DTS pair
+  exactly when the stream reorders. Verified against real x264 (240-frame
+  b-pyramid) and x265 (120-frame) streams: ffprobe reports 0 non-monotonic
+  `pkt_dts_time` and 0 DTS>PTS on video and audio; decoded display-order
+  PTS is strictly increasing at exact frame spacing; `ffmpeg -f null`
+  decodes with zero warnings.
+
+  Correction of the two prior releases' scoping (v0.0.7/v0.0.8): the field
+  failure was never a WriteVideoReordered problem — the source has no
+  per-frame presentation timestamps at all. `WriteVideoReordered` remains
+  for callers that DO hold decode-order presentation stamps; callers on a
+  monotonic decode clock (the live P2P shape) should use `WriteVideo`,
+  which now handles B-frames correctly.
+
+- **Keyframe Aligner dropped standalone parameter sets.** A pre-keyframe
+  video AU carrying only SPS/PPS (no coded slice) was discarded with the
+  undecodable pre-IDR frames; if the IDR did not repeat the parameter sets
+  in-band the whole stream was undecodable. Configuration-only AUs (new
+  `core.CodecConfigOnlyDetector`, H.264 + HEVC) are now held (bounded queue
+  of 8, oldest dropped) and replayed immediately ahead of the first
+  keyframe.
+
+- **MPEG-TS `AddTrack` could silently alias PES stream_ids.** The 17th
+  video (0xE0+16) or 33rd audio (0xC0+32) track overflowed its ISO 13818-1
+  stream_id range into foreign ids; both now return an error at the range
+  bound.
+
+### Added
+
+- `core.PictureOrderParser` (`NewPictureOrderParser`): stateful H.264/HEVC
+  picture-order-count decoding from AU bytes — in-band SPS/PPS caching,
+  Exp-Golomb/RBSP reader with emulation-prevention removal, H.264 POC type
+  0 (MSB wraparound per §8.2.1.1, reference-only prev tracking,
+  `delta_pic_order_cnt_bottom` min rule) and type 2, HEVC §8.3.1 (prevTid0
+  tracking, IDR/BLA/first-CRA resets, mid-stream CRA continuity), IDR
+  epoch numbering. POC type 1 and malformed slices report per-AU
+  "no picture" so callers degrade to decode-order presentation. Validated
+  bit-exact against spec-derived fixtures and real encoder output.
+- `internal/preprocessor.PresentationSynthesizer`: the display-timeline
+  mirror of the DTS synthesizer. Startup probe (8 pictures) collapses
+  reorder-free streams to a zero-steady-latency passthrough byte-identical
+  to v0.0.8; B-frame streams get a bounded lookahead window (observed
+  pyramid depth + margin, capped at the 16-frame DPB bound) with exact
+  display ranking, extrapolated anchor slots (median frame interval), and a
+  per-frame `PTS >= DTS` clamp so a scrambled/duplicate-stamped startup
+  burst degrades locally instead of corrupting the timeline. Verified over
+  60 shuffled/duplicated burst seeds at the full-session level —
+  deterministic, every output frame strictly monotonic DTS at 90 kHz with
+  `DTS <= PTS`.
+
+### Audited (no defect found)
+
+Full-path correctness sweep of the live/preprocessor/TS code: ADTS parsing
+(resync scan, truncated-tail withholding, per-frame duration on mid-stream
+config changes), Enforcer stable equal-DTS insertion and PTS-preserving
+nudges, packet-pool ownership on every emit/drop/flush path, the
+payload-copy contract on all four write entry points (the POC parser reads
+the caller's buffer only synchronously and caches decoded values, never
+slices), PES header flags/length (0 = unbounded for oversized video AUs),
+PCR placement and 33-bit masking, continuity counters, PAT/PMT cadence,
+zero-length AUs, keyframe-less streams (bounded audio pending queue), and
+`go test -race` across the suite (the library spawns no goroutines;
+single-writer contract documented).
+
+### Notes
+
+- Video presentation necessarily lags the shared live clock by the reorder
+  depth (a late-delivered frame cannot present at its capture slot); the
+  offset is constant and small (2–3 frame intervals for typical B-pyramids).
+- `WriteVideo` startup latency for H.264/HEVC TS tracks is a one-time
+  8-picture probe; B-frame streams then run at a constant lookahead of
+  observed-depth+2 pictures. Reorder-free streams keep zero steady-state
+  latency and byte-identical output.
+
 ## v0.0.8 — 2026-07-27
 
 ### Fixed

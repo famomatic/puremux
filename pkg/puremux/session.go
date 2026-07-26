@@ -46,8 +46,8 @@ type Config struct {
 // DefaultConfig returns a real-time-friendly configuration.
 func DefaultConfig() Config {
 	return Config{
-		TimecodeScale: 1_000_000,
-		Preprocessor:  preprocessor.DefaultConfig(),
+		TimecodeScale:   1_000_000,
+		Preprocessor:    preprocessor.DefaultConfig(),
 		OutputContainer: ContainerWebM,
 	}
 }
@@ -71,6 +71,13 @@ type Session struct {
 	// the pipeline and may hold frames across calls (startup probe), so Close
 	// drains them first.
 	synths map[int]*preprocessor.DTSSynthesizer
+	// ptsStages holds the per-track presentation-timestamp pipelines for the
+	// WriteVideo live path (MPEG-TS H.264/HEVC): a core POC parser plus a
+	// preprocessor.PresentationSynthesizer that derives display-order PTS
+	// from the bitstream picture order. Created lazily on the first
+	// WriteVideo call for an eligible track; may hold frames across calls
+	// (probe + reorder lookahead), so Close drains them like synths.
+	ptsStages map[int]*ptsStage
 
 	cluster    *webm.ClusterWriter
 	clusterTc  uint64 // absolute ms of current cluster
@@ -115,8 +122,18 @@ func NewSession(w io.Writer, cfg Config) (*Session, error) {
 		enforcers: make(map[int]*preprocessor.Enforcer),
 		aligners:  make(map[int]*preprocessor.Aligner),
 		synths:    make(map[int]*preprocessor.DTSSynthesizer),
+		ptsStages: make(map[int]*ptsStage),
 	}
 	return s, nil
+}
+
+// ptsStage pairs a codec picture-order parser with the presentation
+// synthesizer it feeds (one per WriteVideo track). The parser is the only
+// place the AU bytes are inspected (§5.A); the synthesizer works on
+// timestamps and POCInfo alone.
+type ptsStage struct {
+	parser core.PictureOrderParser
+	synth  *preprocessor.PresentationSynthesizer
 }
 
 // AddTrack registers a media track. Returns the assigned track number (1-based)
@@ -385,10 +402,29 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
-	// Drain the per-track DTS synthesizers first: a WriteVideoReordered
-	// stream shorter than the startup probe still holds every frame here (in
-	// which case even the header is unwritten — writePacket below writes it).
-	// The track iteration is ordered for deterministic multi-track output.
+	// Drain the per-track presentation stages and DTS synthesizers first: a
+	// stream shorter than a startup probe still holds every frame in them
+	// (in which case even the header is unwritten — writePacket below writes
+	// it). The track iteration is ordered for deterministic multi-track
+	// output.
+	stageTracks := make([]int, 0, len(s.ptsStages))
+	for tn := range s.ptsStages {
+		stageTracks = append(stageTracks, tn)
+	}
+	slices.Sort(stageTracks)
+	for _, tn := range stageTracks {
+		var werr error
+		s.ptsStages[tn].synth.Flush(func(out *core.Packet) {
+			if werr == nil {
+				werr = s.writePacket(out)
+			} else {
+				core.ReleasePacket(out)
+			}
+		})
+		if werr != nil {
+			return werr
+		}
+	}
 	synthTracks := make([]int, 0, len(s.synths))
 	for tn := range s.synths {
 		synthTracks = append(synthTracks, tn)
@@ -523,10 +559,10 @@ func (sw *seekWriter) Seek(offset int64, whence int) (int64, error) {
 func (sw *seekWriter) offset() int64 { return sw.off }
 
 var (
-	errUnknownTrack    = errPtr("unknown track")
+	errUnknownTrack     = errPtr("unknown track")
 	errUnsupportedCodec = errPtr("codec not permitted in output container")
-	errNotSeekable  = errPtr("writer is not seekable")
-	errTrackAfterStart = errPtr("AddTrack called after first WritePacket")
+	errNotSeekable      = errPtr("writer is not seekable")
+	errTrackAfterStart  = errPtr("AddTrack called after first WritePacket")
 )
 
 type errPtr string

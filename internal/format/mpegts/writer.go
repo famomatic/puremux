@@ -127,9 +127,18 @@ func (m *Muxer) AddTrack(t core.Track) (int, error) {
 			nAud++
 		}
 	}
+	// PES stream_id ranges are finite: 0xE0-0xEF video, 0xC0-0xDF audio
+	// (ISO/IEC 13818-1 Table 2-18). One more track would silently alias a
+	// foreign stream_id.
 	if t.Codec.IsVideo() {
+		if nVid >= 16 {
+			return 0, errors.New("mpegts: too many video tracks (max 16)")
+		}
 		ts.streamID = byte(0xE0 + nVid)
 	} else {
+		if nAud >= 32 {
+			return 0, errors.New("mpegts: too many audio tracks (max 32)")
+		}
 		ts.streamID = byte(0xC0 + nAud)
 	}
 	m.tracks = append(m.tracks, ts)

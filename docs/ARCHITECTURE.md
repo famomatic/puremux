@@ -79,6 +79,8 @@ type CodecKeyframeDetector interface {
 
 Each target codec (VP8, VP9, AV1) provides its own implementation registered in `internal/core`. Opus has no keyframe concept and returns the no-op detector.
 
+A second, equally scoped probing interface is `core.PictureOrderParser`: for H.264/HEVC it parses SPS/PPS and slice HEADER fields only (picture order count) to place each decode-order access unit in display order. It is stateful (parameter-set cache, POC wraparound tracking), obtained per elementary stream via `core.NewPictureOrderParser`, and — like the keyframe detector — is the only sanctioned path for this inspection: preprocessor and muxer code consume its `POCInfo` output, never the bytes.
+
 ### B. Preprocessor Layer (`internal/preprocessor`)
 
 Responsible for fixing corrupted packet streams. Operates purely in-memory. Does NOT write to files.
@@ -95,6 +97,10 @@ Responsible for fixing corrupted packet streams. Operates purely in-memory. Does
    - Principle: a valid decode timeline is the PTS sequence sorted ascending, delayed by the stream's reorder depth; the depth is **measured from the stream, continuously** — a bounded startup probe (8 frames held once; up to 32 for a duplicate-heavy start with no ordering evidence) whose window-wide measurement is order-tolerant against scrambled/duplicated backfill bursts, then a sliding-window steady phase whose delay grows adaptively if a deeper B-pyramid appears and decays back when a burst-inflated startup measurement exceeds the observed depth. No measurement is ever locked permanently.
    - Guarantees: decode order preserved exactly; synthesized DTS strictly monotonic (advancing by ≥ `MinMonotonicStep`, so it survives container-clock quantization); `DTS ≤ PTS` per frame (bounded transient on mid-stream depth growth); caller PTS never altered; zero steady-state latency.
    - Reorder-free input degenerates to a passthrough (`DTS == PTS`), byte-identical to the `WriteVideo` path — duplicate-timestamp repair stays the Enforcer's job.
+4. **Presentation Synthesizer** (live decode-clock ingestion, `Session.WriteVideo` + MPEG-TS H.264/HEVC): the mirror problem — video delivered in decode order on a monotonic *decode* clock (`PTS == DTS == t`) whose bitstream reorders display (B-frames). Decode-order timestamps are wrong as presentation times, so it derives the display timeline instead.
+   - Sits BEFORE the Enforcer; per-track, stateful, in-memory only. It never inspects payload bytes: the session parses each AU's POC via `core.PictureOrderParser` (§5.A) and passes the `POCInfo` in.
+   - Principle: the picture with display rank d takes decode-clock slot `t[d + D]` (D = observed reorder depth — the causality delay). Ranks come from the POC; a bounded startup probe (8 pictures) detects whether the stream reorders at all, and a sliding lookahead window (observed depth + margin, capped at the 16-frame DPB bound) delays each picture just long enough to rank it exactly. Slots beyond the newest arrival are extrapolated from the median decode-clock delta.
+   - Guarantees: decode order preserved exactly; DTS (the decode clock) never altered; `PTS ≥ DTS` per frame (clamped under a jittery startup clock, degrading locally); display-order PTS strictly increasing in steady state; reorder-free input is a zero-steady-latency passthrough, byte-identical to earlier releases.
 
 ### C. Muxer Layer (`internal/muxer` & `internal/format/webm`)
 

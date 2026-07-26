@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/webm"
 	"github.com/famomatic/puremux/internal/preprocessor"
 )
 
@@ -22,15 +23,32 @@ import (
 // buffer holds packets across calls, so the caller may reuse its buffer
 // immediately after the call returns.
 
-// WriteVideo feeds one video access unit (Annex-B for H.264/HEVC) stamped
-// with pts (== dts). It is only correct for streams WITHOUT B-frame
-// reordering; for decode-order streams whose per-frame presentation
-// timestamps may be non-monotonic (B-frames), use WriteVideoReordered, which
-// synthesizes a valid DTS. (Callers that already hold a correct distinct
-// PTS/DTS pair can still use WritePacket directly.) The keyframe flag is
-// derived from the track's codec detector so the Aligner can sync audio to
-// the first IDR.
+// WriteVideo feeds one video access unit (Annex-B for H.264/HEVC) in DECODE
+// order, stamped with t — a monotonic decode-order clock (the live delivery
+// clock). t is used as the decode timestamp (DTS) directly.
+//
+// The presentation timestamp is derived from the BITSTREAM: for MPEG-TS
+// output with H.264/HEVC, each AU's picture order count (POC) is parsed from
+// the slice headers, and frames that the bitstream reorders (B-frames) get a
+// PES PTS reflecting their true display slot on the decode clock (PES then
+// carries a distinct PTS/DTS pair). Streams without B-frames collapse to
+// PTS == DTS == t, byte-identical to earlier releases, with zero
+// steady-state latency after a one-time startup probe of 8 pictures. For
+// B-frame streams the added latency is a bounded reorder lookahead (the
+// observed B-pyramid depth + margin, capped at the 16-frame DPB bound).
+// Streams whose POC cannot be parsed (missing parameter sets, POC type 1)
+// fall back to PTS == DTS per AU. Frames held by the probe/lookahead are
+// drained by Close.
+//
+// The keyframe flag is derived from the track's codec detector so the
+// Aligner can sync audio to the first IDR. Callers that already hold a
+// correct distinct PTS/DTS pair can use WritePacket directly; callers whose
+// per-frame timestamps are PRESENTATION times in decode order should use
+// WriteVideoReordered instead. Do not mix the three on one track.
 func (s *Session) WriteVideo(trackID int, au []byte, pts time.Duration) error {
+	if s.closed {
+		return io.ErrClosedPipe
+	}
 	idx, ok := s.trackByID[trackID]
 	if !ok {
 		return errUnknownTrack
@@ -43,7 +61,43 @@ func (s *Session) WriteVideo(trackID int, au []byte, pts time.Duration) error {
 	p.Codec = spec.Codec
 	p.TrackID = trackID
 	p.IsKeyframe = s.detectors.Detector(spec.Codec).IsKeyframe(au)
-	return s.WritePacket(p)
+	st := s.ptsStageFor(trackID, spec)
+	if st == nil {
+		return s.writePacket(p)
+	}
+	poc, isPic := st.parser.ParseAU(au)
+	var werr error
+	st.synth.Process(p, poc, isPic, func(out *core.Packet) {
+		if werr == nil {
+			werr = s.writePacket(out)
+		} else {
+			core.ReleasePacket(out)
+		}
+	})
+	return werr
+}
+
+// ptsStageFor returns (lazily creating) the track's presentation stage, or
+// nil when the stage does not apply: non-TS output (the WebM/MKV writer keys
+// blocks on DTS only), non-video tracks, or codecs without bitstream display
+// reordering.
+func (s *Session) ptsStageFor(trackID int, spec webm.TrackSpec) *ptsStage {
+	if !s.isTS() || !spec.IsVideo {
+		return nil
+	}
+	if st, ok := s.ptsStages[trackID]; ok {
+		return st
+	}
+	parser := core.NewPictureOrderParser(spec.Codec)
+	if parser == nil {
+		return nil
+	}
+	st := &ptsStage{
+		parser: parser,
+		synth:  preprocessor.NewPresentationSynthesizer(s.cfg.Preprocessor),
+	}
+	s.ptsStages[trackID] = st
+	return st
 }
 
 // WriteVideoReordered feeds one video access unit (Annex-B for H.264/HEVC)
