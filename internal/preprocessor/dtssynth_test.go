@@ -1,6 +1,8 @@
 package preprocessor
 
 import (
+	"math/rand"
+	"slices"
 	"testing"
 	"time"
 
@@ -106,9 +108,9 @@ func TestDTSSynthSteadyStateZeroLatency(t *testing.T) {
 }
 
 func TestDTSSynthMonotonicPassthrough(t *testing.T) {
-	// No reordering: probe must exit after dtsProbeMonoExit frames, and every
-	// frame must come out with DTS exactly equal to its PTS.
-	pts := []int{0, 20, 40, 60, 80, 100, 120}
+	// No reordering: probe must exit after a full dtsProbeWindow of monotonic
+	// frames, and every frame must come out with DTS exactly equal to its PTS.
+	pts := []int{0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220}
 	out, perCall := feedSynth(t, NewDTSSynthesizer(synthCfg()), pts)
 	defer releaseAll(out)
 	checkSynthInvariants(t, out, pts)
@@ -117,12 +119,12 @@ func TestDTSSynthMonotonicPassthrough(t *testing.T) {
 			t.Fatalf("DTS != PTS at %d: %v vs %v", i, p.DTS, p.PTS)
 		}
 	}
-	// Probe releases everything on the dtsProbeMonoExit-th arrival...
-	if perCall[dtsProbeMonoExit-1] != dtsProbeMonoExit {
-		t.Fatalf("probe exit emitted %d, want %d", perCall[dtsProbeMonoExit-1], dtsProbeMonoExit)
+	// Probe releases everything once the window fills...
+	if perCall[dtsProbeWindow-1] != dtsProbeWindow {
+		t.Fatalf("probe exit emitted %d, want %d", perCall[dtsProbeWindow-1], dtsProbeWindow)
 	}
 	// ...and is a 1:1 passthrough afterwards.
-	for i := dtsProbeMonoExit; i < len(perCall); i++ {
+	for i := dtsProbeWindow; i < len(perCall); i++ {
 		if perCall[i] != 1 {
 			t.Fatalf("passthrough call %d emitted %d packets, want 1", i, perCall[i])
 		}
@@ -164,6 +166,104 @@ func TestDTSSynthShortStreamFlush(t *testing.T) {
 		if p.DTS != p.PTS {
 			t.Fatalf("DTS != PTS at %d", i)
 		}
+	}
+}
+
+// steadyBFramePTS returns `groups` mini-GOPs of a 60fps decode-order pattern
+// with reorder depth 2 (two anchors then the B-frame presenting between
+// them): for base b at 50ms spacing, b+34, b+50, b+17.
+func steadyBFramePTS(startMs, groups int) []int {
+	var pts []int
+	for g := range groups {
+		b := startMs + 50*g
+		pts = append(pts, b+34, b+50, b+17)
+	}
+	return pts
+}
+
+func TestDTSSynthScrambledStartupDeterministic(t *testing.T) {
+	// The v0.0.8 regression: a live session that starts with a backfill burst
+	// delivered out of order with a duplicated timestamp, then settles into a
+	// clean B-frame GOP. The v0.0.7 one-shot probe measured the reorder depth
+	// from the scrambled burst, so the synthesized timeline depended on the
+	// burst's arrival order (non-deterministic across sessions). Every
+	// scramble must now yield strict invariants for EVERY frame, and the
+	// decode delay must converge to the steady stream's depth regardless of
+	// how badly the burst inflated the startup measurement.
+	base := []int{13867, 13884, 13900, 13917, 13934, 13950, 13967, 13984}
+	for seed := range int64(100) {
+		rng := rand.New(rand.NewSource(seed))
+		burst := slices.Clone(base)
+		burst[rng.Intn(len(burst))] = burst[rng.Intn(len(burst))] // duplicate one
+		rng.Shuffle(len(burst), func(i, j int) { burst[i], burst[j] = burst[j], burst[i] })
+		if slices.IsSorted(burst) {
+			// A shuffle that lands monotonic is indistinguishable from a true
+			// reorder-free start; only actual scrambles are asserted here.
+			continue
+		}
+		pts := append(slices.Clone(burst), steadyBFramePTS(14000, 40)...)
+		s := NewDTSSynthesizer(synthCfg())
+		out, _ := feedSynth(t, s, pts)
+		checkSynthInvariants(t, out, pts)
+		// Decay must have walked any burst-inflated delay back down to the
+		// steady pattern's depth (2) + 1 margin.
+		if s.delay > 3 {
+			releaseAll(out)
+			t.Fatalf("seed %d: delay %d did not decay to the steady depth", seed, s.delay)
+		}
+		releaseAll(out)
+	}
+}
+
+func TestDTSSynthDuplicateBurstThenBFrames(t *testing.T) {
+	// The production jittery-startup shape: a backfill burst of frames all
+	// sharing one timestamp (no ordering evidence at all), then the clean
+	// B-frame pattern. The v0.0.7 probe declared this "monotonic" after 4
+	// duplicates and locked DTS==PTS passthrough for the whole stream; the
+	// probe must instead keep holding until real ordering evidence arrives
+	// and then emit a fully valid timeline — no DTS>PTS transient at all.
+	burst := []int{13900, 13900, 13900, 13900, 13900, 13900, 13900, 13900}
+	pts := append(slices.Clone(burst), steadyBFramePTS(14000, 20)...)
+	out, _ := feedSynth(t, NewDTSSynthesizer(synthCfg()), pts)
+	defer releaseAll(out)
+	checkSynthInvariants(t, out, pts)
+}
+
+func TestDTSSynthDuplicateOnlyStreamStaysPassthrough(t *testing.T) {
+	// A stream that never yields ordering evidence (every frame one
+	// timestamp) must exit the probe at the hard cap as a passthrough, with
+	// bounded latency, leaving the duplicates for the Enforcer.
+	pts := make([]int, dtsProbeMaxExtend+8)
+	for i := range pts {
+		pts[i] = 700
+	}
+	out, perCall := feedSynth(t, NewDTSSynthesizer(synthCfg()), pts)
+	defer releaseAll(out)
+	if len(out) != len(pts) {
+		t.Fatalf("emitted %d, want %d", len(out), len(pts))
+	}
+	for i, p := range out {
+		if p.DTS != p.PTS {
+			t.Fatalf("duplicate run altered at %d: dts=%v pts=%v", i, p.DTS, p.PTS)
+		}
+	}
+	if perCall[dtsProbeMaxExtend-1] != dtsProbeMaxExtend {
+		t.Fatalf("probe cap exit emitted %d, want %d", perCall[dtsProbeMaxExtend-1], dtsProbeMaxExtend)
+	}
+}
+
+func TestDTSSynthDelayDecaysAfterInflatedStart(t *testing.T) {
+	// A fully reversed startup window inflates the measured depth to the
+	// window maximum. The steady-phase decay must walk the delay back to the
+	// observed steady depth instead of locking the inflated lead forever.
+	burst := []int{13984, 13967, 13950, 13934, 13917, 13900, 13884, 13867}
+	pts := append(slices.Clone(burst), steadyBFramePTS(14000, 40)...)
+	s := NewDTSSynthesizer(synthCfg())
+	out, _ := feedSynth(t, s, pts)
+	defer releaseAll(out)
+	checkSynthInvariants(t, out, pts)
+	if s.delay > 3 {
+		t.Fatalf("delay %d did not decay to the steady depth", s.delay)
 	}
 }
 

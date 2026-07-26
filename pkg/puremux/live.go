@@ -59,13 +59,18 @@ func (s *Session) WriteVideo(trackID int, au []byte, pts time.Duration) error {
 // It is safe to call unconditionally, without knowing whether the stream has
 // B-frames: input with monotonic timestamps collapses to the WriteVideo fast
 // path (DTS == PTS, byte-identical output, zero steady-state latency).
-// Added latency is bounded to a one-time startup probe of at most 8 frames
-// (3 when the first 4 frames show no reordering) while the stream's reorder
-// depth is measured; afterwards every access unit is forwarded by the call
-// that delivered it. If the reorder depth grows mid-stream (deeper B-pyramid
-// appearing only later), the delay adapts within a frame or two; the bridging
-// frames may transiently carry DTS slightly above PTS before the timeline
-// re-converges. Frames still held by the startup probe are drained by Close.
+// Added latency is bounded to a one-time startup probe of 8 frames (up to 32
+// when the start is duplicate-heavy and carries no ordering evidence) while
+// the stream's reorder depth is measured; afterwards every access unit is
+// forwarded by the call that delivered it. The measurement is continuous, not
+// locked at startup: it is order-tolerant within the probe window (a
+// scrambled or duplicate-stamped backfill burst at session start yields a
+// deterministic, valid timeline), and the decode delay keeps adapting
+// afterwards — growing within a frame or two if a deeper B-pyramid appears
+// (bridging frames may transiently carry DTS slightly above PTS before the
+// timeline re-converges) and decaying back when a burst-inflated startup
+// measurement exceeds the stream's real depth. Frames still held by the
+// startup probe are drained by Close.
 //
 // Do not mix WriteVideo, WriteVideoReordered, and WritePacket on the same
 // track: the synthesizer only sees frames fed through this method, so a

@@ -11,17 +11,37 @@ import (
 // they encode codec-level facts (H.264/HEVC DPB reordering limits), not
 // deployment tuning.
 const (
-	// dtsProbeWindow is the maximum number of frames held at stream start to
-	// measure the reorder depth of a B-frame stream. One mini-GOP (typically
-	// <= 4 frames) reveals the full pyramid depth, so 8 leaves margin.
+	// dtsProbeWindow is the number of frames held at stream start to measure
+	// the reorder depth of a B-frame stream. One mini-GOP (typically <= 4
+	// frames) reveals the full pyramid depth, so 8 leaves margin; it also
+	// covers a startup backfill burst of up to 8 scrambled frames, which the
+	// window-based measurement handles because every burst frame is measured
+	// against all of its held predecessors (order-tolerant within the window).
 	dtsProbeWindow = 8
-	// dtsProbeMonoExit ends the probe early: if the first dtsProbeMonoExit
-	// frames arrive with non-decreasing PTS the stream is assumed
-	// reorder-free (depth 0, DTS == PTS) and held frames are released.
-	dtsProbeMonoExit = 4
+	// dtsProbeMinDistinct is the minimum number of DISTINCT presentation
+	// timestamps the probe must see before declaring a stream reorder-free.
+	// A duplicate-stamped backfill burst (every frame sharing one timestamp)
+	// carries no ordering evidence at all: counting it as "monotonic" locked
+	// the v0.0.7 probe into DTS==PTS passthrough right before the stream's
+	// first real B-frames arrived.
+	dtsProbeMinDistinct = 4
+	// dtsProbeMaxExtend bounds the probe when the window is duplicate-heavy
+	// (fewer than dtsProbeMinDistinct distinct timestamps after
+	// dtsProbeWindow frames): the probe keeps holding frames until enough
+	// distinct timestamps arrive or this hard cap is reached, so startup
+	// latency stays bounded even for pathological all-duplicate streams.
+	dtsProbeMaxExtend = 32
 	// dtsMaxReorderDepth caps the synthesized decode delay at the H.264
 	// maximum DPB reorder depth.
 	dtsMaxReorderDepth = 16
+	// dtsDepthDecayWindow is the number of steady-phase frames over which the
+	// observed reorder depth is aggregated before the decode delay is allowed
+	// to shrink one step toward it. A scrambled startup burst can inflate the
+	// measured depth well past the stream's true steady-state depth; without
+	// decay that one-shot over-measurement would lock a permanently excessive
+	// DTS lead. The window spans several mini-GOPs so a normal B-pyramid never
+	// looks shallower than it is.
+	dtsDepthDecayWindow = 16
 )
 
 // DTSSynthesizer derives a valid decode timeline for a video stream delivered
@@ -39,39 +59,57 @@ const (
 // Principle: for a stream with decoder reorder depth D, a valid decode
 // timeline is the PTS sequence sorted ascending and delayed by D frames
 // (DTS[n] = sortedPTS[n-D]); the first D frames extrapolate backwards from
-// the earliest PTS. The synthesizer measures D from the stream itself:
+// the earliest PTS. The synthesizer measures D from the stream itself,
+// continuously — no measurement is ever locked permanently:
 //
-//   - Probe phase: the first frames are held while the observed reorder depth
-//     (max count of earlier-decoded frames with a larger PTS) is measured.
-//     If the first dtsProbeMonoExit frames are non-decreasing the stream is
-//     declared reorder-free and the synthesizer becomes a passthrough
-//     (DTS == PTS, zero added latency, duplicate timestamps left for the
-//     Enforcer's nudge exactly as with unsynthesized input). Otherwise the
-//     probe runs to dtsProbeWindow frames and locks delay = depth+1 (the +1
+//   - Probe phase: the first dtsProbeWindow frames are held while the
+//     observed reorder depth (max count of earlier-decoded frames with a
+//     larger PTS) is measured across the whole window. Because every frame is
+//     compared against all held predecessors, the measurement is
+//     order-tolerant within the window: a scrambled startup burst yields the
+//     depth needed to cover its own jitter, deterministically, regardless of
+//     arrival order. If the full window shows no reordering across at least
+//     dtsProbeMinDistinct distinct timestamps the stream is declared
+//     reorder-free and the synthesizer becomes a passthrough (DTS == PTS,
+//     zero added latency, duplicate timestamps left for the Enforcer's nudge
+//     exactly as with unsynthesized input). A duplicate-heavy window
+//     (duplicated backfill timestamps carry no ordering evidence) extends the
+//     probe up to dtsProbeMaxExtend frames instead of mis-declaring
+//     passthrough. Otherwise the probe locks in delay = depth+1 (the +1
 //     absorbs one pyramid level appearing only after the probe).
 //   - Steady phase: every frame is emitted immediately on arrival (no added
 //     latency); its DTS is the smallest not-yet-consumed PTS, which lags the
-//     newest arrival by `delay` frames. If a deeper reorder than `delay`
-//     appears mid-stream the delay grows adaptively; the frames bridging the
-//     growth get minimal-step DTS nudges that may transiently exceed their
-//     PTS by roughly one frame interval before the timeline re-converges.
+//     newest arrival by `delay` frames. The reorder depth keeps being
+//     measured over a sliding window of recent frames: if a deeper reorder
+//     appears the delay grows immediately (the bridging frames get
+//     minimal-step DTS nudges that may transiently exceed their PTS by
+//     roughly one frame interval before the timeline re-converges); if the
+//     observed depth stays below the active delay for dtsDepthDecayWindow
+//     consecutive frames the delay shrinks one step (skipping ahead in the
+//     sorted-PTS timeline, which preserves monotonicity and DTS <= PTS), so
+//     a startup burst can never lock a permanently excessive lead.
 //
 // Added latency: at most dtsProbeWindow frames once at stream start
-// (dtsProbeMonoExit-1 frames when no reordering is observed); zero afterwards.
+// (dtsProbeMaxExtend for a pathological duplicate-only start); zero
+// afterwards.
 //
 // The synthesizer NEVER writes to a file and never inspects payload bytes
 // (ARCHITECTURE.md sections 4 and 5.B). It is not safe for concurrent use.
 type DTSSynthesizer struct {
-	step      time.Duration // minimum DTS advance in reorder mode
-	probing   bool
-	held      []*core.Packet  // decode-order FIFO, only during the probe
-	depth     int             // max observed reorder depth
-	delay     int             // active decode delay D; never shrinks
-	pending   ptsMinHeap      // PTS values not yet consumed as DTS (steady: len == delay)
-	recent    []time.Duration // ring of the last dtsMaxReorderDepth PTS values
-	recentPos int
-	lastDTS   time.Duration
-	emitted   bool
+	step       time.Duration // minimum DTS advance in reorder mode
+	probing    bool
+	held       []*core.Packet  // decode-order FIFO, only during the probe
+	depth      int             // max observed reorder depth (probe phase)
+	distinct   int             // distinct PTS values seen by the probe
+	dupMax     int             // longest duplicate-PTS run seen by the probe
+	delay      int             // active decode delay D; adapts both directions
+	pending    ptsMinHeap      // PTS values not yet consumed as DTS (steady: len == delay)
+	recent     []time.Duration // ring of the last dtsMaxReorderDepth PTS values
+	recentPos  int
+	decayMax   int // max reorder depth observed in the current decay window
+	decayCount int // frames accumulated in the current decay window
+	lastDTS    time.Duration
+	emitted    bool
 }
 
 // NewDTSSynthesizer builds a synthesizer honoring cfg.MinMonotonicStep (the
@@ -106,27 +144,61 @@ func (s *DTSSynthesizer) Flush(emit func(*core.Packet)) {
 	if !s.probing {
 		return
 	}
-	// End of stream: the measured depth is exact, no margin needed.
-	s.finishProbe(min(s.depth, dtsMaxReorderDepth), emit)
+	// End of stream: the measured depth is exact, no margin needed. Reordered
+	// duplicate runs still need delay >= run length (see probe).
+	delay := s.depth
+	if delay > 0 {
+		delay = max(delay, s.dupMax)
+	}
+	s.finishProbe(min(delay, dtsMaxReorderDepth), emit)
 }
 
 // probe holds the frame and measures reorder depth until an exit condition.
 func (s *DTSSynthesizer) probe(p *core.Packet, emit func(*core.Packet)) {
-	if n := s.countLargerPTS(s.heldPTS(), p.PTS); n > s.depth {
-		s.depth = n
+	larger, equal := 0, 0
+	for _, q := range s.held {
+		switch {
+		case q.PTS > p.PTS:
+			larger++
+		case q.PTS == p.PTS:
+			equal++
+		}
+	}
+	if larger > s.depth {
+		s.depth = larger
+	}
+	if equal == 0 {
+		s.distinct++
+	}
+	if equal+1 > s.dupMax {
+		s.dupMax = equal + 1
 	}
 	s.held = append(s.held, p)
-	if s.depth == 0 && len(s.held) >= dtsProbeMonoExit {
-		s.finishProbe(0, emit)
+	if len(s.held) < dtsProbeWindow {
 		return
 	}
-	if len(s.held) >= dtsProbeWindow {
-		s.finishProbe(min(s.depth+1, dtsMaxReorderDepth), emit)
+	switch {
+	case s.depth > 0:
+		// Reordering observed: the full window's measurement covers every held
+		// frame's displacement, so depth+1 is a safe decode delay for both the
+		// burst and (with margin) the steady stream behind it. A duplicate run
+		// needs at least its own length as delay so every duplicate's DTS can
+		// sit below the shared PTS (strict monotonicity forces them apart).
+		s.finishProbe(min(max(s.depth+1, s.dupMax), dtsMaxReorderDepth), emit)
+	case s.distinct >= dtsProbeMinDistinct:
+		// A full window of genuinely monotonic timestamps: reorder-free.
+		s.finishProbe(0, emit)
+	case len(s.held) >= dtsProbeMaxExtend:
+		// Duplicate-only start with no ordering evidence at the hard cap:
+		// give up and pass through (the Enforcer handles duplicate repair).
+		s.finishProbe(0, emit)
 	}
+	// Otherwise: duplicate-heavy window, keep probing for ordering evidence.
 }
 
-// finishProbe locks the decode delay, assigns DTS to every held frame from
-// the sorted-and-delayed PTS timeline, and switches to the steady phase.
+// finishProbe locks the initial decode delay, assigns DTS to every held frame
+// from the sorted-and-delayed PTS timeline, and switches to the steady phase
+// (where the delay keeps adapting in both directions).
 func (s *DTSSynthesizer) finishProbe(delay int, emit func(*core.Packet)) {
 	s.probing = false
 	s.delay = delay
@@ -161,22 +233,51 @@ func (s *DTSSynthesizer) finishProbe(delay int, emit func(*core.Packet)) {
 	s.held = s.held[:0]
 }
 
-// steady emits the frame immediately with the next delayed-sorted-PTS value.
+// steady emits the frame immediately with the next delayed-sorted-PTS value,
+// growing the decode delay as soon as a deeper reorder is observed and
+// shrinking it (one step per dtsDepthDecayWindow frames of evidence) when the
+// stream's observed depth stays below it.
 func (s *DTSSynthesizer) steady(p *core.Packet, emit func(*core.Packet)) {
-	if n := s.countLargerPTS(s.recent, p.PTS); n > s.delay {
+	n := s.countLargerPTS(s.recent, p.PTS)
+	if n > s.delay {
 		s.delay = min(n, dtsMaxReorderDepth)
 	}
+	s.updateDepthDecay(n)
 	s.pushRecent(p.PTS)
 	s.pending.push(p.PTS)
 	var cand time.Duration
 	if len(s.pending) > s.delay {
 		cand = s.pending.pop()
+		// After a delay shrink the pending set is oversized; consuming the
+		// surplus here skips the synthesized timeline ahead in the sorted-PTS
+		// order (monotonic, and closer to — never past — the frame's PTS).
+		for len(s.pending) > s.delay {
+			cand = s.pending.pop()
+		}
 	} else {
 		// The delay just grew: keep this presentation time pending and bridge
 		// with a minimal nudge (the documented mid-stream-growth transient).
 		cand = s.lastDTS + s.step
 	}
 	s.emitWithDTS(p, cand, emit)
+}
+
+// updateDepthDecay aggregates the per-frame observed reorder depth n and,
+// once a full evidence window shows the active delay exceeds the observed
+// depth (+1 margin), shrinks the delay one step. Passthrough (delay 0) is
+// never re-entered: the floor in reorder mode is delay 1.
+func (s *DTSSynthesizer) updateDepthDecay(n int) {
+	if n > s.decayMax {
+		s.decayMax = n
+	}
+	s.decayCount++
+	if s.decayCount < dtsDepthDecayWindow {
+		return
+	}
+	if target := s.decayMax + 1; s.delay > target {
+		s.delay--
+	}
+	s.decayMax, s.decayCount = 0, 0
 }
 
 // emitWithDTS stamps the frame and emits it. In reorder mode (delay > 0) the
@@ -195,16 +296,6 @@ func (s *DTSSynthesizer) emitWithDTS(p *core.Packet, dts time.Duration, emit fun
 	emit(p)
 }
 
-// heldPTS returns the presentation times of the held probe frames. The probe
-// holds at most dtsProbeWindow frames, so the scan is O(8).
-func (s *DTSSynthesizer) heldPTS() []time.Duration {
-	pts := make([]time.Duration, len(s.held))
-	for i, q := range s.held {
-		pts[i] = q.PTS
-	}
-	return pts
-}
-
 // countLargerPTS counts values strictly greater than pts: the number of
 // earlier-decoded frames this frame presents before, i.e. its reorder depth.
 func (s *DTSSynthesizer) countLargerPTS(window []time.Duration, pts time.Duration) int {
@@ -218,7 +309,7 @@ func (s *DTSSynthesizer) countLargerPTS(window []time.Duration, pts time.Duratio
 }
 
 // pushRecent records pts in the bounded decode-order ring used for
-// mid-stream reorder-depth growth detection.
+// steady-phase reorder-depth measurement.
 func (s *DTSSynthesizer) pushRecent(pts time.Duration) {
 	if len(s.recent) < dtsMaxReorderDepth {
 		s.recent = append(s.recent, pts)

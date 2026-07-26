@@ -3,6 +3,57 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## v0.0.8 — 2026-07-27
+
+### Fixed
+
+- **`WriteVideoReordered`: non-deterministic DTS synthesis on jittery
+  startups.** Live sessions that begin with a backfill burst (frames
+  delivered out of order and/or with duplicated timestamps before the stream
+  settles into its regular B-frame GOP) made the v0.0.7 one-shot startup
+  probe non-deterministic: depending on the burst's arrival order the probe
+  either mis-declared the stream reorder-free after 4 "non-decreasing"
+  duplicates (locking DTS==PTS passthrough — duplicate/non-monotonic DTS on
+  every B-frame for the rest of the stream, ~80 of 240 frames in field
+  captures) or locked a burst-inflated reorder depth (a permanently excessive
+  DTS lead). Same input pattern, different session, different result.
+
+  The synthesis is now continuous and never locks a startup measurement:
+
+  - the probe always evaluates its full 8-frame window (no 4-frame monotonic
+    early-exit), so the depth measurement is order-tolerant within the
+    window — every scramble of a startup burst yields a deterministic, valid
+    delay covering the burst's own jitter;
+  - passthrough (DTS==PTS) is only declared from a full window with zero
+    reordering across at least 4 *distinct* timestamps; a duplicate-heavy
+    window (duplicated backfill timestamps carry no ordering evidence)
+    extends the probe — bounded at 32 frames — until real ordering evidence
+    arrives, instead of mis-locking right before the first B-frames;
+  - a reordered duplicate run sizes the delay to at least the run length so
+    every duplicate's synthesized DTS stays at or below its PTS;
+  - the steady phase keeps measuring reorder depth over a sliding window of
+    recent frames: the delay still grows immediately when a deeper B-pyramid
+    appears, and now also *decays* (one step per 16-frame evidence window,
+    skipping ahead in the sorted-PTS timeline, which preserves monotonicity
+    and DTS <= PTS) when a burst-inflated startup measurement exceeds the
+    stream's real depth.
+
+  Invariants on the output, verified per frame across 100 scrambled-burst
+  orderings (unit + full-session MPEG-TS tests) and externally with
+  ffprobe/ffmpeg (0 non-monotonic `pkt_dts_time`, no "non monotonically
+  increasing dts" warnings, startup included): DTS strictly monotonic at
+  container-clock granularity, DTS <= PTS, decode order preserved, PTS
+  deltas unaltered, no frames dropped.
+
+### Changed
+
+- `WriteVideoReordered` startup latency for reorder-free streams is now the
+  full 8-frame probe window (was 3 frames when the first 4 arrived
+  monotonic); duplicate-only starts may hold up to 32 frames before falling
+  back to passthrough. Steady-state latency is unchanged (zero — every
+  access unit is still forwarded by the call that delivered it), and
+  monotonic/duplicate-burst input remains byte-identical to `WriteVideo`.
+
 ## v0.0.7 — 2026-07-27
 
 ### Added

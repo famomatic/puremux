@@ -2,6 +2,8 @@ package puremux
 
 import (
 	"bytes"
+	"math/rand"
+	"slices"
 	"testing"
 	"time"
 )
@@ -86,6 +88,126 @@ func TestWriteVideoReorderedBFrames(t *testing.T) {
 	}
 	if !sawSplitPTSDTS {
 		t.Fatal("no PES carried a distinct PTS/DTS pair; DTS synthesis inactive?")
+	}
+}
+
+// bframe60fps returns `groups` mini-GOPs of a 60fps decode-order PTS pattern
+// (ms) with reorder depth 2: for base b at 50ms spacing, b+34, b+50, b+17
+// (two anchors, then the B-frame that presents between them).
+func bframe60fps(startMs, groups int) []int {
+	var pts []int
+	for g := range groups {
+		b := startMs + 50*g
+		pts = append(pts, b+34, b+50, b+17)
+	}
+	return pts
+}
+
+func TestWriteVideoReorderedJitteryStartup(t *testing.T) {
+	// The v0.0.8 regression: a session starts with a backfill burst delivered
+	// out of order with a duplicated timestamp (the IDR first, so the Aligner
+	// drops nothing), then settles into a clean B-frame GOP. The v0.0.7
+	// one-shot startup probe measured the reorder depth from the scrambled
+	// burst, so whether the stream lead-shifted depended on the burst's
+	// arrival order: most orderings produced DTS==PTS passthrough with
+	// duplicate/non-monotonic DTS for the whole stream. Every scramble must
+	// now produce a stream whose EVERY frame has strictly increasing DTS (at
+	// 90 kHz granularity) and DTS <= PTS, with decode order and PTS deltas
+	// preserved exactly.
+	base := []int{13867, 13884, 13900, 13917, 13934, 13950, 13967, 13984}
+	for seed := range int64(100) {
+		rng := rand.New(rand.NewSource(seed))
+		burst := slices.Clone(base)
+		burst[rng.Intn(len(burst))] = burst[rng.Intn(len(burst))] // duplicate one
+		rng.Shuffle(len(burst), func(i, j int) { burst[i], burst[j] = burst[j], burst[i] })
+		if slices.IsSorted(burst) {
+			// A shuffle that lands monotonic is indistinguishable from a true
+			// reorder-free start; only actual scrambles are asserted here.
+			continue
+		}
+		ptsMs := append(slices.Clone(burst), bframe60fps(14000, 80)...)
+
+		var buf bytes.Buffer
+		s, err := NewSession(&buf, reorderCfg())
+		if err != nil {
+			t.Fatal(err)
+		}
+		vid, err := s.AddTrack(Track{Codec: CodecH264, IsVideo: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, ms := range ptsMs {
+			hdr := byte(0x41)
+			if i == 0 {
+				hdr = 0x65 // IDR leads the backfill burst
+			}
+			if err := s.WriteVideoReordered(vid, annexBAU(hdr, byte(i)), time.Duration(ms)*time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		video := demuxTS(t, buf.Bytes(), 0x100)
+		if len(video) != len(ptsMs) {
+			t.Fatalf("seed %d: video PES count = %d, want %d", seed, len(video), len(ptsMs))
+		}
+		for i, pes := range video {
+			if pes.es[5] != byte(i) {
+				t.Fatalf("seed %d: decode order broken at %d: payload tag %#x", seed, i, pes.es[5])
+			}
+			if i > 0 && pes.dts <= video[i-1].dts {
+				t.Fatalf("seed %d: DTS not strictly increasing at %d: %d <= %d (burst %v)",
+					seed, i, pes.dts, video[i-1].dts, burst)
+			}
+			if pes.dts > pes.pts {
+				t.Fatalf("seed %d: DTS > PTS at %d: %d > %d (burst %v)", seed, i, pes.dts, pes.pts, burst)
+			}
+			wantDelta := uint64(ptsMs[i]-ptsMs[0]) * 90
+			if got := pes.pts - video[0].pts; got != wantDelta {
+				t.Fatalf("seed %d: PTS delta altered at %d: got %d ticks, want %d", seed, i, got, wantDelta)
+			}
+		}
+	}
+}
+
+func TestWriteVideoReorderedDuplicateBurstThenBFrames(t *testing.T) {
+	// The production jittery-startup shape: a backfill burst all sharing one
+	// timestamp (no ordering evidence), then the clean B-frame pattern. The
+	// probe must hold past the duplicate burst until ordering evidence
+	// arrives instead of locking DTS==PTS passthrough for the whole stream.
+	ptsMs := append([]int{13900, 13900, 13900, 13900, 13900, 13900, 13900, 13900},
+		bframe60fps(14000, 80)...)
+	var buf bytes.Buffer
+	s, _ := NewSession(&buf, reorderCfg())
+	vid, _ := s.AddTrack(Track{Codec: CodecH264, IsVideo: true})
+	for i, ms := range ptsMs {
+		hdr := byte(0x41)
+		if i == 0 {
+			hdr = 0x65
+		}
+		if err := s.WriteVideoReordered(vid, annexBAU(hdr, byte(i)), time.Duration(ms)*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	video := demuxTS(t, buf.Bytes(), 0x100)
+	if len(video) != len(ptsMs) {
+		t.Fatalf("video PES count = %d, want %d", len(video), len(ptsMs))
+	}
+	for i, pes := range video {
+		if pes.es[5] != byte(i) {
+			t.Fatalf("decode order broken at %d", i)
+		}
+		if i > 0 && pes.dts <= video[i-1].dts {
+			t.Fatalf("DTS not strictly increasing at %d: %d <= %d", i, pes.dts, video[i-1].dts)
+		}
+		if pes.dts > pes.pts {
+			t.Fatalf("DTS > PTS at %d: %d > %d", i, pes.dts, pes.pts)
+		}
 	}
 }
 
