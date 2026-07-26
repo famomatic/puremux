@@ -185,3 +185,32 @@ func TestEnforcerDefaultNudgeIs1ns(t *testing.T) {
 		core.ReleasePacket(p)
 	}
 }
+
+func TestEnforcerStableOrderForEqualDTS(t *testing.T) {
+	// Packets sharing one DTS must emit in ARRIVAL order. The old first-equal
+	// insertion point reversed duplicate runs, which put a burst's keyframe
+	// last and let the Aligner drop the whole burst.
+	e := NewEnforcer(Config{MaxBufferSize: 16, MaxBufferDuration: 1})
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+	for i := 0; i < 4; i++ {
+		p := core.AcquirePacket()
+		p.DTS = 100 * time.Millisecond
+		p.Data = append(p.Data[:0], byte(i))
+		if err := e.Process(p, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.Flush(emit)
+	if len(got) != 4 {
+		t.Fatalf("got %d packets, want 4", len(got))
+	}
+	for i, p := range got {
+		if len(p.Data) != 1 || p.Data[0] != byte(i) {
+			t.Fatalf("packet %d out of arrival order: payload %v", i, p.Data)
+		}
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}

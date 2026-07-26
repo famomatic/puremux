@@ -49,7 +49,12 @@ func (e *Enforcer) Process(inbound *core.Packet, emit func(*core.Packet)) error 
 	return nil
 }
 
-// insertOrdered inserts p keeping buf sorted by DTS ascending.
+// insertOrdered inserts p keeping buf sorted by DTS ascending. The insert is
+// STABLE: among equal DTS values the new packet goes after the existing ones,
+// preserving arrival order. With `>=` (first equal index) a duplicate-stamped
+// run came back out reversed — a live backfill burst [IDR, F1..F9] all
+// stamped t0 emitted as [F9..F1, IDR], so the keyframe Aligner dropped every
+// frame ahead of the reordered IDR and the whole burst was lost.
 func (e *Enforcer) insertOrdered(p *core.Packet) {
 	// Drop immediately if older than last emitted (already too late).
 	if e.emitted && p.DTS < e.lastDTS {
@@ -58,7 +63,7 @@ func (e *Enforcer) insertOrdered(p *core.Packet) {
 		return
 	}
 	idx := sort.Search(len(e.buf), func(i int) bool {
-		return e.buf[i].DTS >= p.DTS
+		return e.buf[i].DTS > p.DTS
 	})
 	e.buf = append(e.buf, nil)
 	copy(e.buf[idx+1:], e.buf[idx:])

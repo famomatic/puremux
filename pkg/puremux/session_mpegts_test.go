@@ -215,3 +215,116 @@ func TestMergeRejectsMPEGTSOutput(t *testing.T) {
 		t.Fatalf("MergeToWriter TS: err = %v, want ErrUnsupportedOutput", err)
 	}
 }
+
+func TestSessionMPEGTSKeyframeFirstDuplicateBurst(t *testing.T) {
+	// The SOOP startup shape: the keyframe AND its following frames all share
+	// one backfill timestamp. Regression for the Enforcer's unstable
+	// equal-DTS insertion, which reversed the burst so the Aligner dropped
+	// every frame and the stream started 9 frames late.
+	var buf bytes.Buffer
+	cfg := DefaultConfig()
+	cfg.OutputContainer = ContainerMPEGTS
+	cfg.Preprocessor.MinMonotonicStep = uint64(time.Millisecond)
+	s, err := NewSession(&buf, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vid, err := s.AddTrack(Track{Codec: CodecH264, IsVideo: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idr := annexBAU(0x65, 0x00)
+	burst := [][]byte{idr}
+	for i := byte(1); i < 5; i++ {
+		burst = append(burst, annexBAU(0x41, i)) // distinct payloads
+	}
+	t0 := 500 * time.Millisecond
+	for _, au := range burst {
+		if err := s.WriteVideo(vid, au, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i <= 3; i++ {
+		if err := s.WriteVideo(vid, annexBAU(0x41, 0xF0+byte(i)), t0+time.Duration(i)*20*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	video := demuxTS(t, buf.Bytes(), 0x100)
+	// Nothing may be dropped: 5 burst + 3 normal = 8 PES.
+	if len(video) != 8 {
+		t.Fatalf("video PES count = %d, want 8 (burst frames dropped?)", len(video))
+	}
+	// Arrival order preserved: IDR first, then F1..F4.
+	if !bytes.Equal(video[0].es, idr) {
+		t.Fatalf("first PES is not the IDR: % X", video[0].es)
+	}
+	for i := 1; i < 5; i++ {
+		if video[i].es[5] != byte(i) {
+			t.Fatalf("burst frame %d out of order (payload marker %#x)", i, video[i].es[5])
+		}
+	}
+	// First PES sits at the rebase origin (the burst was not shifted onto a
+	// nudged base), and PTS is strictly increasing throughout.
+	if video[0].pts != 900000 {
+		t.Fatalf("first PES PTS = %d, want 900000", video[0].pts)
+	}
+	for i := 1; i < len(video); i++ {
+		if video[i].pts <= video[i-1].pts {
+			t.Fatalf("PTS not strictly increasing at %d", i)
+		}
+	}
+}
+
+func TestLiveWriteCopiesCallerBuffer(t *testing.T) {
+	// API contract pinned by test: WriteVideo/WriteADTS copy the payload
+	// before it enters the (packet-holding) pipeline, so callers may reuse
+	// their buffer immediately — ytv1's SOOP deframer reuses its carry
+	// buffer between pushes and relies on this. A zero-copy change to the
+	// live helpers must fail here.
+	var buf bytes.Buffer
+	cfg := DefaultConfig()
+	cfg.OutputContainer = ContainerMPEGTS
+	s, err := NewSession(&buf, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vid, _ := s.AddTrack(Track{Codec: CodecH264, IsVideo: true})
+	aud, _ := s.AddTrack(Track{Codec: CodecAAC})
+
+	shared := make([]byte, 0, 256)
+	idr := annexBAU(0x65, 0xAA)
+	shared = append(shared[:0], idr...)
+	if err := s.WriteVideo(vid, shared, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Clobber the caller buffer, as the deframer's next push would.
+	for i := range shared {
+		shared[i] = 0xEE
+	}
+
+	adts := adts48k([]byte{0x42, 0x43})
+	shared = append(shared[:0], adts...)
+	if err := s.WriteADTS(aud, shared, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	for i := range shared {
+		shared[i] = 0xEE
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	video := demuxTS(t, buf.Bytes(), 0x100)
+	if len(video) != 1 || !bytes.Equal(video[0].es, idr) {
+		t.Fatalf("video payload corrupted by caller buffer reuse")
+	}
+	audio := demuxTS(t, buf.Bytes(), 0x101)
+	if len(audio) != 1 || !bytes.Equal(audio[0].es, adts) {
+		t.Fatalf("audio payload corrupted by caller buffer reuse")
+	}
+}
