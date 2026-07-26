@@ -329,9 +329,11 @@ func TestMuxerTimestampBaseAndClamp(t *testing.T) {
 	if got := m.toTicks(80 * time.Second); got != 0 {
 		t.Fatalf("clamped ticks = %d, want 0", got)
 	}
-	// 33-bit wrap: 26.5h + offset must be masked into field range.
-	if got := m.toTicks(100*time.Second + 30*time.Hour); got > ptsMask {
-		t.Fatalf("wrap ticks = %d exceeds 33-bit field", got)
+	// 30h past base exceeds the point where int64(rel)*90000 overflowed (~28.5h)
+	// — verify the exact masked value, so a silent overflow (which clamps to 0
+	// and would still satisfy the <= ptsMask bound) is caught.
+	if got := m.toTicks(100*time.Second + 30*time.Hour); got != 1130965408 {
+		t.Fatalf("30h ticks = %d, want 1130965408 (no overflow, masked to 33-bit)", got)
 	}
 }
 

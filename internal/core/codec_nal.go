@@ -84,6 +84,9 @@ const (
 	hevcNalTypeIDRWRADL = 19
 	hevcNalTypeIDRNLP   = 20
 	hevcNalTypeCRANUT   = 21
+	// 22/23 are RSV_IRAP_VCL22/23 — reserved IRAP VCL types. Still IRAP for POC
+	// reset and still carry no_output_of_prior_pics_flag (H.265 §7.3.6.1).
+	hevcNalTypeRSVIRAPVCL23 = 23
 )
 
 func (hevcDetector) IsKeyframe(data []byte) bool {

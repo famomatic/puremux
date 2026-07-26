@@ -169,6 +169,9 @@ func (s *Session) WriteVideoReordered(trackID int, au []byte, pts time.Duration)
 // chunk yields correctly spaced per-frame packets. Bytes that do not parse
 // as ADTS are skipped; a truncated trailing frame is ignored.
 func (s *Session) WriteADTS(trackID int, chunk []byte, pts time.Duration) error {
+	if s.closed {
+		return io.ErrClosedPipe
+	}
 	idx, ok := s.trackByID[trackID]
 	if !ok {
 		return errUnknownTrack

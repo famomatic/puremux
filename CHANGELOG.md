@@ -3,6 +3,41 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## v0.0.10 — 2026-07-27
+
+### Fixed
+
+- **MPEG-TS: `DefaultConfig()` yielded non-monotonic PES DTS.**
+  `MinMonotonicStep` defaults to 0 (a 1 ns monotonic-DTS nudge), which rounds
+  to **0 ticks** at the 90 kHz PES clock, so a duplicate-stamped burst collapsed
+  to identical PES DTS — the exact "non monotonically increasing dts" failure,
+  for any caller who did not manually set the step. `NewSession` now clamps
+  `MinMonotonicStep` to at least one 90 kHz tick (11112 ns) when the output
+  container is MPEG-TS.
+- **`toTicks` int64 overflow on long streams.** The ns→90 kHz conversion
+  multiplied by 90000, overflowing int64 after ~28.5 h (a 24/7 live session
+  hits this), wrapping to a clamped-to-zero timestamp. Reduced the fraction to
+  9/100000 so the multiply now overflows only after ~32 years.
+- **`WriteADTS` missing closed-session guard (pooled-packet leak).** Unlike
+  `WriteVideo`, it did not check the closed flag, so a call after `Close`
+  acquired a pooled packet that `WritePacket` then declined without releasing.
+  Added the guard.
+- **HEVC POC: RSV_IRAP_VCL22/23 misparsed.** The IRAP range stopped at
+  `CRA_NUT` (21), so reserved IRAP types 22/23 skipped
+  `no_output_of_prior_pics_flag`, misaligning the slice header (wrong POC →
+  wrong PTS). Extended the IRAP range through 23 per H.265 §7.3.6.1.
+
+### Tests
+
+- Real-data replay (`TestWriteVideoRealBFrameStream`, opt-in
+  `PUREMUX_TS_SAMPLE=<ts>`): replays a captured B-frame transport stream's
+  access units through `WriteVideo` and asserts strictly monotonic PES DTS,
+  DTS ≤ PTS, and decode order preserved — guards the v0.0.9 POC fix against real
+  bitstreams a synthetic fixture might miss.
+- `TestMPEGTSDefaultConfigMonotonicDTS`, `TestWriteADTSAfterCloseGuarded`, and a
+  strengthened `TestMuxerTimestampBaseAndClamp` (exact value at 30 h to catch
+  the overflow).
+
 ## v0.0.9 — 2026-07-27
 
 ### Fixed

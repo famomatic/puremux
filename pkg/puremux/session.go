@@ -114,6 +114,19 @@ func NewSession(w io.Writer, cfg Config) (*Session, error) {
 	if cfg.TimecodeScale == 0 {
 		cfg.TimecodeScale = 1_000_000
 	}
+	// MPEG-TS PES timestamps are quantized to the 90 kHz clock (one tick =
+	// ceil(1e9/90000) = 11112 ns). The monotonic-DTS nudge advances by
+	// MinMonotonicStep nanoseconds; a value below one tick rounds to zero and
+	// leaves duplicate PES DTS ("non monotonically increasing dts"). Ensure the
+	// nudge is at least one tick for TS output so a caller using DefaultConfig()
+	// (which leaves MinMonotonicStep 0 → a 1 ns default) still gets strictly
+	// monotonic DTS.
+	if cfg.OutputContainer == ContainerMPEGTS {
+		const tsTickNs uint64 = (uint64(time.Second) + 90000 - 1) / 90000
+		if cfg.Preprocessor.MinMonotonicStep < tsTickNs {
+			cfg.Preprocessor.MinMonotonicStep = tsTickNs
+		}
+	}
 	s := &Session{
 		ws:        ws,
 		cfg:       cfg,

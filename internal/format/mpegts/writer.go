@@ -31,6 +31,12 @@ const (
 
 	// ptsHz is the PES/PCR base clock.
 	ptsHz = 90000
+	// tickNum/tickDen is ptsHz/1e9 reduced (gcd 10000). toTicks multiplies the
+	// nanosecond offset by tickNum, so the reduced numerator (9 vs 90000) keeps
+	// int64(rel)*tickNum from overflowing until ~32 years of stream, instead of
+	// ~28.5 h with the unreduced ptsHz*rel (a 24/7 live session would hit that).
+	tickNum = 9
+	tickDen = 100_000
 	// ptsMask keeps PES timestamps within their 33-bit field.
 	ptsMask = (uint64(1) << 33) - 1
 
@@ -195,7 +201,7 @@ func (m *Muxer) Close() error { return nil }
 // not drift a tick low under truncation.
 func (m *Muxer) toTicks(d time.Duration) uint64 {
 	rel := d - m.base
-	ticks := int64(ptsOffset) + divRound(int64(rel)*ptsHz, int64(time.Second))
+	ticks := int64(ptsOffset) + divRound(int64(rel)*tickNum, tickDen)
 	// Clamp anything beyond the 10s headroom rather than wrapping negative.
 	return uint64(max(ticks, 0)) & ptsMask
 }

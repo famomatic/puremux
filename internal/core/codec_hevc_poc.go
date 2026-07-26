@@ -217,7 +217,7 @@ func (p *hevcPOCParser) parsePPS(rbsp []byte) {
 // runs the §8.3.1 POC derivation.
 func (p *hevcPOCParser) parseSlice(rbsp []byte, nalType byte, tid int) (POCInfo, bool) {
 	idr := nalType == hevcNalTypeIDRWRADL || nalType == hevcNalTypeIDRNLP
-	irap := nalType >= hevcNalTypeBLAWLP && nalType <= hevcNalTypeCRANUT
+	irap := nalType >= hevcNalTypeBLAWLP && nalType <= hevcNalTypeRSVIRAPVCL23
 	bla := nalType >= hevcNalTypeBLAWLP && nalType <= hevcNalTypeBLANLP
 
 	r := newRBSPBitReader(rbsp)
