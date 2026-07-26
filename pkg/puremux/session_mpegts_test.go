@@ -12,8 +12,16 @@ import (
 // --- minimal TS parse-back (independent of internal/format/mpegts) ----------
 
 type pesInfo struct {
-	pts uint64
-	es  []byte
+	pts    uint64
+	dts    uint64 // == pts when the PES header carried no separate DTS
+	hasDTS bool   // PTS_DTS_flags was 0b11
+	es     []byte
+}
+
+// pes33 decodes the 5-byte 33-bit PES timestamp field.
+func pes33(f []byte) uint64 {
+	return uint64(f[0]&0x0E)<<29 | uint64(f[1])<<22 |
+		uint64(f[2]&0xFE)<<14 | uint64(f[3])<<7 | uint64(f[4])>>1
 }
 
 // demuxTS extracts completed PES packets for one PID from a transport stream.
@@ -32,13 +40,17 @@ func demuxTS(t *testing.T, raw []byte, pid uint16) []pesInfo {
 			t.Fatalf("bad PES header: % X", cur[:min(9, len(cur))])
 		}
 		hdrLen := int(cur[8])
-		var pts uint64
+		var pts, dts uint64
+		hasDTS := false
 		if cur[7]&0x80 != 0 {
-			f := cur[9:14]
-			pts = uint64(f[0]&0x0E)<<29 | uint64(f[1])<<22 |
-				uint64(f[2]&0xFE)<<14 | uint64(f[3])<<7 | uint64(f[4])>>1
+			pts = pes33(cur[9:14])
+			dts = pts
 		}
-		out = append(out, pesInfo{pts: pts, es: append([]byte{}, cur[9+hdrLen:]...)})
+		if cur[7]&0xC0 == 0xC0 {
+			dts = pes33(cur[14:19])
+			hasDTS = true
+		}
+		out = append(out, pesInfo{pts: pts, dts: dts, hasDTS: hasDTS, es: append([]byte{}, cur[9+hdrLen:]...)})
 		cur = nil
 	}
 	for off := 0; off < len(raw); off += 188 {

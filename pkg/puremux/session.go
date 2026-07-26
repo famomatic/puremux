@@ -8,6 +8,7 @@ package puremux
 
 import (
 	"io"
+	"slices"
 	"time"
 
 	"github.com/famomatic/puremux/internal/core"
@@ -65,6 +66,11 @@ type Session struct {
 	// per-track preprocessors
 	enforcers map[int]*preprocessor.Enforcer
 	aligners  map[int]*preprocessor.Aligner
+	// synths holds per-track DTS synthesizers, created lazily on the first
+	// WriteVideoReordered call for a track. They sit BEFORE the Enforcer in
+	// the pipeline and may hold frames across calls (startup probe), so Close
+	// drains them first.
+	synths map[int]*preprocessor.DTSSynthesizer
 
 	cluster    *webm.ClusterWriter
 	clusterTc  uint64 // absolute ms of current cluster
@@ -108,6 +114,7 @@ func NewSession(w io.Writer, cfg Config) (*Session, error) {
 		detectors: core.NewDetectorRegistry(),
 		enforcers: make(map[int]*preprocessor.Enforcer),
 		aligners:  make(map[int]*preprocessor.Aligner),
+		synths:    make(map[int]*preprocessor.DTSSynthesizer),
 	}
 	return s, nil
 }
@@ -160,6 +167,13 @@ func (s *Session) WritePacket(p *core.Packet) error {
 	if s.closed {
 		return io.ErrClosedPipe
 	}
+	return s.writePacket(p)
+}
+
+// writePacket is WritePacket without the closed-session guard, so Close can
+// drain the DTS synthesizers' held frames into the pipeline after latching
+// the closed flag.
+func (s *Session) writePacket(p *core.Packet) error {
 	if p == nil {
 		return nil
 	}
@@ -371,6 +385,28 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	// Drain the per-track DTS synthesizers first: a WriteVideoReordered
+	// stream shorter than the startup probe still holds every frame here (in
+	// which case even the header is unwritten — writePacket below writes it).
+	// The track iteration is ordered for deterministic multi-track output.
+	synthTracks := make([]int, 0, len(s.synths))
+	for tn := range s.synths {
+		synthTracks = append(synthTracks, tn)
+	}
+	slices.Sort(synthTracks)
+	for _, tn := range synthTracks {
+		var werr error
+		s.synths[tn].Flush(func(out *core.Packet) {
+			if werr == nil {
+				werr = s.writePacket(out)
+			} else {
+				core.ReleasePacket(out)
+			}
+		})
+		if werr != nil {
+			return werr
+		}
+	}
 	// If no packet was ever written, no header/Segment exists. Finalizing would
 	// write a stray SeekHead and patch a non-existent Segment size at offset 0,
 	// producing a malformed file. Nothing to do.

@@ -90,6 +90,11 @@ Responsible for fixing corrupted packet streams. Operates purely in-memory. Does
 2. **Keyframe Aligner**: Enforces video stream to start with an IDR/I-Frame. Adjusts audio sync.
    - Audio realignment is **packet-granular only**. The aligner may drop or duplicate whole Opus packets; it MUST NOT trim within a packet, because sample counts are unknown under the opacity rule (§4) and trimming would require decoding.
    - The aligner depends on `CodecKeyframeDetector` (§5.A) — it never probes codec bytes directly.
+3. **DTS Synthesizer** (live reordered ingestion, `Session.WriteVideoReordered`): derives a decode timeline for video delivered in decode order with per-frame *presentation* timestamps only (B-frame streams have non-monotonic PTS in decode order, unusable as DTS).
+   - Sits BEFORE the Enforcer; per-track, stateful, in-memory only (never writes bytes, never inspects payloads).
+   - Principle: a valid decode timeline is the PTS sequence sorted ascending, delayed by the stream's reorder depth; the depth is **measured from the stream** by a bounded startup probe (≤ 8 frames held once, ≤ 3 when the first 4 arrive monotonic) and grows adaptively if a deeper B-pyramid appears later.
+   - Guarantees: decode order preserved exactly; synthesized DTS strictly monotonic (advancing by ≥ `MinMonotonicStep`, so it survives container-clock quantization); `DTS ≤ PTS` per frame (bounded transient on mid-stream depth growth); caller PTS never altered; zero steady-state latency.
+   - Reorder-free input degenerates to a passthrough (`DTS == PTS`), byte-identical to the `WriteVideo` path — duplicate-timestamp repair stays the Enforcer's job.
 
 ### C. Muxer Layer (`internal/muxer` & `internal/format/webm`)
 
