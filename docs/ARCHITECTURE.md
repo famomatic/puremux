@@ -6,8 +6,8 @@
 
 - **Core Constraint**: Absolutely NO CGO (`CGO_ENABLED=0`), NO external FFmpeg binaries.
 - **Scope**: Muxing only. No decoding/encoding or pixel data manipulation. Parses pre-compressed packet headers and serializes them into container formats.
-- **Target Containers**: WebM (primary), Matroska/MKV (secondary superset extension)
-- **Target Codecs**: VP8, VP9, AV1, Opus
+- **Target Containers**: WebM (primary), Matroska/MKV (secondary superset extension), MPEG-TS (live-streaming output, Session API only)
+- **Target Codecs**: VP8, VP9, AV1, Opus (EBML); H.264/HEVC Annex-B + ADTS AAC (MPEG-TS)
 - **Implementation Priority**: WebM first. MKV is a strict superset of WebM and is layered on top, never forked. WebM correctness is the gate for MKV work.
 
 ## 2. Core Problem Solved
@@ -28,7 +28,8 @@ puremux/
 │   ├── muxer/                # Muxer interfaces
 │   └── format/
 │       ├── ebml/             # RFC 8794 EBML low-level parser/builder
-│       └── webm/             # WebM/MKV container implementation
+│       ├── webm/             # WebM/MKV container implementation
+│       └── mpegts/           # MPEG-2 TS (ISO/IEC 13818-1) live muxer
 ```
 
 ## 4. Packet Opacity Boundary
@@ -97,6 +98,7 @@ Takes corrected packets and writes valid container bytes. Assumes incoming strea
 - **SeekHead + Cues**: When the writer is an `io.Seeker`, the muxer writes a SeekHead that points at the Cues element and the Tracks element for random access.
 - **Graceful Closer**: If the underlying `io.Writer` implements `io.Seeker`, it MUST seek back upon `Close()` to overwrite the dummy `Duration` (in the Info element) and `Cues` (Index) that were reserved up front. If not a seeker, uses streaming flags.
 - **Streaming Mode (non-seekable)**: When `io.Seeker` is unavailable, `Duration` is left unset (or set to the live `TimecodeScale`-relative placeholder), `Cues` are omitted entirely, and the Segment uses the unknown-size (`0x01FFFFFFFFFFFFFF`) sentinel. This produces a valid live/appendable WebM that players can stream but not seek.
+- **MPEG-TS backend (`internal/format/mpegts`)**: single-program transport stream for live output. Elementary streams are written verbatim (H.264/HEVC as Annex-B access units, AAC as ADTS frames — the muxer never converts bitstream framing, §4). Timestamps are only *converted*: `time.Duration` → 90 kHz PES ticks, rebased to the first packet plus a 10s headroom offset, rounded to nearest tick. PAT/PMT are emitted at start and periodically re-emitted so mid-stream readers can sync; PCR rides the first video track's PID. Every 188-byte packet is flushed as produced (no fragment buffering), which is what makes `Session` + `ContainerMPEGTS` suitable for live pipes. File-based `Merge` refuses TS output because container inputs carry AVCC/raw-AAC framing; only the live ES ingestion path (`Session.WriteVideo` / `Session.WriteADTS`) may feed it.
 
 ## 6. Concurrency Model
 

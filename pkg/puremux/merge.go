@@ -46,6 +46,11 @@ func Merge(ctx context.Context, inputs []string, outputPath string, cfg Config) 
 	if !isWritableOutput(out) {
 		return fmt.Errorf("%w: %s", ErrUnsupportedOutput, out)
 	}
+	// MPEG-TS is Session-only output: file inputs carry AVCC-framed video and
+	// raw AAC, and puremux does not convert bitstream framing (§4 opacity).
+	if out == ContainerMPEGTS {
+		return fmt.Errorf("%w: %s (live Session API only)", ErrUnsupportedOutput, out)
+	}
 
 	// Sniff each input and verify the (input, output) pair is remuxable.
 	inContainers := make([]Container, len(inputs))
@@ -103,6 +108,10 @@ func MergeToWriter(ctx context.Context, inputs []string, w io.Writer, out Contai
 	}
 	if !isWritableOutput(out) {
 		return fmt.Errorf("%w: %s", ErrUnsupportedOutput, out)
+	}
+	// See Merge: MPEG-TS output is reachable only through the Session live API.
+	if out == ContainerMPEGTS {
+		return fmt.Errorf("%w: %s (live Session API only)", ErrUnsupportedOutput, out)
 	}
 	inContainers := make([]Container, len(inputs))
 	for i, in := range inputs {

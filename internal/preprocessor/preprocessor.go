@@ -18,6 +18,17 @@ type Config struct {
 	// emitted as-is (no synthetic packets are fabricated). Larger gaps are
 	// left as discontinuities without counting. Zero disables gap detection.
 	InterpolationGapThreshold uint64
+	// MinMonotonicStep is the minimum DTS advance (in nanoseconds) the
+	// Enforcer forces between consecutive emitted packets on the same track.
+	// Zero defaults to 1ns (strict monotonicity in the time.Duration domain).
+	//
+	// Set this to the output container's clock granularity when the container
+	// uses a coarser clock than nanoseconds: e.g. MPEG-TS timestamps tick at
+	// 90 kHz (~11.1us) and Matroska at the TimecodeScale (1ms default). A 1ns
+	// nudge collapses back into a duplicate after quantization to those
+	// clocks, so streams with duplicated source timestamps (common in live
+	// backfill bursts) would still play back as "invalid timestamp" frames.
+	MinMonotonicStep uint64
 }
 
 // DefaultConfig returns a conservative real-time-friendly configuration.

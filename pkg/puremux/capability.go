@@ -36,6 +36,13 @@ const (
 	// ContainerMP4 is the ISO Base Media File Format container (ftyp box).
 	// Input only: puremux reads MP4 to remux into WebM/MKV. It never writes MP4.
 	ContainerMP4
+	// ContainerMPEGTS is the MPEG-2 Transport Stream (ISO/IEC 13818-1).
+	// Output only, and only via the Session live API: the TS muxer expects
+	// H.264/HEVC video as Annex-B access units and AAC audio as ADTS frames.
+	// File-based Merge/MergeToWriter reject it because MP4/MKV inputs carry
+	// AVCC-framed video and raw AAC, and puremux performs no bitstream
+	// framing conversion (payloads stay opaque, ARCHITECTURE.md §4).
+	ContainerMPEGTS
 )
 
 // String returns the lowercase container name.
@@ -47,6 +54,8 @@ func (c Container) String() string {
 		return "mkv"
 	case ContainerMP4:
 		return "mp4"
+	case ContainerMPEGTS:
+		return "mpegts"
 	default:
 		return "unknown"
 	}
@@ -62,6 +71,8 @@ func (c Container) Extension() string {
 		return "mkv"
 	case ContainerMP4:
 		return "mp4"
+	case ContainerMPEGTS:
+		return "ts"
 	default:
 		return ""
 	}
@@ -134,12 +145,24 @@ func SupportedInputs() []ContainerCapability {
 }
 
 // SupportedOutputs returns the containers puremux can write (mux). puremux
-// never writes MP4; MP4 is input-only.
+// never writes MP4; MP4 is input-only. MPEG-TS is writable only through the
+// Session live API (Annex-B/ADTS elementary-stream input), not through the
+// file-based Merge path.
 func SupportedOutputs() []ContainerCapability {
 	return []ContainerCapability{
 		{Container: ContainerWebM, CanRead: false, CanWrite: true, Codecs: webMCodecs},
 		{Container: ContainerMKV, CanRead: false, CanWrite: true, Codecs: mkvCodecs},
+		{Container: ContainerMPEGTS, CanRead: false, CanWrite: true, Codecs: mpegtsCodecs},
 	}
+}
+
+// mpegtsCodecs are the codecs puremux can mux into an MPEG-TS container.
+// Video must be Annex-B framed; AAC must be ADTS framed (the TS muxer writes
+// elementary streams verbatim; it never converts framing).
+var mpegtsCodecs = []CodecCombo{
+	{Codec: core.CodecH264, Kind: core.TrackVideo},
+	{Codec: core.CodecHEVC, Kind: core.TrackVideo},
+	{Codec: core.CodecAAC, Kind: core.TrackAudio},
 }
 
 // mp4Codecs are the codecs puremux can demux from an MP4 container. AV1 and
@@ -165,6 +188,8 @@ func codecsForContainer(c Container) []CodecCombo {
 		return mkvCodecs
 	case ContainerMP4:
 		return mp4Codecs
+	case ContainerMPEGTS:
+		return mpegtsCodecs
 	default:
 		return nil
 	}

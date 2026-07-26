@@ -131,8 +131,18 @@ func (e *Enforcer) emitOne(p *core.Packet, emit func(*core.Packet)) {
 			// detect the discontinuity.
 		}
 		// Enforce strict monotonicity: never emit a packet at or before last.
+		// The nudge is MinMonotonicStep (default 1ns) so that containers with
+		// coarse clocks (90 kHz MPEG-TS, 1ms Matroska) still see distinct
+		// timestamps after quantization. PTS is shifted by the same amount to
+		// preserve the packet's PTS-DTS offset (B-frame reorder delay).
 		if p.DTS <= e.lastDTS {
-			p.DTS = e.lastDTS + 1 // nudge forward by 1ns to preserve order
+			step := time.Duration(e.cfg.MinMonotonicStep)
+			if step <= 0 {
+				step = 1
+			}
+			shift := e.lastDTS + step - p.DTS
+			p.DTS += shift
+			p.PTS += shift
 		}
 	}
 	e.lastDTS = p.DTS

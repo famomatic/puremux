@@ -117,3 +117,71 @@ func TestEnforcerReset(t *testing.T) {
 		t.Error("Reset should clear metrics")
 	}
 }
+
+func TestEnforcerMinMonotonicStepDuplicates(t *testing.T) {
+	// Simulates a live backfill burst: several packets stamped with the SAME
+	// timestamp. With MinMonotonicStep = 1ms, emitted DTS must advance by at
+	// least 1ms per packet so 90 kHz / 1ms-clock containers still see
+	// strictly increasing timestamps after quantization.
+	e := NewEnforcer(Config{
+		MaxBufferSize:     10,
+		MaxBufferDuration: 1, // effectively no reorder hold
+		MinMonotonicStep:  uint64(time.Millisecond),
+	})
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+
+	const dup = 5
+	base := 100 * time.Millisecond
+	ptsLead := 7 * time.Millisecond // PTS-DTS offset that must be preserved
+	for i := 0; i < dup; i++ {
+		p := core.AcquirePacket()
+		p.DTS = base
+		p.PTS = base + ptsLead
+		if err := e.Process(p, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.Flush(emit)
+
+	if len(got) != dup {
+		t.Fatalf("got %d packets, want %d", len(got), dup)
+	}
+	for i, p := range got {
+		wantDTS := base + time.Duration(i)*time.Millisecond
+		if p.DTS != wantDTS {
+			t.Errorf("packet %d DTS = %v, want %v", i, p.DTS, wantDTS)
+		}
+		if p.PTS-p.DTS != ptsLead {
+			t.Errorf("packet %d PTS-DTS offset = %v, want %v", i, p.PTS-p.DTS, ptsLead)
+		}
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}
+
+func TestEnforcerDefaultNudgeIs1ns(t *testing.T) {
+	// Zero MinMonotonicStep keeps the original 1ns behavior.
+	e := NewEnforcer(Config{MaxBufferSize: 10, MaxBufferDuration: 1})
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+	for i := 0; i < 2; i++ {
+		p := core.AcquirePacket()
+		p.DTS = 50 * time.Millisecond
+		p.PTS = 50 * time.Millisecond
+		if err := e.Process(p, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.Flush(emit)
+	if len(got) != 2 {
+		t.Fatalf("got %d packets", len(got))
+	}
+	if d := got[1].DTS - got[0].DTS; d != 1 {
+		t.Errorf("nudge = %v, want 1ns", d)
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}

@@ -17,8 +17,9 @@ const (
 	// (MKV) lossless codec not permitted in WebM.
 	CodecVorbis
 	CodecFLAC
-	// CodecAAC is read-only: MP4 input may carry AAC audio. puremux never
-	// writes AAC (no MP4 writer; AAC is not a WebM/MKV-pure codec we mux).
+	// CodecAAC is carried opaque from MP4 input (raw AAC) and muxed into
+	// MPEG-TS output as ADTS-framed elementary stream packets. It is not a
+	// WebM/MKV-writable codec.
 	CodecAAC
 	// MPEG video codecs. Muxing these is patent-free (muxers do not decode or
 	// implement the codec); they are carried opaque and read/written across
@@ -66,7 +67,7 @@ func (c CodecType) IsVideo() bool {
 // IsAudio reports whether the codec is an audio track.
 func (c CodecType) IsAudio() bool {
 	switch c {
-	case CodecOpus, CodecVorbis, CodecFLAC:
+	case CodecOpus, CodecVorbis, CodecFLAC, CodecAAC:
 		return true
 	default:
 		return false

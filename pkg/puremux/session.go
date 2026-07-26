@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/mpegts"
 	"github.com/famomatic/puremux/internal/format/webm"
 	"github.com/famomatic/puremux/internal/preprocessor"
 )
@@ -33,9 +34,11 @@ type Config struct {
 	TimecodeScale uint64
 	// Preprocessor config bounds the jitter buffer (ARCHITECTURE.md §5.B).
 	Preprocessor preprocessor.Config
-	// OutputContainer selects the EBML doctype written by the session. Zero
+	// OutputContainer selects the container written by the session. Zero
 	// defaults to WebM for backward compatibility. Set to ContainerMKV to
-	// emit a Matroska container (codec superset of WebM).
+	// emit a Matroska container (codec superset of WebM), or to
+	// ContainerMPEGTS to emit a live MPEG-2 Transport Stream (H.264/HEVC
+	// Annex-B video + ADTS AAC audio; see WriteVideo/WriteADTS).
 	OutputContainer Container
 }
 
@@ -72,7 +75,15 @@ type Session struct {
 	segTc0Set  bool          // true once segmentTc0 has been captured from the first emitted packet
 	started    bool
 	closed     bool
+
+	// tsMux is the MPEG-TS backend, non-nil only when
+	// Config.OutputContainer == ContainerMPEGTS. The EBML fields above are
+	// unused in that mode; the shared preprocessor pipeline feeds tsMux.
+	tsMux *mpegts.Muxer
 }
+
+// isTS reports whether the session writes an MPEG-TS container.
+func (s *Session) isTS() bool { return s.cfg.OutputContainer == ContainerMPEGTS }
 
 // NewSession creates a muxing session writing to w. If w implements
 // io.Seeker the session runs in seekable mode (patches Duration/Cues on
@@ -220,8 +231,14 @@ func (s *Session) pushThroughAligner(trackNum int, pp *core.Packet) error {
 	return nil
 }
 
-// writeBlock serializes a corrected packet into a Cluster/SimpleBlock.
+// writeBlock serializes a corrected packet into the container: a
+// Cluster/SimpleBlock for WebM/MKV, or a PES packet for MPEG-TS.
 func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
+	if s.isTS() {
+		// The TS muxer rebases timestamps internally (first packet + headroom
+		// offset); no EBML cluster/cue bookkeeping applies.
+		return s.tsMux.WritePacket(p)
+	}
 	absMs := uint64(p.DTS / time.Millisecond)
 	// Capture the segment origin from the first packet actually written.
 	if !s.segTc0Set {
@@ -279,8 +296,32 @@ func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 	return s.cluster.WriteSimpleBlock(spec.Number, relTc, p.IsKeyframe, p.Data)
 }
 
-// writeHeader writes the EBML header, Segment, Info, and Tracks.
+// writeHeader initializes the container: EBML header + Segment + Info +
+// Tracks for WebM/MKV, or the TS muxer track table for MPEG-TS (whose PAT/PMT
+// are emitted lazily with the first packet).
 func (s *Session) writeHeader() error {
+	if s.isTS() {
+		s.tsMux = mpegts.New(s.ws)
+		for _, spec := range s.tracks {
+			kind := core.TrackAudio
+			if spec.IsVideo {
+				kind = core.TrackVideo
+			}
+			if _, err := s.tsMux.AddTrack(core.Track{
+				ID:         int(spec.Number),
+				Kind:       kind,
+				Codec:      spec.Codec,
+				Width:      spec.Width,
+				Height:     spec.Height,
+				Channels:   spec.Channels,
+				SampleRate: int(spec.SampleRate),
+			}); err != nil {
+				return err
+			}
+		}
+		s.resolveAudioSync()
+		return nil
+	}
 	doctype := webm.DocTypeWebM
 	if s.cfg.OutputContainer == ContainerMKV {
 		doctype = webm.DocTypeMatroska
@@ -301,24 +342,25 @@ func (s *Session) writeHeader() error {
 		return err
 	}
 	s.header.TracksEnd = int64(s.ws.offset())
-	// Now that all tracks are registered, decide whether audio aligners should
-	// hold for a video sync start. An audio-only session has no video track,
-	// so holding would never resolve. The first packet has not been processed
-	// yet (writeHeader runs before the pipeline), so pending queues are empty.
-	hasVideo := false
+	s.resolveAudioSync()
+	return nil
+}
+
+// resolveAudioSync decides, once all tracks are registered, whether audio
+// aligners should hold for a video sync start. An audio-only session has no
+// video track, so holding would never resolve. The first packet has not been
+// processed yet (writeHeader runs before the pipeline), so pending queues are
+// empty.
+func (s *Session) resolveAudioSync() {
 	for _, spec := range s.tracks {
 		if spec.IsVideo {
-			hasVideo = true
-			break
+			return
 		}
 	}
-	if !hasVideo {
-		noemit := func(*core.Packet) {}
-		for _, al := range s.aligners {
-			al.SetExpectsVideoSync(false, noemit)
-		}
+	noemit := func(*core.Packet) {}
+	for _, al := range s.aligners {
+		al.SetExpectsVideoSync(false, noemit)
 	}
-	return nil
 }
 
 // Close finalizes the session. For seekable sinks it patches the reserved
@@ -359,6 +401,10 @@ func (s *Session) Close() error {
 			}
 			core.ReleasePacket(ap)
 		}
+	}
+	if s.isTS() {
+		// MPEG-TS has no trailer, cues, or duration patch.
+		return s.tsMux.Close()
 	}
 	if s.cluster != nil {
 		if err := s.cluster.Close(); err != nil {
