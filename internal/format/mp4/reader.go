@@ -3,35 +3,173 @@ package mp4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
+	"math"
+	"math/big"
 
 	"github.com/famomatic/puremux/internal/core"
 )
 
 // Track is a track parsed from the input MP4 moov/trak box.
 type Track struct {
-	Number     int
-	Codec      core.CodecType
-	IsVideo    bool
-	Width      int
-	Height     int
-	Channels   int
-	SampleRate float64
+	Number          int
+	ID              uint32
+	Codec           core.CodecType
+	IsVideo         bool
+	Width           int
+	Height          int
+	Channels        int
+	SampleRate      float64
+	Timescale       uint32
+	Duration        uint64
+	Language        string
+	CodecConfigType string
+	CodecConfig     []byte
 }
 
-// Sample is a decoded media sample from the input, equivalent to a Block.
+func timestampLess(left int64, leftScale uint32, right int64, rightScale uint32) bool {
+	if leftScale == 0 || rightScale == 0 {
+		return left < right
+	}
+	l := new(big.Int).Mul(big.NewInt(left), new(big.Int).SetUint64(uint64(rightScale)))
+	r := new(big.Int).Mul(big.NewInt(right), new(big.Int).SetUint64(uint64(leftScale)))
+	return l.Cmp(r) < 0
+}
+
+// Sample carries one opaque compressed sample with exact media-time ticks.
 type Sample struct {
 	TrackNum int
-	// AbsMs is the sample's absolute time in milliseconds, derived from the
-	// stts decode deltas. NOTE: the composition-offset table (ctts) is not
-	// applied, so for streams with B-frame reordering (H.264/HEVC/AV1) this is
-	// the decode timestamp (DTS), not the presentation timestamp (PTS).
-	// All-intra video and audio are unaffected. Applying ctts requires
-	// carrying separate DTS/PTS through the whole pipeline (the current model
-	// conflates them), so it is intentionally deferred.
-	AbsMs    uint64
-	Keyframe bool
-	Data     []byte
+	// AbsMs is the compatibility view of PTS, rounded to milliseconds.
+	AbsMs     uint64
+	DTS       int64
+	PTS       int64
+	Duration  int64
+	Timescale uint32
+	Position  int64
+	Keyframe  bool
+	Data      []byte
+}
+
+// SeekNS positions every progressive track at the sync point selected from
+// trackNumber and returns that point in nanoseconds.
+func (rd *Reader) SeekNS(trackNumber int, targetNS int64) (int64, error) {
+	if targetNS < 0 {
+		targetNS = 0
+	}
+	if len(rd.fragments) > 0 {
+		chosen := -1
+		for i, sample := range rd.fragments {
+			if sample.track.info.Number != trackNumber || (sample.track.info.IsVideo && !sample.keyframe) {
+				continue
+			}
+			if scaleToNS(sample.pts, sample.track.timescale) <= targetNS {
+				chosen = i
+			}
+		}
+		if chosen < 0 {
+			for i, sample := range rd.fragments {
+				if sample.track.info.Number == trackNumber {
+					chosen = i
+					break
+				}
+			}
+		}
+		if chosen < 0 {
+			return 0, errors.New("mp4: seek track not found")
+		}
+		actualNS := scaleToNS(rd.fragments[chosen].pts, rd.fragments[chosen].track.timescale)
+		rd.fragmentCursor = chosen
+		for rd.fragmentCursor > 0 {
+			previous := rd.fragments[rd.fragmentCursor-1]
+			if scaleToNS(previous.dts, previous.track.timescale) < actualNS {
+				break
+			}
+			rd.fragmentCursor--
+		}
+		return actualNS, nil
+	}
+	selected := -1
+	for i, track := range rd.tracks {
+		if track.info.Number == trackNumber {
+			selected = i
+			break
+		}
+	}
+	if selected < 0 {
+		return 0, errors.New("mp4: seek track not found")
+	}
+	index, actualUnits, err := rd.tracks[selected].findSeekIndex(targetNS, rd.tracks[selected].info.IsVideo)
+	if err != nil {
+		return 0, err
+	}
+	_ = index
+	actualNS := scaleToNS(actualUnits, rd.tracks[selected].timescale)
+	for _, track := range rd.tracks {
+		trackIndex, _, err := track.findSeekIndex(actualNS, track.info.IsVideo)
+		if err != nil {
+			return 0, err
+		}
+		if err := track.setSampleIndex(trackIndex); err != nil {
+			return 0, err
+		}
+	}
+	rd.inited = true
+	return actualNS, nil
+}
+
+func (t *trackState) findSeekIndex(targetNS int64, keyOnly bool) (uint32, int64, error) {
+	if err := t.initCursor(); err != nil {
+		return 0, 0, err
+	}
+	var chosen uint32
+	var chosenPTS int64
+	for t.consumed < t.totalSamples {
+		if !t.peekNext() {
+			break
+		}
+		ptsNS := scaleToNS(t.peek.pts, t.timescale)
+		if ptsNS > targetNS {
+			break
+		}
+		if !keyOnly || t.peek.keyframe {
+			chosen, chosenPTS = t.consumed, t.peek.pts
+		}
+		t.hasPeek = false
+		t.consumed++
+		t.advancePast(t.peek)
+	}
+	return chosen, chosenPTS, nil
+}
+
+func (t *trackState) setSampleIndex(index uint32) error {
+	if err := t.initCursor(); err != nil {
+		return err
+	}
+	for t.consumed < index {
+		if !t.peekNext() {
+			return ErrCorrupt
+		}
+		t.hasPeek = false
+		t.consumed++
+		t.advancePast(t.peek)
+	}
+	return nil
+}
+
+func scaleToNS(value int64, scale uint32) int64 {
+	if scale == 0 {
+		return 0
+	}
+	n := new(big.Int).Mul(big.NewInt(value), big.NewInt(1_000_000_000))
+	n.Quo(n, new(big.Int).SetUint64(uint64(scale)))
+	if !n.IsInt64() {
+		if value < 0 {
+			return math.MinInt64
+		}
+		return math.MaxInt64
+	}
+	return n.Int64()
 }
 
 // NewReader wraps an MP4 input stream. The reader must implement
@@ -41,7 +179,7 @@ func NewReader(r io.Reader) (*Reader, error) {
 	if !ok {
 		return nil, ErrNotSeekable
 	}
-	rd := &Reader{rs: rs}
+	rd := &Reader{rs: rs, metadata: make(map[string]string), trex: make(map[uint32]trackDefaults)}
 	if err := rd.parse(); err != nil {
 		return nil, err
 	}
@@ -54,6 +192,25 @@ func NewReader(r io.Reader) (*Reader, error) {
 // NextSample returns the next media sample in merged absolute-time order
 // across all tracks, or io.EOF when exhausted.
 func (rd *Reader) NextSample() (*Sample, error) {
+	if len(rd.fragments) > 0 {
+		if rd.fragmentCursor >= len(rd.fragments) {
+			return nil, io.EOF
+		}
+		s := rd.fragments[rd.fragmentCursor]
+		rd.fragmentCursor++
+		if _, err := rd.rs.Seek(s.off, io.SeekStart); err != nil {
+			return nil, err
+		}
+		data := make([]byte, s.size)
+		if _, err := io.ReadFull(rd.rs, data); err != nil {
+			return nil, err
+		}
+		absMs := uint64(0)
+		if s.pts > 0 {
+			absMs = timescaleToMs(uint64(s.pts), s.track.timescale)
+		}
+		return &Sample{TrackNum: s.track.info.Number, AbsMs: absMs, DTS: s.dts, PTS: s.pts, Duration: s.duration, Timescale: s.track.timescale, Position: s.off, Keyframe: s.keyframe, Data: data}, nil
+	}
 	// Prime streaming cursors on first call (O(tracks) work, no sample array).
 	if !rd.inited {
 		if err := rd.initCursors(); err != nil {
@@ -63,7 +220,8 @@ func (rd *Reader) NextSample() (*Sample, error) {
 	}
 	// Find the track whose next (peeked) sample has the smallest absolute time.
 	pick := -1
-	var bestMs uint64
+	var bestDTS int64
+	var bestScale uint32
 	for i, t := range rd.tracks {
 		// Lazily compute the peek for this track if missing.
 		if !t.hasPeek {
@@ -72,10 +230,10 @@ func (rd *Reader) NextSample() (*Sample, error) {
 			}
 			t.hasPeek = true
 		}
-		ms := t.peek.absMs
-		if pick < 0 || ms < bestMs {
+		if pick < 0 || timestampLess(t.peek.dts, t.timescale, bestDTS, bestScale) {
 			pick = i
-			bestMs = ms
+			bestDTS = t.peek.dts
+			bestScale = t.timescale
 		}
 	}
 	if pick < 0 {
@@ -95,10 +253,15 @@ func (rd *Reader) NextSample() (*Sample, error) {
 		return nil, err
 	}
 	return &Sample{
-		TrackNum: t.info.Number,
-		AbsMs:    s.absMs,
-		Keyframe: s.keyframe,
-		Data:     buf,
+		TrackNum:  t.info.Number,
+		AbsMs:     s.absMs,
+		DTS:       s.dts,
+		PTS:       s.pts,
+		Duration:  s.duration,
+		Timescale: t.timescale,
+		Position:  s.off,
+		Keyframe:  s.keyframe,
+		Data:      buf,
 	}, nil
 }
 
@@ -126,6 +289,10 @@ func (rd *Reader) parse() error {
 			// Sample offsets are absolute file offsets (stco points into mdat
 			// payload), so we only need to skip past mdat here.
 			if err := skipBox(rd.rs, b); err != nil {
+				return err
+			}
+		case "moof":
+			if err := rd.parseMoof(b, off); err != nil {
 				return err
 			}
 		default:
@@ -160,8 +327,20 @@ func (rd *Reader) parseMoov(b box) error {
 			return err
 		}
 		switch cb.typ {
+		case "mvhd":
+			if err := rd.parseMvhd(mr, cb); err != nil {
+				return err
+			}
 		case "trak":
 			if err := rd.parseTrak(mr, cb); err != nil {
+				return err
+			}
+		case "mvex":
+			if err := rd.parseMvex(mr, cb); err != nil {
+				return err
+			}
+		case "udta", "meta":
+			if err := rd.parseMetadataContainer(mr, cb, cb.typ == "meta"); err != nil {
 				return err
 			}
 		default:
@@ -194,7 +373,11 @@ func (rd *Reader) parseTrak(r io.Reader, b box) error {
 		}
 		switch cb.typ {
 		case "tkhd":
-			if err := skipBox(tr, cb); err != nil {
+			if err := rd.parseTkhd(tr, cb, t); err != nil {
+				return err
+			}
+		case "edts":
+			if err := rd.parseEdts(tr, cb, t); err != nil {
 				return err
 			}
 		case "mdia":
@@ -209,6 +392,14 @@ func (rd *Reader) parseTrak(r io.Reader, b box) error {
 	}
 	if t.timescale == 0 {
 		return nil // no mdhd; skip
+	}
+	t.info.Timescale = t.timescale
+	t.info.Duration = t.duration
+	if t.hasEditMediaTime && t.editMediaTime >= 0 {
+		t.presentationShift = -t.editMediaTime
+	}
+	if rd.movieTimescale > 0 && t.editLeadMovie > 0 {
+		t.presentationShift += int64(t.editLeadMovie * uint64(t.timescale) / uint64(rd.movieTimescale))
 	}
 	rd.tracks = append(rd.tracks, t)
 	return nil
@@ -274,16 +465,30 @@ func (rd *Reader) parseMdhd(r io.Reader, b box, t *trackState) error {
 	}
 	t.timescale = binary.BigEndian.Uint32(ts[:])
 	rest -= 4
-	// duration (8 bytes v1, 4 bytes v0). Read explicitly so the remaining
+	// duration (8 bytes v1, 4 bytes v0).
 	// body (language + predefined) is skipped from the correct offset.
 	var dur int64 = 4
 	if version == 1 {
 		dur = 8
 	}
-	if _, err := io.CopyN(io.Discard, r, dur); err != nil {
+	var durationBytes [8]byte
+	if _, err := io.ReadFull(r, durationBytes[:dur]); err != nil {
 		return err
 	}
+	if version == 1 {
+		t.duration = binary.BigEndian.Uint64(durationBytes[:])
+	} else {
+		t.duration = uint64(binary.BigEndian.Uint32(durationBytes[:4]))
+	}
 	rest -= dur
+	if rest >= 2 {
+		var language [2]byte
+		if _, err := io.ReadFull(r, language[:]); err != nil {
+			return err
+		}
+		t.info.Language = decodeLanguage(binary.BigEndian.Uint16(language[:]))
+		rest -= 2
+	}
 	if rest > 0 {
 		if _, err := io.CopyN(io.Discard, r, rest); err != nil {
 			return err
@@ -351,6 +556,10 @@ func (rd *Reader) parseStbl(r io.Reader, b box, t *trackState) error {
 			if err := rd.parseStts(mr, cb, t); err != nil {
 				return err
 			}
+		case "ctts":
+			if err := rd.parseCtts(mr, cb, t); err != nil {
+				return err
+			}
 		case "stsz":
 			if err := rd.parseStsz(mr, cb, t); err != nil {
 				return err
@@ -406,7 +615,15 @@ func (rd *Reader) parseStsd(r io.Reader, b box, t *trackState) error {
 	remaining -= 8
 	entrySize := int64(binary.BigEndian.Uint32(se[0:4]))
 	codecType := string(se[4:8])
-	t.info = codecFromSampleEntry(codecType, t.info.Number)
+	detected := codecFromSampleEntry(codecType, t.info.Number)
+	t.info.Codec = detected.Codec
+	t.info.IsVideo = detected.IsVideo
+	if t.info.Channels == 0 {
+		t.info.Channels = detected.Channels
+	}
+	if t.info.SampleRate == 0 {
+		t.info.SampleRate = detected.SampleRate
+	}
 	// Read this sample entry's body (after size+type), bounded by the bytes
 	// actually remaining in the stsd box.
 	bodyLen := entrySize - 8
@@ -427,12 +644,113 @@ func (rd *Reader) parseStsd(r io.Reader, b box, t *trackState) error {
 		t.info.Width = int(binary.BigEndian.Uint16(body[24:26]))
 		t.info.Height = int(binary.BigEndian.Uint16(body[26:28]))
 	}
+	childOffset := 0
+	if t.info.IsVideo && len(body) >= 78 {
+		childOffset = 78
+	} else if !t.info.IsVideo && len(body) >= 28 {
+		t.info.Channels = int(binary.BigEndian.Uint16(body[16:18]))
+		t.info.SampleRate = float64(binary.BigEndian.Uint32(body[24:28])) / 65536
+		childOffset = 28
+	}
+	if childOffset > 0 && childOffset < len(body) {
+		if err := parseSampleEntryChildren(body[childOffset:], t); err != nil {
+			return err
+		}
+	}
 	if remaining > 0 {
 		if _, err := io.CopyN(io.Discard, r, remaining); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (rd *Reader) parseCtts(r io.Reader, b box, t *trackState) error {
+	if b.payload < 8 {
+		return ErrCorrupt
+	}
+	var header [8]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return err
+	}
+	version := header[0]
+	count := binary.BigEndian.Uint32(header[4:8])
+	if uint64(count) > uint64(b.payload-8)/8 {
+		return ErrCorrupt
+	}
+	for range count {
+		var row [8]byte
+		if _, err := io.ReadFull(r, row[:]); err != nil {
+			return err
+		}
+		offset := int64(binary.BigEndian.Uint32(row[4:8]))
+		if version == 1 {
+			offset = int64(int32(binary.BigEndian.Uint32(row[4:8])))
+		} else if version != 0 {
+			return ErrCorrupt
+		}
+		t.ctts = append(t.ctts, cttsEntry{count: binary.BigEndian.Uint32(row[0:4]), offset: offset})
+	}
+	return nil
+}
+
+func parseSampleEntryChildren(data []byte, t *trackState) error {
+	r := bytes.NewReader(data)
+	for r.Len() > 0 {
+		b, err := readBox(r)
+		if err != nil {
+			return err
+		}
+		if b.payload < 0 || b.payload > int64(r.Len()) {
+			return ErrCorrupt
+		}
+		payload := make([]byte, b.payload)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return err
+		}
+		switch b.typ {
+		case "avcC", "hvcC", "av1C", "vpcC", "dOps", "dfLa":
+			t.info.CodecConfigType = b.typ
+			t.info.CodecConfig = payload
+		case "esds":
+			if config := findESDSDecoderConfig(payload); len(config) > 0 {
+				t.info.CodecConfigType = "asc"
+				t.info.CodecConfig = config
+			}
+		}
+	}
+	return nil
+}
+
+func findESDSDecoderConfig(data []byte) []byte {
+	if len(data) < 4 {
+		return nil
+	}
+	for i := 4; i < len(data); i++ {
+		if data[i] != 0x05 {
+			continue
+		}
+		length, used, ok := readDescriptorLength(data[i+1:])
+		start := i + 1 + used
+		if ok && length > 0 && start <= len(data) && length <= len(data)-start {
+			return append([]byte(nil), data[start:start+length]...)
+		}
+	}
+	return nil
+}
+
+func readDescriptorLength(data []byte) (int, int, bool) {
+	length := 0
+	for i := 0; i < len(data) && i < 4; i++ {
+		if length > (1 << 24) {
+			return 0, 0, false
+		}
+		length = length<<7 | int(data[i]&0x7f)
+		if data[i]&0x80 == 0 {
+			return length, i + 1, true
+		}
+	}
+	return 0, 0, false
 }
 
 func (rd *Reader) parseStts(r io.Reader, b box, t *trackState) error {

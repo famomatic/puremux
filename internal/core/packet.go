@@ -26,6 +26,9 @@ const (
 	// MKV (and MP4 input). VP8-style NAL keyframe detection applies.
 	CodecH264 // H.264/AVC (V_MPEG4/ISO/AVC)
 	CodecHEVC // H.265/HEVC (V_MPEGH/ISO/SHEVC)
+	// CodecMP3 is exposed for MPEG-TS and raw MPEG audio demuxing. Existing
+	// muxer capability tables intentionally do not accept it.
+	CodecMP3
 )
 
 // String returns the canonical lowercase codec name used in WebM codec IDs.
@@ -49,6 +52,8 @@ func (c CodecType) String() string {
 		return "h264"
 	case CodecHEVC:
 		return "hevc"
+	case CodecMP3:
+		return "mp3"
 	default:
 		return "unknown"
 	}
@@ -67,7 +72,7 @@ func (c CodecType) IsVideo() bool {
 // IsAudio reports whether the codec is an audio track.
 func (c CodecType) IsAudio() bool {
 	switch c {
-	case CodecOpus, CodecVorbis, CodecFLAC, CodecAAC:
+	case CodecOpus, CodecVorbis, CodecFLAC, CodecAAC, CodecMP3:
 		return true
 	default:
 		return false

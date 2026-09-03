@@ -25,4 +25,5 @@ const (
 	CodecAAC     = core.CodecAAC
 	CodecH264    = core.CodecH264
 	CodecHEVC    = core.CodecHEVC
+	CodecMP3     = core.CodecMP3
 )

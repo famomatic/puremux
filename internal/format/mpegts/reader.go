@@ -1,0 +1,386 @@
+package mpegts
+
+import (
+	"encoding/binary"
+	"errors"
+	"io"
+	"sort"
+
+	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/pkg/bitstream/aac"
+	"github.com/famomatic/puremux/pkg/bitstream/mp3"
+)
+
+type InputTrack struct {
+	PID        uint16
+	Codec      core.CodecType
+	Timescale  int
+	SampleRate int
+	Channels   int
+	Config     []byte
+}
+
+type InputPacket struct {
+	Track    int
+	Data     []byte
+	PTS      int64
+	DTS      int64
+	Duration int64
+	Keyframe bool
+	Offset   int64
+}
+
+type InputReader struct {
+	tracks  []InputTrack
+	packets []InputPacket
+	next    int
+}
+
+type pesBuffer struct {
+	pid    uint16
+	offset int64
+	data   []byte
+}
+
+// NewInputReader indexes an aligned single-program MPEG-2 transport stream.
+// It parses transport/PES and codec framing only; elementary payloads are not
+// decoded.
+func NewInputReader(r io.Reader) (*InputReader, error) {
+	var raw []byte
+	buffer := make([]byte, 188*256)
+	for {
+		n, err := r.Read(buffer)
+		raw = append(raw, buffer[:n]...)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		if n == 0 {
+			return nil, io.ErrNoProgress
+		}
+	}
+	if len(raw) == 0 || len(raw)%188 != 0 {
+		return nil, errors.New("mpegts: input is not 188-byte packet aligned")
+	}
+	pmtPID := uint16(0xffff)
+	streamTypes := make(map[uint16]byte)
+	continuity := make(map[uint16]byte)
+	seenCC := make(map[uint16]bool)
+	active := make(map[uint16]*pesBuffer)
+	var completed []*pesBuffer
+	for offset := 0; offset < len(raw); offset += 188 {
+		packet := raw[offset : offset+188]
+		if packet[0] != 0x47 || packet[1]&0x80 != 0 {
+			return nil, errors.New("mpegts: invalid sync or transport error")
+		}
+		start := packet[1]&0x40 != 0
+		pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+		afc := packet[3] >> 4 & 3
+		if afc == 0 {
+			return nil, errors.New("mpegts: reserved adaptation control")
+		}
+		payloadOffset := 4
+		discontinuity := false
+		if afc&2 != 0 {
+			length := int(packet[4])
+			if length > 183 || 5+length > len(packet) {
+				return nil, errors.New("mpegts: adaptation field overruns packet")
+			}
+			if length > 0 {
+				discontinuity = packet[5]&0x80 != 0
+			}
+			payloadOffset = 5 + length
+		}
+		if afc&1 == 0 || payloadOffset == len(packet) {
+			continue
+		}
+		cc := packet[3] & 15
+		if seenCC[pid] && !discontinuity && cc != (continuity[pid]+1)&15 {
+			return nil, errors.New("mpegts: continuity counter gap")
+		}
+		seenCC[pid], continuity[pid] = true, cc
+		payload := packet[payloadOffset:]
+		if pid == 0 {
+			section, err := psiSection(payload, start)
+			if err != nil {
+				return nil, err
+			}
+			if len(section) > 0 {
+				pmtPID, err = parsePAT(section)
+				if err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if pid == pmtPID {
+			section, err := psiSection(payload, start)
+			if err != nil {
+				return nil, err
+			}
+			if len(section) > 0 {
+				if err := parsePMT(section, streamTypes); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if _, known := streamTypes[pid]; !known {
+			continue
+		}
+		if start {
+			if previous := active[pid]; previous != nil {
+				completed = append(completed, previous)
+			}
+			active[pid] = &pesBuffer{pid: pid, offset: int64(offset)}
+		}
+		if current := active[pid]; current != nil {
+			current.data = append(current.data, payload...)
+		}
+	}
+	for _, current := range active {
+		completed = append(completed, current)
+	}
+	sort.SliceStable(completed, func(i, j int) bool { return completed[i].offset < completed[j].offset })
+	reader := &InputReader{}
+	trackByPID := make(map[uint16]int)
+	for _, pes := range completed {
+		typ := streamTypes[pes.pid]
+		codec := streamCodec(typ)
+		if codec == core.CodecUnknown {
+			continue
+		}
+		index, ok := trackByPID[pes.pid]
+		if !ok {
+			index = len(reader.tracks)
+			trackByPID[pes.pid] = index
+			reader.tracks = append(reader.tracks, InputTrack{PID: pes.pid, Codec: codec, Timescale: 90000})
+		}
+		packets, update, err := parsePES(pes, index, codec)
+		if err != nil {
+			return nil, err
+		}
+		if update.SampleRate != 0 {
+			update.PID = pes.pid
+			update.Codec = codec
+			reader.tracks[index] = update
+		}
+		reader.packets = append(reader.packets, packets...)
+	}
+	if len(reader.tracks) == 0 || len(reader.packets) == 0 {
+		return nil, errors.New("mpegts: no supported elementary packets")
+	}
+	return reader, nil
+}
+
+func (r *InputReader) Tracks() []InputTrack {
+	out := append([]InputTrack(nil), r.tracks...)
+	for i := range out {
+		out[i].Config = append([]byte(nil), out[i].Config...)
+	}
+	return out
+}
+
+func (r *InputReader) NextPacket() (InputPacket, error) {
+	if r.next >= len(r.packets) {
+		return InputPacket{}, io.EOF
+	}
+	p := r.packets[r.next]
+	r.next++
+	p.Data = append([]byte(nil), p.Data...)
+	return p, nil
+}
+
+func (r *InputReader) Seek(track int, target int64) (int64, error) {
+	if track < 0 || track >= len(r.tracks) {
+		return 0, errors.New("mpegts: track index out of range")
+	}
+	chosen := 0
+	for i, packet := range r.packets {
+		if packet.Track == track && packet.PTS <= target && (packet.Keyframe || r.tracks[track].Codec == core.CodecAAC || r.tracks[track].Codec == core.CodecMP3) {
+			chosen = i
+		}
+	}
+	r.next = chosen
+	return r.packets[chosen].PTS, nil
+}
+
+func psiSection(payload []byte, start bool) ([]byte, error) {
+	if !start {
+		return nil, nil
+	}
+	if len(payload) == 0 || int(payload[0])+1 > len(payload) {
+		return nil, errors.New("mpegts: invalid PSI pointer")
+	}
+	payload = payload[1+int(payload[0]):]
+	if len(payload) < 3 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	length := int(payload[1]&15)<<8 | int(payload[2])
+	if length < 4 || 3+length > len(payload) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	section := payload[:3+length]
+	if crc32MPEG(section) != 0 {
+		return nil, errors.New("mpegts: PSI CRC mismatch")
+	}
+	return section, nil
+}
+
+func parsePAT(section []byte) (uint16, error) {
+	if len(section) < 12 || section[0] != 0x00 {
+		return 0, errors.New("mpegts: invalid PAT")
+	}
+	for offset := 8; offset+4 <= len(section)-4; offset += 4 {
+		program := binary.BigEndian.Uint16(section[offset : offset+2])
+		if program != 0 {
+			return uint16(section[offset+2]&0x1f)<<8 | uint16(section[offset+3]), nil
+		}
+	}
+	return 0, errors.New("mpegts: PAT has no program")
+}
+
+func parsePMT(section []byte, streams map[uint16]byte) error {
+	if len(section) < 16 || section[0] != 0x02 {
+		return errors.New("mpegts: invalid PMT")
+	}
+	programInfo := int(section[10]&15)<<8 | int(section[11])
+	offset := 12 + programInfo
+	for offset+5 <= len(section)-4 {
+		typ := section[offset]
+		pid := uint16(section[offset+1]&0x1f)<<8 | uint16(section[offset+2])
+		length := int(section[offset+3]&15)<<8 | int(section[offset+4])
+		offset += 5
+		if length > len(section)-4-offset {
+			return io.ErrUnexpectedEOF
+		}
+		streams[pid] = typ
+		offset += length
+	}
+	return nil
+}
+
+func streamCodec(typ byte) core.CodecType {
+	switch typ {
+	case 0x0f:
+		return core.CodecAAC
+	case 0x03, 0x04:
+		return core.CodecMP3
+	case 0x1b:
+		return core.CodecH264
+	case 0x24:
+		return core.CodecHEVC
+	default:
+		return core.CodecUnknown
+	}
+}
+
+func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, InputTrack, error) {
+	data := pes.data
+	if len(data) < 9 || data[0] != 0 || data[1] != 0 || data[2] != 1 || data[6]&0xc0 != 0x80 {
+		return nil, InputTrack{}, errors.New("mpegts: invalid PES header")
+	}
+	headerLength := int(data[8])
+	if 9+headerLength > len(data) {
+		return nil, InputTrack{}, io.ErrUnexpectedEOF
+	}
+	pts, dts := int64(0), int64(0)
+	flags := data[7] >> 6
+	if flags&2 != 0 {
+		if headerLength < 5 {
+			return nil, InputTrack{}, io.ErrUnexpectedEOF
+		}
+		var err error
+		pts, err = decodeTimestamp(data[9:14])
+		if err != nil {
+			return nil, InputTrack{}, err
+		}
+		dts = pts
+	}
+	if flags&1 != 0 {
+		if headerLength < 10 {
+			return nil, InputTrack{}, io.ErrUnexpectedEOF
+		}
+		var err error
+		dts, err = decodeTimestamp(data[14:19])
+		if err != nil {
+			return nil, InputTrack{}, err
+		}
+	}
+	payload := data[9+headerLength:]
+	trackInfo := InputTrack{Codec: codec, Timescale: 90000}
+	switch codec {
+	case core.CodecAAC:
+		var packets []InputPacket
+		for len(payload) > 0 {
+			header, err := aac.ParseADTS(payload)
+			if err != nil {
+				return nil, InputTrack{}, err
+			}
+			if trackInfo.SampleRate == 0 {
+				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.ChannelConfig, header.SampleRate
+				trackInfo.Config, _ = aac.ASC(aac.Config{AudioObjectType: header.Profile, SampleRate: header.SampleRate, FrequencyIndex: header.FrequencyIndex, ChannelConfig: header.ChannelConfig})
+			}
+			packetPTS := pts * int64(header.SampleRate) / 90000
+			packets = append(packets, InputPacket{Track: track, Data: append([]byte(nil), payload[header.HeaderLength:header.FrameLength]...), PTS: packetPTS, DTS: packetPTS, Duration: int64(header.Samples), Keyframe: true, Offset: pes.offset})
+			pts += int64(header.Samples) * 90000 / int64(header.SampleRate)
+			payload = payload[header.FrameLength:]
+		}
+		return packets, trackInfo, nil
+	case core.CodecMP3:
+		var packets []InputPacket
+		for len(payload) > 0 {
+			header, err := mp3.ParseHeader(payload)
+			if err != nil || header.FrameLength > len(payload) {
+				return nil, InputTrack{}, errors.New("mpegts: malformed MP3 frame")
+			}
+			if trackInfo.SampleRate == 0 {
+				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.Channels, header.SampleRate
+			}
+			packetPTS := pts * int64(header.SampleRate) / 90000
+			packets = append(packets, InputPacket{Track: track, Data: append([]byte(nil), payload[:header.FrameLength]...), PTS: packetPTS, DTS: packetPTS, Duration: int64(header.Samples), Keyframe: true, Offset: pes.offset})
+			pts += int64(header.Samples) * 90000 / int64(header.SampleRate)
+			payload = payload[header.FrameLength:]
+		}
+		return packets, trackInfo, nil
+	default:
+		if len(payload) == 0 {
+			return nil, InputTrack{}, errors.New("mpegts: empty PES payload")
+		}
+		return []InputPacket{{Track: track, Data: append([]byte(nil), payload...), PTS: pts, DTS: dts, Keyframe: annexBKeyframe(codec, payload), Offset: pes.offset}}, trackInfo, nil
+	}
+}
+
+func decodeTimestamp(data []byte) (int64, error) {
+	if len(data) < 5 || data[0]&1 == 0 || data[2]&1 == 0 || data[4]&1 == 0 {
+		return 0, errors.New("mpegts: malformed PES timestamp markers")
+	}
+	value := int64(data[0]>>1&7)<<30 | int64(binary.BigEndian.Uint16(data[1:3])>>1)<<15 | int64(binary.BigEndian.Uint16(data[3:5])>>1)
+	return value, nil
+}
+
+func annexBKeyframe(codec core.CodecType, data []byte) bool {
+	for i := 0; i+4 < len(data); i++ {
+		start := 0
+		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+			start = i + 3
+		} else if i+4 < len(data) && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
+			start = i + 4
+		}
+		if start == 0 || start >= len(data) {
+			continue
+		}
+		if codec == core.CodecH264 && data[start]&0x1f == 5 {
+			return true
+		}
+		if codec == core.CodecHEVC {
+			typ := data[start] >> 1 & 0x3f
+			if typ >= 16 && typ <= 23 {
+				return true
+			}
+		}
+	}
+	return false
+}

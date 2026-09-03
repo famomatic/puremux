@@ -2,6 +2,7 @@ package mp4
 
 import (
 	"errors"
+	"math"
 )
 
 // initCursors primes the streaming cursors of every track so that peekNext can
@@ -20,6 +21,19 @@ func (rd *Reader) initCursors() error {
 }
 
 func (t *trackState) initCursor() error {
+	t.totalSamples = 0
+	t.consumed = 0
+	t.sttsIdx = 0
+	t.sttsLeft = 0
+	t.accumUnits = 0
+	t.cttsIdx = 0
+	t.cttsLeft = 0
+	t.chunkIdx = 0
+	t.chunkSampleLeft = 0
+	t.chunkOff = 0
+	t.stssIdx = 0
+	t.hasPeek = false
+	t.peek = samplePeek{}
 	// Total samples: prefer stsz count, else sum of stts counts.
 	t.totalSamples = uint32(len(t.sampleSize))
 	if t.uniform != 0 {
@@ -44,7 +58,10 @@ func (t *trackState) initCursor() error {
 		t.sttsIdx = 0
 		t.sttsLeft = t.stts[0].count
 	}
-	t.accumUnits = 0
+	if len(t.ctts) > 0 {
+		t.cttsIdx = 0
+		t.cttsLeft = t.ctts[0].count
+	}
 	// chunk cursor at the first chunk.
 	if len(t.stco) > 0 {
 		t.chunkIdx = 0
@@ -52,9 +69,6 @@ func (t *trackState) initCursor() error {
 		t.chunkSampleLeft = samplesPerChunkFor(t.stsc, 1)
 	}
 	// stss cursor at the start.
-	t.stssIdx = 0
-	t.consumed = 0
-	t.hasPeek = false
 	return nil
 }
 
@@ -73,7 +87,29 @@ func (t *trackState) peekNext() bool {
 			t.sttsLeft = t.stts[t.sttsIdx].count
 		}
 	}
-	absMs := timescaleToMs(t.accumUnits, t.timescale)
+	if t.accumUnits > math.MaxInt64 {
+		return false
+	}
+	dts := int64(t.accumUnits)
+	var compositionOffset int64
+	for t.cttsIdx < len(t.ctts) && t.cttsLeft == 0 {
+		t.cttsIdx++
+		if t.cttsIdx < len(t.ctts) {
+			t.cttsLeft = t.ctts[t.cttsIdx].count
+		}
+	}
+	if t.cttsIdx < len(t.ctts) {
+		compositionOffset = t.ctts[t.cttsIdx].offset
+	}
+	pts := dts + compositionOffset + t.presentationShift
+	absMs := uint64(0)
+	if pts > 0 {
+		absMs = timescaleToMs(uint64(pts), t.timescale)
+	}
+	duration := int64(0)
+	if t.sttsIdx < len(t.stts) {
+		duration = int64(t.stts[t.sttsIdx].delta)
+	}
 
 	// Size from stsz (uniform or per-sample).
 	var size uint32
@@ -124,6 +160,9 @@ func (t *trackState) peekNext() bool {
 
 	t.peek = samplePeek{
 		absMs:    absMs,
+		dts:      dts,
+		pts:      pts,
+		duration: duration,
 		keyframe: isKey,
 		off:      off,
 		size:     size,
@@ -141,6 +180,9 @@ func (t *trackState) advancePast(s samplePeek) {
 		if t.sttsLeft > 0 {
 			t.sttsLeft--
 		}
+	}
+	if t.cttsIdx < len(t.ctts) && t.cttsLeft > 0 {
+		t.cttsLeft--
 	}
 	// chunk: consume one sample from the current chunk and advance the offset
 	// by this sample's size.

@@ -18,21 +18,33 @@ import (
 // MP4 sample tables reference absolute mdat offsets, so the input must be an
 // io.ReadSeeker.
 type Reader struct {
-	rs     io.ReadSeeker
-	tracks []*trackState
+	rs             io.ReadSeeker
+	tracks         []*trackState
+	movieTimescale uint32
+	duration       uint64
+	metadata       map[string]string
+	trex           map[uint32]trackDefaults
+	fragments      []fragmentSample
+	fragmentCursor int
 	// inited is set once the streaming cursors below are primed.
 	inited bool
 }
 
 type trackState struct {
-	info       Track
-	timescale  uint32
-	sampleSize []uint32 // stsz per-sample sizes
-	uniform    uint32   // stsz uniform sample size (0 if per-sample)
-	stts       []sttsEntry
-	stsc       []stscEntry
-	stco       []uint64 // chunk offsets (stco 32-bit or co64 64-bit)
-	stss       []uint32 // sync sample numbers (1-based); nil = unknown
+	info              Track
+	timescale         uint32
+	duration          uint64
+	editMediaTime     int64
+	hasEditMediaTime  bool
+	editLeadMovie     uint64
+	presentationShift int64
+	sampleSize        []uint32 // stsz per-sample sizes
+	uniform           uint32   // stsz uniform sample size (0 if per-sample)
+	stts              []sttsEntry
+	ctts              []cttsEntry
+	stsc              []stscEntry
+	stco              []uint64 // chunk offsets (stco 32-bit or co64 64-bit)
+	stss              []uint32 // sync sample numbers (1-based); nil = unknown
 
 	// --- Streaming cursors (O(1) memory, independent of sample count) ---
 	totalSamples uint32 // total samples in the track
@@ -42,6 +54,8 @@ type trackState struct {
 	sttsIdx    int    // current stts entry index
 	sttsLeft   uint32 // samples remaining in the current stts entry
 	accumUnits uint64 // accumulated timescale units up to the NEXT sample
+	cttsIdx    int
+	cttsLeft   uint32
 
 	// chunk cursor: offset accumulation
 	chunkIdx        int    // current chunk index into stco
@@ -61,6 +75,28 @@ type sttsEntry struct {
 	delta uint32
 }
 
+type cttsEntry struct {
+	count  uint32
+	offset int64
+}
+
+type trackDefaults struct {
+	descriptionIndex uint32
+	duration         uint32
+	size             uint32
+	flags            uint32
+}
+
+type fragmentSample struct {
+	track    *trackState
+	dts      int64
+	pts      int64
+	duration int64
+	off      int64
+	size     uint32
+	keyframe bool
+}
+
 type stscEntry struct {
 	firstChunk      uint32
 	samplesPerChunk uint32
@@ -71,6 +107,9 @@ type stscEntry struct {
 // only the current sample's metadata, not the whole table.
 type samplePeek struct {
 	absMs    uint64
+	dts      int64
+	pts      int64
+	duration int64
 	keyframe bool
 	off      int64
 	size     uint32
@@ -135,7 +174,9 @@ func skipBox(r io.Reader, b box) error {
 func (rd *Reader) Tracks() []Track {
 	out := make([]Track, 0, len(rd.tracks))
 	for _, t := range rd.tracks {
-		out = append(out, t.info)
+		info := t.info
+		info.CodecConfig = append([]byte(nil), info.CodecConfig...)
+		out = append(out, info)
 	}
 	return out
 }

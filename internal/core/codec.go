@@ -51,6 +51,7 @@ func NewDetectorRegistry() *DetectorRegistry {
 	r.Register(CodecFLAC, noopDetector{})
 	r.Register(CodecH264, h264Detector{})
 	r.Register(CodecHEVC, hevcDetector{})
+	r.Register(CodecMP3, noopDetector{})
 	return r
 }
 

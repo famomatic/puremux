@@ -2,12 +2,21 @@
 
 ## 1. Project Overview
 
-`puremux` is a pure Go, native media muxer library.
+`puremux` is the compatibility module for a pure Go compressed-media toolkit.
+The historical muxing facade remains supported while the public `pkg/media`
+API adds demuxing, probing, seeking, source transports, manifest readers, and
+bounded bitstream-framing transforms.
 
 - **Core Constraint**: Absolutely NO CGO (`CGO_ENABLED=0`), NO external FFmpeg binaries.
-- **Scope**: Muxing only. No decoding/encoding or pixel data manipulation. Parses pre-compressed packet headers and serializes them into container formats.
-- **Target Containers**: WebM (primary), Matroska/MKV (secondary superset extension), MPEG-TS (live-streaming output, Session API only)
-- **Target Codecs**: VP8, VP9, AV1, Opus (EBML); H.264/HEVC Annex-B + ADTS AAC (MPEG-TS)
+- **Scope**: Compressed-media container, manifest, transport, probe, seek, and
+  bitstream-framing operations. No decoding, encoding, resampling, PCM/pixel
+  access, or DSP/filter implementation.
+- **Target Containers**: WebM/Matroska, MP4/fMP4, Ogg, MPEG-TS, MP3, ADTS, and
+  FLAC. MPEG-TS output remains available through the historical Session API.
+- **Target Manifests/Transports**: caller-controlled files/readers, HTTP(S)
+  range sources, HLS, and DASH.
+- **Target Codecs**: VP8, VP9, AV1, Opus, Vorbis, FLAC, AAC, MP3, H.264, and
+  HEVC at the compressed packet/header level only.
 - **Implementation Priority**: WebM first. MKV is a strict superset of WebM and is layered on top, never forked. WebM correctness is the gate for MKV work.
 
 ## 2. Core Problem Solved
@@ -46,7 +55,9 @@ The "treat payloads as opaque" rule (AGENTS.md) is precise, not absolute. It for
 | Unpacking audio PCM samples                   | No        | —                |
 | Resampling / re-encoding any track            | No        | —                |
 
-Every codec-specific header parse MUST live behind the `CodecKeyframeDetector` interface in `internal/core` (see §5.A). No preprocessor or muxer code may contain inline VP9/AV1 byte probing; it must call through the interface.
+Every codec-specific header parse MUST live in `internal/core` or a dedicated
+`pkg/bitstream/<codec>` package. Preprocessors and muxers must consume a
+codec-neutral interface/result and may not contain inline codec parsing.
 
 ## 5. Architectural Layers
 
@@ -111,6 +122,40 @@ Takes corrected packets and writes valid container bytes. Assumes incoming strea
 - **Streaming Mode (non-seekable)**: When `io.Seeker` is unavailable, `Duration` is left unset (or set to the live `TimecodeScale`-relative placeholder), `Cues` are omitted entirely, and the Segment uses the unknown-size (`0x01FFFFFFFFFFFFFF`) sentinel. This produces a valid live/appendable WebM that players can stream but not seek.
 - **MPEG-TS backend (`internal/format/mpegts`)**: single-program transport stream for live output. Elementary streams are written verbatim (H.264/HEVC as Annex-B access units, AAC as ADTS frames — the muxer never converts bitstream framing, §4). Timestamps are only *converted*: `time.Duration` → 90 kHz PES ticks, rebased to the first packet plus a 10s headroom offset, rounded to nearest tick. PAT/PMT are emitted at start and periodically re-emitted so mid-stream readers can sync; PCR rides the first video track's PID. Every 188-byte packet is flushed as produced (no fragment buffering), which is what makes `Session` + `ContainerMPEGTS` suitable for live pipes. File-based `Merge` refuses TS output because container inputs carry AVCC/raw-AAC framing; only the live ES ingestion path (`Session.WriteVideo` / `Session.WriteADTS`) may feed it.
 
+### D. Media/Demux Layer (`pkg/media` & `internal/format/*`)
+
+Demuxers report container truth and never repair or synthesize timestamps.
+Public packet timestamps are signed integer ticks in the owning stream's exact
+time base. `time.Duration` conversion is a convenience and must not replace
+the exact representation. Unknown timestamps and durations are explicit.
+
+`ReadPacket`, `Seek`, and `Close` have a documented cancellation and ownership
+contract. Returned packet storage remains valid until `Packet.Release`; a
+released packet and its data must not be retained. Seek invalidates queued
+packets and resets format-local cursors without invoking the preprocessor.
+
+Sources expose capabilities instead of pretending every input is seekable:
+sequential readers support streamable formats, while `io.ReaderAt` plus a
+known size enables indexed/random-access formats. HTTP sources accept a
+caller-provided client, headers, retry policy, and context; they validate
+range responses and entity validators before combining bytes.
+
+### E. Manifest Layer (`internal/manifest`)
+
+HLS and DASH resolve playlists/manifests into ordered, bounded segment
+sources and delegate compressed bytes to format demuxers. Manifest code does
+not parse codec payloads. Live refresh, discontinuity, byte ranges,
+initialization segments, encryption metadata, and cancellation are explicit
+state rather than hidden behavior in an HTTP reader.
+
+### F. Bitstream Framing (`pkg/bitstream`)
+
+Framing transforms may parse and rewrite codec headers/configuration records
+but never decode samples. AVCC/HVCC conversion includes NAL-length size and
+parameter-set handling; AAC/ADTS helpers expose unsupported configurations
+instead of guessing. All transforms are bounded and return typed errors for
+truncation, malformed sizes, or unsupported profiles.
+
 ## 6. Concurrency Model
 
 A muxer instance serializes a multi-track stream through a single writer goroutine. Producers (one per track) push `Packet`s onto per-track buffered channels; the single writer drains them in merged timecode order and serializes cluster/block writes. No per-packet mutex is held across I/O — only the channel handoff. This keeps allocation and lock contention out of the hot path and preserves the `sync.Pool` reuse assumption.
@@ -119,4 +164,14 @@ The preprocessor runs per-track and is stateful, so each track owns its own Enfo
 
 ## 7. Implementation Priority & Gates
 
-WebM is implemented and verified first; MKV extensions (extra codecs, additional EBML elements, `Chapters`, `Attachments`) layer on top of the same EBML engine and muxer interfaces. Do not begin MKV-specific work until WebM round-trips a VP9+Opus stream against a reference player.
+The media expansion is delivered in dependency order: public contracts,
+WebM/Opus, HTTP range and seek, Lavalink passthrough integration, Ogg/Opus,
+MP4, fMP4, optional FFmpeg packet bridging, bitstream filters, raw audio,
+HLS, then DASH. Every codec/container task requires specification-derived
+boundary tests plus committed real-media fixtures or externally generated
+packet manifests; self-authored synthetic bytes alone are not acceptance.
+
+The module path remains `github.com/famomatic/puremux` during this cycle so
+existing ytv1 and lavalink dependency graphs do not load old and new module
+identities simultaneously. A product/module rename is a separate coordinated
+migration after the public media API stabilizes.
