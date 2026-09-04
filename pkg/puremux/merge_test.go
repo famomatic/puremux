@@ -63,6 +63,19 @@ type fileSeeker struct{ f *os.File }
 func (fs *fileSeeker) Write(p []byte) (int, error)        { return fs.f.Write(p) }
 func (fs *fileSeeker) Seek(o int64, w int) (int64, error) { return fs.f.Seek(o, w) }
 
+type cancelAfterWrite struct {
+	cancel context.CancelFunc
+	writes int
+}
+
+func (w *cancelAfterWrite) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 {
+		w.cancel()
+	}
+	return len(p), nil
+}
+
 func TestMergeWebMToWebM(t *testing.T) {
 	dir := t.TempDir()
 	in := filepath.Join(dir, "in.webm")
@@ -84,6 +97,18 @@ func TestMergeWebMToWebM(t *testing.T) {
 	}
 	if len(b) == 0 {
 		t.Fatal("empty output")
+	}
+}
+
+func TestMergeToWriterHonorsMidMergeCancellation(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.webm")
+	writeWebMFile(t, in)
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &cancelAfterWrite{cancel: cancel}
+	err := MergeToWriter(ctx, []string{in}, w, ContainerWebM, DefaultConfig())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("merge error = %v, want context.Canceled", err)
 	}
 }
 

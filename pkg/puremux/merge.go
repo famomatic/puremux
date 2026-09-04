@@ -94,7 +94,7 @@ func Merge(ctx context.Context, inputs []string, outputPath string, cfg Config) 
 	// tracks from the inputs; the container only affects header writing.
 	cfg.OutputContainer = out
 
-	if rerr := remuxInputs(inputs, inContainers, f, cfg); rerr != nil {
+	if rerr := remuxInputs(ctx, inputs, inContainers, f, cfg); rerr != nil {
 		// Close before removing: Windows refuses to unlink an open file, so a
 		// deferred close would leave a partial output on disk.
 		_ = f.Close()
@@ -200,7 +200,7 @@ func MergeToWriter(ctx context.Context, inputs []string, w io.Writer, out Contai
 		inContainers[i] = c
 	}
 	cfg.OutputContainer = out
-	return remuxInputs(inputs, inContainers, w, cfg)
+	return remuxInputs(ctx, inputs, inContainers, w, cfg)
 }
 
 // outputContainerForPath infers the output container from the file extension.

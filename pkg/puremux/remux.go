@@ -1,6 +1,7 @@
 package puremux
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -85,14 +86,17 @@ func RemuxInputs(inputs []string, w io.Writer, cfg Config) error {
 		}
 		containers[i] = c
 	}
-	return remuxInputs(inputs, containers, w, cfg)
+	return remuxInputs(context.Background(), inputs, containers, w, cfg)
 }
 
 // remuxInputs is the container-agnostic merge core. It opens each input with
 // the matching demuxer, registers tracks on a fresh session, and drains all
 // sources in merged absolute-timecode order. The cfg.OutputContainer decides
 // the EBML doctype written; it defaults to WebM when zero.
-func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Config) error {
+func remuxInputs(ctx context.Context, inputs []string, containers []Container, w io.Writer, cfg Config) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(inputs) == 0 {
 		return fmt.Errorf("puremux: no inputs")
 	}
@@ -113,6 +117,9 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 
 	// Open all inputs.
 	for i, path := range inputs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		rd, err := openInputReader(path, containers[i])
 		if err != nil {
 			for _, s := range srcs {
@@ -129,7 +136,11 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 	}()
 
 	// Create the output session and register tracks.
-	s, err := NewSession(w, cfg)
+	var output io.Writer = &contextWriter{ctx: ctx, w: w}
+	if ws, ok := w.(io.WriteSeeker); ok {
+		output = &contextWriteSeeker{contextWriter: contextWriter{ctx: ctx, w: w}, s: ws}
+	}
+	s, err := NewSession(output, cfg)
 	if err != nil {
 		return err
 	}
@@ -153,6 +164,9 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 
 	// Prime each source with its first block.
 	for _, src := range srcs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		blk, err := src.reader.NextBlock()
 		if err == io.EOF {
 			src.next = nil
@@ -166,6 +180,9 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 
 	// Merge loop: pick the source with the earliest block, emit it, advance.
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var pick int = -1
 		var bestTC uint64
 		for i, src := range srcs {
@@ -209,4 +226,28 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 		return fmt.Errorf("puremux: close: %w", err)
 	}
 	return nil
+}
+
+type contextWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+type contextWriteSeeker struct {
+	contextWriter
+	s io.Seeker
+}
+
+func (w *contextWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.s.Seek(offset, whence)
+}
+
+func (w *contextWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.w.Write(p)
 }
