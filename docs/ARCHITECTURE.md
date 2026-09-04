@@ -1,177 +1,187 @@
-# Puremux Architecture Specification
+# Puremux v0.2 Architecture
 
-## 1. Project Overview
+## Purpose
 
-`puremux` is the compatibility module for a pure Go compressed-media toolkit.
-The historical muxing facade remains supported while the public `pkg/media`
-API adds demuxing, probing, seeking, source transports, manifest readers, and
-bounded bitstream-framing transforms.
+Puremux is a pure-Go compressed-media demuxing and muxing toolkit. It copies
+compressed packets between supported containers without decoding audio or
+video. v0.2 makes `pkg/media` the only public API and adds native progressive
+and fragmented MP4 output.
 
-- **Core Constraint**: Absolutely NO CGO (`CGO_ENABLED=0`), NO external FFmpeg binaries.
-- **Scope**: Compressed-media container, manifest, transport, probe, seek, and
-  bitstream-framing operations. No decoding, encoding, resampling, PCM/pixel
-  access, or DSP/filter implementation.
-- **Target Containers**: WebM/Matroska, MP4/fMP4, Ogg, MPEG-TS, MP3, ADTS, and
-  FLAC. MPEG-TS output remains available through the historical Session API.
-- **Target Manifests/Transports**: caller-controlled files/readers, HTTP(S)
-  range sources, HLS, and DASH.
-- **Target Codecs**: VP8, VP9, AV1, Opus, Vorbis, FLAC, AAC, MP3, H.264, and
-  HEVC at the compressed packet/header level only.
-- **Implementation Priority**: WebM first. MKV is a strict superset of WebM and is layered on top, never forked. WebM correctness is the gate for MKV work.
+The module must build with `CGO_ENABLED=0`. Production code may not invoke
+FFmpeg/ffprobe, decode pixels or PCM, or depend on a native codec library.
 
-## 2. Core Problem Solved
+## Public packages
 
-Provides robust Error Resilience (FFmpeg-level packet preprocessing) for network-streamed packets (e.g., WebRTC, YouTube) that suffer from timestamp inversion or A/V sync drift.
+### `pkg/media`
 
-## 3. Directory Layout
+`pkg/media` owns all public container concepts:
+
+- `Source`, `Open`, `Demuxer`, `Stream`, and `Packet` for input;
+- `MuxOptions`, `NewMuxer`, and `Muxer` for output;
+- `RemuxInput`, `Remux`, and `RemuxFiles` for exact packet copying;
+- HLS/DASH readers and caller-controlled HTTP sources.
+
+Packet PTS, DTS, and duration are signed integer ticks in the owning stream's
+`Rational` time base. `time.Duration` is only a boundary convenience. A
+demuxer reports container timing without repair, and a muxer serializes the
+ordered timing supplied by its caller without repair.
+
+`Open` owns a source only after it succeeds. `Remux` explicitly takes
+ownership of every supplied input source. Neither `NewMuxer` nor `Remux`
+closes its output writer.
+
+### `pkg/bitstream`
+
+Bitstream packages parse or convert compressed framing and configuration
+records without decoding samples. They cover AAC ASC/ADTS, H.264 avcC and
+Annex-B/length prefixes, HEVC hvcC and NAL framing, OpusHead/dOps, FLAC
+STREAMINFO/dfLa, MP3 headers, and generic NAL conversion.
+
+All codec-specific inspection belongs here or in `internal/core`. Container
+writers consume validated, codec-neutral configuration and opaque samples.
+
+## Internal layers
 
 ```text
-puremux/
-├── cmd/
-│   └── puremux/              # CLI entrypoint
-├── pkg/
-│   └── puremux/              # Public facade API for external consumers
-├── internal/
-│   ├── core/                 # Common data structures (Packet, Codec, Track)
-│   ├── preprocessor/         # Packet pipeline (Enforcer, Aligner)
-│   ├── muxer/                # Muxer interfaces
-│   └── format/
-│       ├── ebml/             # RFC 8794 EBML low-level parser/builder
-│       ├── webm/             # WebM/MKV container implementation
-│       └── mpegts/           # MPEG-2 TS (ISO/IEC 13818-1) live muxer
+cmd/puremux                 CLI using pkg/media only
+pkg/media                   public demux, mux, remux, source, manifest API
+pkg/bitstream/<codec>       bounded compressed-header/config transforms
+internal/format/mp4         ISO BMFF reader, progressive writer, fMP4 writer
+internal/format/webm        Matroska/WebM reader and EBML writer
+internal/format/ebml        RFC 8794 integer/VINT primitives
+internal/format/mpegts      MPEG-2 TS reader/writer
+internal/format/ogg         Ogg reader
+internal/manifest           HLS/DASH parsing
+internal/core               shared codec and packet internals
+internal/preprocessor       isolated timestamp-repair algorithms
 ```
 
-## 4. Packet Opacity Boundary
+The preprocessor never writes container bytes. It is not implicitly invoked
+by `media.Muxer` or `media.Remux`; callers of the public mux API must provide
+pristine, decode-ordered streams. The muxers never reorder, interpolate, or
+otherwise repair timestamps.
 
-The "treat payloads as opaque" rule (AGENTS.md) is precise, not absolute. It forbids **media decoding** — never unpack, decompress, or inspect raw pixel buffers or audio PCM samples. It does NOT forbid reading **codec packet headers** to extract metadata required for muxing decisions.
+## Muxing contract
 
-| Operation                                     | Permitted | Layer            |
-| :-------------------------------------------- | :-------- | :--------------- |
-| VP9 superframe index parsing                  | Yes       | core (Codec)     |
-| AV1 OBU header / temporal_unit keyframe flag | Yes       | core (Codec)     |
-| Opus packet frame count read                  | Yes       | core (Codec)     |
-| Timestamp / keyframe flag extraction          | Yes       | preprocessor    |
-| Decoding compressed frames to pixels          | No        | —                |
-| Unpacking audio PCM samples                   | No        | —                |
-| Resampling / re-encoding any track            | No        | —                |
+Streams are registered before the first packet. `WritePacket` is synchronous
+and not safe for concurrent calls on one muxer. It returns only after the
+implementation has copied any bytes it needs to retain, so callers may then
+release or reuse the packet and payload. `Close` is idempotent and finalizes
+container metadata but does not close the destination.
 
-Every codec-specific header parse MUST live in `internal/core` or a dedicated
-`pkg/bitstream/<codec>` package. Preprocessors and muxers must consume a
-codec-neutral interface/result and may not contain inline codec parsing.
+All muxers require known PTS, DTS, and positive duration. Container clock
+conversion is explicit:
 
-## 5. Architectural Layers
+- MP4 preserves ticks directly and therefore requires an integral
+  ticks-per-second time base;
+- WebM/Matroska quantizes timestamps and duration to its 1 ms TimecodeScale;
+- MPEG-TS converts PTS/DTS to its 90 kHz clock and retains its established
+  first-DTS plus 10-second headroom mapping.
 
-### A. Core Data Structures (`internal/core`)
+No muxer converts elementary-stream framing. H.264/HEVC MP4 samples are
+length-prefixed and require avcC/hvcC. MPEG-TS H.264/HEVC packets are Annex-B,
+and AAC packets are complete ADTS frames. `Remux` rejects source/output pairs
+whose demuxed packet framing cannot satisfy MPEG-TS output.
 
-Telemetry primitives with zero/low-allocation design. Must reuse byte buffers via `sync.Pool`.
+## MP4 output
 
-```go
-type Packet struct {
-    Data       []byte
-    PTS        time.Duration
-    DTS        time.Duration
-    IsKeyframe bool
-    Codec      CodecType
-    TrackID    int
-}
+### Progressive mode
+
+A seekable destination receives `ftyp`, a 64-bit-size `mdat`, and a final
+`moov`. Sample payloads are written immediately; bounded per-sample metadata
+is retained until close. Finalization patches `mdat` and writes version-1
+movie/track/media headers, edit lists, sample descriptions, run-length
+`stts`, signed `ctts` version 1, `stss`, `stsc`, `stsz`, and `stco` or `co64`.
+
+Moov-at-end is deliberate for v0.2. Fast-start relocation is outside this
+release.
+
+### Fragmented mode
+
+Any `io.Writer` can receive fragmented MP4. The writer emits an initialization
+`ftyp+moov+mvex/trex`, followed by bounded `moof+mdat` fragments. Each fragment
+contains `mfhd`, per-track `tfhd`, 64-bit `tfdt`, and signed version-1 `trun`
+entries. Payload buffers come from `sync.Pool` and are copied before
+`WritePacket` returns.
+
+Video fragments cut on GOP/keyframe boundaries; audio-only output uses the
+configured duration threshold. `MaxFragmentBytes` is a hard retention bound.
+`MP4ModeAuto` selects progressive output for an `io.WriteSeeker` and fragmented
+output otherwise.
+
+### MP4 codec matrix
+
+| Codec | Sample entry | Required configuration |
+|---|---|---|
+| H.264 | `avc1` | `avcC` |
+| HEVC | `hvc1` | `hvcC` |
+| AV1 | `av01` | `av1C` |
+| VP9 | `vp09` | `vpcC` |
+| AAC | `mp4a` | ASC, serialized in `esds` |
+| Opus | `Opus` | `dOps` or convertible OpusHead |
+| FLAC | `fLaC` | `dfLa`, STREAMINFO, or Matroska FLAC private data |
+
+The configuration validators reject missing parameter sets, malformed sizes,
+reserved bits, unsupported channel mappings, and metadata/config mismatches.
+AV1 output includes the `av01` compatible brand; an AV1 sample entry whose
+`av1C` has no Sequence Header OBU carries an unspecified limited-range
+`colr/nclx` box as required by the binding. VP9 `vpcC` validation includes the
+registered profile/level/bit-depth/chroma combinations and requires its codec
+initialization data size to be zero.
+
+## WebM and Matroska output
+
+Both formats share one EBML implementation and differ by DocType and codec
+policy. WebM accepts VP8, VP9, AV1, Opus, and Vorbis. Matroska additionally
+accepts H.264, HEVC, and FLAC.
+
+Packets use `BlockGroup` with explicit `BlockDuration`; non-keyframes include
+`ReferenceBlock=0` when their exact dependency is unknown, and signed
+`DiscardPadding` is retained. VP9 CodecPrivate uses the Matroska ID/length/value
+feature list and is converted to or from MP4 `vpcC`; the two representations
+are never copied as though they were identical. Complete FLAC CodecPrivate
+metadata chains are preserved in Matroska and normalized to STREAMINFO-only
+`dfLa` for MP4. Opus tracks carry validated OpusHead, spec-derived CodecDelay
+(including a present zero-valued element), and SeekPreRoll. This avoids losing
+duration for codecs that do not expose a duration in their packet header.
+
+Seekable outputs patch Segment size and Duration and append Cues plus SeekHead.
+Non-seekable outputs use RFC 8794 unknown-size Segment/Cluster VINTs and omit
+indexes.
+
+## MPEG-TS output
+
+The TS backend emits a single program carrying Annex-B H.264/HEVC and ADTS
+AAC. PAT/PMT are repeated periodically, PCR uses the first video PID (or first
+audio PID), and every 188-byte packet is written immediately. There is no
+trailer. TS output is useful for explicitly framed live packets; it is not a
+general MP4/WebM-to-TS framing converter.
+
+## Exact remuxing
+
+`Remux` opens every input, registers tracks in input order, primes one packet
+per source, and performs a stable multiway merge by DTS. Cross-time-base
+comparison uses unsigned 192-bit products, so it neither overflows nor loses
+sub-nanosecond ordering by converting through `time.Duration`.
+
+Every demuxed packet is released after the synchronous mux write, including
+all error paths. `RemuxFiles` writes to a sibling temporary file, rejects an
+output that aliases an input, and installs the result only after successful
+container finalization and file close.
+
+## Verification gates
+
+Container and codec tests use hand-derived specification bytes with explicit
+bit order and malformed/truncated/overflow boundaries. MP4 writer tests also
+use an attributed real H.264 access unit and the independent Eyevinn/mp4ff
+parser to validate box structure, sample tables, data offsets, timestamps,
+and byte-identical payload extraction.
+
+A release is complete only after:
+
+```text
+CGO_ENABLED=0 go test -count=1 ./...
+go vet ./...
+go mod tidy -diff
+git diff --check
 ```
-
-Codec-specific behavior is isolated behind an interface. The preprocessor depends on this, never on concrete codec logic:
-
-```go
-// Detects keyframe status and packet boundary metadata from a compressed
-// payload's header bytes only. MUST NOT decode the payload.
-type CodecKeyframeDetector interface {
-    // IsKeyframe inspects the packet header (e.g. VP9 superframe index,
-    // AV1 OBU header) and reports whether this packet holds a sync frame.
-    IsKeyframe(data []byte) bool
-}
-```
-
-Each target codec (VP8, VP9, AV1) provides its own implementation registered in `internal/core`. Opus has no keyframe concept and returns the no-op detector.
-
-A second, equally scoped probing interface is `core.PictureOrderParser`: for H.264/HEVC it parses SPS/PPS and slice HEADER fields only (picture order count) to place each decode-order access unit in display order. It is stateful (parameter-set cache, POC wraparound tracking), obtained per elementary stream via `core.NewPictureOrderParser`, and — like the keyframe detector — is the only sanctioned path for this inspection: preprocessor and muxer code consume its `POCInfo` output, never the bytes.
-
-### B. Preprocessor Layer (`internal/preprocessor`)
-
-Responsible for fixing corrupted packet streams. Operates purely in-memory. Does NOT write to files.
-
-1. **Monotonic Timestamp Enforcer**: Jitter buffer to force chronological ordering and interpolate gaps.
-   - The buffer is **bounded and configurable** (`MaxBufferSize`, `MaxBufferDuration`). It is never unbounded.
-   - **Overflow policy** (explicit, not implicit): on overflow the oldest out-of-order packet is drop, never silently absorbed into an unbounded queue. The drop MUST be observable via a returned/recorded metric so callers can detect stream degradation.
-   - Interpolation fills small gaps only; gaps exceeding a codec-specific threshold are left as discontinuities rather than synthesized.
-2. **Keyframe Aligner**: Enforces video stream to start with an IDR/I-Frame. Adjusts audio sync.
-   - Audio realignment is **packet-granular only**. The aligner may drop or duplicate whole Opus packets; it MUST NOT trim within a packet, because sample counts are unknown under the opacity rule (§4) and trimming would require decoding.
-   - The aligner depends on `CodecKeyframeDetector` (§5.A) — it never probes codec bytes directly.
-3. **DTS Synthesizer** (live reordered ingestion, `Session.WriteVideoReordered`): derives a decode timeline for video delivered in decode order with per-frame *presentation* timestamps only (B-frame streams have non-monotonic PTS in decode order, unusable as DTS).
-   - Sits BEFORE the Enforcer; per-track, stateful, in-memory only (never writes bytes, never inspects payloads).
-   - Principle: a valid decode timeline is the PTS sequence sorted ascending, delayed by the stream's reorder depth; the depth is **measured from the stream, continuously** — a bounded startup probe (8 frames held once; up to 32 for a duplicate-heavy start with no ordering evidence) whose window-wide measurement is order-tolerant against scrambled/duplicated backfill bursts, then a sliding-window steady phase whose delay grows adaptively if a deeper B-pyramid appears and decays back when a burst-inflated startup measurement exceeds the observed depth. No measurement is ever locked permanently.
-   - Guarantees: decode order preserved exactly; synthesized DTS strictly monotonic (advancing by ≥ `MinMonotonicStep`, so it survives container-clock quantization); `DTS ≤ PTS` per frame (bounded transient on mid-stream depth growth); caller PTS never altered; zero steady-state latency.
-   - Reorder-free input degenerates to a passthrough (`DTS == PTS`), byte-identical to the `WriteVideo` path — duplicate-timestamp repair stays the Enforcer's job.
-4. **Presentation Synthesizer** (live decode-clock ingestion, `Session.WriteVideo` + MPEG-TS H.264/HEVC): the mirror problem — video delivered in decode order on a monotonic *decode* clock (`PTS == DTS == t`) whose bitstream reorders display (B-frames). Decode-order timestamps are wrong as presentation times, so it derives the display timeline instead.
-   - Sits BEFORE the Enforcer; per-track, stateful, in-memory only. It never inspects payload bytes: the session parses each AU's POC via `core.PictureOrderParser` (§5.A) and passes the `POCInfo` in.
-   - Principle: the picture with display rank d takes decode-clock slot `t[d + D]` (D = observed reorder depth — the causality delay). Ranks come from the POC; a bounded startup probe (8 pictures) detects whether the stream reorders at all, and a sliding lookahead window (observed depth + margin, capped at the 16-frame DPB bound) delays each picture just long enough to rank it exactly. Slots beyond the newest arrival are extrapolated from the median decode-clock delta.
-   - Guarantees: decode order preserved exactly; DTS (the decode clock) never altered; `PTS ≥ DTS` per frame (clamped under a jittery startup clock, degrading locally); display-order PTS strictly increasing in steady state; reorder-free input is a zero-steady-latency passthrough, byte-identical to earlier releases.
-
-### C. Muxer Layer (`internal/muxer` & `internal/format/webm`)
-
-Takes corrected packets and writes valid container bytes. Assumes incoming streams are pristine and ordered; it MUST NOT alter timestamps or fix sync (see AGENTS.md separation of concerns).
-
-- **SeekHead + Cues**: When the writer is an `io.Seeker`, the muxer writes a SeekHead that points at the Cues element and the Tracks element for random access.
-- **Graceful Closer**: If the underlying `io.Writer` implements `io.Seeker`, it MUST seek back upon `Close()` to overwrite the dummy `Duration` (in the Info element) and `Cues` (Index) that were reserved up front. If not a seeker, uses streaming flags.
-- **Streaming Mode (non-seekable)**: When `io.Seeker` is unavailable, `Duration` is left unset (or set to the live `TimecodeScale`-relative placeholder), `Cues` are omitted entirely, and the Segment uses the unknown-size (`0x01FFFFFFFFFFFFFF`) sentinel. This produces a valid live/appendable WebM that players can stream but not seek.
-- **MPEG-TS backend (`internal/format/mpegts`)**: single-program transport stream for live output. Elementary streams are written verbatim (H.264/HEVC as Annex-B access units, AAC as ADTS frames — the muxer never converts bitstream framing, §4). Timestamps are only *converted*: `time.Duration` → 90 kHz PES ticks, rebased to the first packet plus a 10s headroom offset, rounded to nearest tick. PAT/PMT are emitted at start and periodically re-emitted so mid-stream readers can sync; PCR rides the first video track's PID. Every 188-byte packet is flushed as produced (no fragment buffering), which is what makes `Session` + `ContainerMPEGTS` suitable for live pipes. File-based `Merge` refuses TS output because container inputs carry AVCC/raw-AAC framing; only the live ES ingestion path (`Session.WriteVideo` / `Session.WriteADTS`) may feed it.
-
-### D. Media/Demux Layer (`pkg/media` & `internal/format/*`)
-
-Demuxers report container truth and never repair or synthesize timestamps.
-Public packet timestamps are signed integer ticks in the owning stream's exact
-time base. `time.Duration` conversion is a convenience and must not replace
-the exact representation. Unknown timestamps and durations are explicit.
-
-`ReadPacket`, `Seek`, and `Close` have a documented cancellation and ownership
-contract. Returned packet storage remains valid until `Packet.Release`; a
-released packet and its data must not be retained. Seek invalidates queued
-packets and resets format-local cursors without invoking the preprocessor.
-
-Sources expose capabilities instead of pretending every input is seekable:
-sequential readers support streamable formats, while `io.ReaderAt` plus a
-known size enables indexed/random-access formats. HTTP sources accept a
-caller-provided client, headers, retry policy, and context; they validate
-range responses and entity validators before combining bytes.
-
-### E. Manifest Layer (`internal/manifest`)
-
-HLS and DASH resolve playlists/manifests into ordered, bounded segment
-sources and delegate compressed bytes to format demuxers. Manifest code does
-not parse codec payloads. Live refresh, discontinuity, byte ranges,
-initialization segments, encryption metadata, and cancellation are explicit
-state rather than hidden behavior in an HTTP reader.
-
-### F. Bitstream Framing (`pkg/bitstream`)
-
-Framing transforms may parse and rewrite codec headers/configuration records
-but never decode samples. AVCC/HVCC conversion includes NAL-length size and
-parameter-set handling; AAC/ADTS helpers expose unsupported configurations
-instead of guessing. All transforms are bounded and return typed errors for
-truncation, malformed sizes, or unsupported profiles.
-
-## 6. Concurrency Model
-
-A muxer instance serializes a multi-track stream through a single writer goroutine. Producers (one per track) push `Packet`s onto per-track buffered channels; the single writer drains them in merged timecode order and serializes cluster/block writes. No per-packet mutex is held across I/O — only the channel handoff. This keeps allocation and lock contention out of the hot path and preserves the `sync.Pool` reuse assumption.
-
-The preprocessor runs per-track and is stateful, so each track owns its own Enforcer/Aligner instance; no cross-track shared mutable state exists above the muxer's merge step.
-
-## 7. Implementation Priority & Gates
-
-The media expansion is delivered in dependency order: public contracts,
-WebM/Opus, HTTP range and seek, Lavalink passthrough integration, Ogg/Opus,
-MP4, fMP4, optional FFmpeg packet bridging, bitstream filters, raw audio,
-HLS, then DASH. Every codec/container task requires specification-derived
-boundary tests plus committed real-media fixtures or externally generated
-packet manifests; self-authored synthetic bytes alone are not acceptance.
-
-The module path remains `github.com/famomatic/puremux` during this cycle so
-existing ytv1 and lavalink dependency graphs do not load old and new module
-identities simultaneously. A product/module rename is a separate coordinated
-migration after the public media API stabilizes.

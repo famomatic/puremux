@@ -1,5 +1,7 @@
 package core
 
+import "encoding/binary"
+
 // h264Detector parses H.264/AVC NAL unit headers to detect an IDR slice
 // (sync frame). A packet may carry multiple NAL units, separated either by
 // an AVCC length prefix (a big-endian length, default 4 bytes) or by the
@@ -98,7 +100,7 @@ func (hevcDetector) IsKeyframe(data []byte) bool {
 func (hevcDetector) IsConfigOnly(data []byte) bool {
 	hasParamSet, hasVCL, any := false, false, false
 	forEachNAL(data, func(nal []byte) bool {
-		if len(nal) < 2 || nal[0]&0x80 != 0 {
+		if !validHEVCNALHeader(nal) {
 			return true
 		}
 		any = true
@@ -117,16 +119,17 @@ func (hevcDetector) IsConfigOnly(data []byte) bool {
 // hevcNALIsKeyframe inspects a NAL unit's first two header bytes. The
 // nal_unit_type occupies bits [6:1] of byte 0 (after the forbidden bit).
 func hevcNALIsKeyframe(nal []byte) bool {
-	if len(nal) < 2 {
+	if !validHEVCNALHeader(nal) {
 		return false
 	}
-	b0 := nal[0]
-	if b0&0x80 != 0 {
-		// forbidden_zero_bit set: malformed NAL.
-		return false
-	}
-	nalType := (b0 >> 1) & 0x3F
-	return nalType >= hevcNalTypeBLAWLP && nalType <= hevcNalTypeCRANUT
+	nalType := (nal[0] >> 1) & 0x3F
+	// H.265 requires TemporalId == 0 for IRAP VCL NAL units, so the
+	// encoded nuh_temporal_id_plus1 field must be exactly one.
+	return nalType >= hevcNalTypeBLAWLP && nalType <= hevcNalTypeCRANUT && nal[1]&0x07 == 1
+}
+
+func validHEVCNALHeader(nal []byte) bool {
+	return len(nal) >= 2 && nal[0]&0x80 == 0 && nal[1]&0x07 != 0
 }
 
 // scanNALs walks a packet payload and applies check to each NAL unit's
@@ -264,13 +267,13 @@ func findNextStartCode(data []byte, from int) int {
 func forEachAVCCNAL(data []byte, fn func(nal []byte) bool) {
 	i := 0
 	for i+4 <= len(data) {
-		length := int(data[i])<<24 | int(data[i+1])<<16 | int(data[i+2])<<8 | int(data[i+3])
+		length := binary.BigEndian.Uint32(data[i : i+4])
 		nalStart := i + 4
-		nalEnd := nalStart + length
-		if length <= 0 || nalEnd > len(data) {
+		if length == 0 || uint64(length) > uint64(len(data)-nalStart) {
 			// Malformed length: stop scanning safely rather than panic.
 			return
 		}
+		nalEnd := nalStart + int(length)
 		if !fn(data[nalStart:nalEnd]) {
 			return
 		}

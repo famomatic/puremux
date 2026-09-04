@@ -6,9 +6,8 @@ import (
 	"math"
 	"testing"
 
-	"github.com/famomatic/puremux/internal/format/ebml"
-
 	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 func TestPatchDuration(t *testing.T) {
@@ -100,7 +99,9 @@ func TestWriteTracks(t *testing.T) {
 	ws := newMockSeeker()
 	tracks := []TrackSpec{
 		{Number: 1, UID: 123, Codec: core.CodecVP9, IsVideo: true, Width: 1920, Height: 1080},
-		{Number: 2, UID: 456, Codec: core.CodecOpus, IsVideo: false, Channels: 2, SampleRate: 48000.0},
+		{Number: 2, UID: 456, Codec: core.CodecOpus, IsVideo: false, Channels: 2, SampleRate: 48000.0,
+			CodecDelayNS: 6_500_000, SeekPreRollNS: 80_000_000},
+		{Number: 3, UID: 789, Codec: core.CodecHEVC, IsVideo: true, Width: 1280, Height: 720},
 	}
 	start, err := WriteTracks(ws, tracks)
 	if err != nil {
@@ -117,9 +118,9 @@ func TestWriteTracks(t *testing.T) {
 	if id != idTracks {
 		t.Errorf("id = 0x%X want Tracks", id)
 	}
-	// Should contain 2 TrackEntry (id 0xAE).
-	if bytes.Count(out, []byte{0xAE}) < 2 {
-		t.Error("expected 2 TrackEntry elements")
+	// Should contain 3 TrackEntry (id 0xAE).
+	if bytes.Count(out, []byte{0xAE}) < 3 {
+		t.Error("expected 3 TrackEntry elements")
 	}
 	// VP9 codec ID string should appear.
 	if !bytes.Contains(out, []byte("V_VP9")) {
@@ -128,5 +129,30 @@ func TestWriteTracks(t *testing.T) {
 	// Opus codec ID string should appear.
 	if !bytes.Contains(out, []byte("A_OPUS")) {
 		t.Error("Opus codec ID not found")
+	}
+	// Matroska Opus mapping: pre-skip 312 at 48 kHz is 6,500,000 ns,
+	// encoded as a three-byte unsigned EBML integer. SeekPreRoll is 80 ms.
+	if !bytes.Contains(out, []byte{0x56, 0xaa, 0x83, 0x63, 0x2e, 0xa0}) ||
+		!bytes.Contains(out, []byte{0x56, 0xbb, 0x84, 0x04, 0xc4, 0xb4, 0x00}) {
+		t.Error("Opus CodecDelay or SeekPreRoll not found")
+	}
+	if !bytes.Contains(out, []byte("V_MPEGH/ISO/HEVC")) {
+		t.Error("standard HEVC codec ID not found")
+	}
+}
+
+func TestWriteTracksZeroOpusCodecDelay(t *testing.T) {
+	ws := newMockSeeker()
+	_, err := WriteTracks(ws, []TrackSpec{{
+		Number: 1, UID: 1, Codec: core.CodecOpus,
+		Channels: 2, SampleRate: 48_000,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Matroska CodecDelay ID 0x56AA, one-byte EBML size 0x81, unsigned
+	// zero payload 0x00. Presence is mandatory for A_OPUS even at zero.
+	if !bytes.Contains(ws.Bytes(), []byte{0x56, 0xaa, 0x81, 0x00}) {
+		t.Fatalf("zero Opus CodecDelay missing: %x", ws.Bytes())
 	}
 }

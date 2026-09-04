@@ -100,9 +100,13 @@ func TestH264ForbiddenBit(t *testing.T) {
 
 func TestH264MalformedAVCCLength(t *testing.T) {
 	// Length prefix larger than remaining data -> must not panic.
-	p := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x65}
-	if (h264Detector{}).IsKeyframe(p) {
-		t.Error("malformed AVCC length should not report keyframe")
+	for _, p := range [][]byte{
+		{0x7f, 0xff, 0xff, 0xff, 0x65},
+		{0xff, 0xff, 0xff, 0xff, 0x65},
+	} {
+		if (h264Detector{}).IsKeyframe(p) {
+			t.Errorf("malformed AVCC length %x should not report keyframe", p[:4])
+		}
 	}
 }
 
@@ -177,6 +181,30 @@ func TestHEVCForbiddenBit(t *testing.T) {
 	p := h264AVCCPayload([][]byte{[]byte{0xA8, 0x01, 0xAA, 0xBB}})
 	if (hevcDetector{}).IsKeyframe(p) {
 		t.Error("HEVC NAL with forbidden bit set should not be keyframe")
+	}
+}
+
+func TestHEVCTemporalIDValidation(t *testing.T) {
+	// H.265 NAL fields are packed MSB-first. For layer_id 0 the low three
+	// bits of byte 1 are nuh_temporal_id_plus1: zero is forbidden, one means
+	// TemporalId 0, and an IRAP VCL NAL is required to use TemporalId 0.
+	tests := []struct {
+		name   string
+		header []byte
+		want   bool
+	}{
+		{name: "forbidden zero", header: []byte{0x28, 0x00}, want: false},
+		{name: "IRAP temporal id one", header: []byte{0x28, 0x02}, want: false},
+		{name: "IRAP temporal id zero", header: []byte{0x28, 0x01}, want: true},
+		{name: "truncated", header: []byte{0x28}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet := h264AVCCPayload([][]byte{test.header})
+			if got := (hevcDetector{}).IsKeyframe(packet); got != test.want {
+				t.Fatalf("IsKeyframe(%x) = %v, want %v", test.header, got, test.want)
+			}
+		})
 	}
 }
 

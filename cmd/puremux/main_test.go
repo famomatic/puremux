@@ -8,12 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/famomatic/puremux/pkg/puremux"
+	"github.com/famomatic/puremux/pkg/media"
 )
 
 func TestRunUsageAndInvalidCommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), []string{"--help"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "puremux merge") {
+	if code := run(context.Background(), []string{"--help"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "puremux remux") {
 		t.Fatalf("help = code %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
@@ -23,7 +23,7 @@ func TestRunUsageAndInvalidCommand(t *testing.T) {
 	}
 }
 
-func TestRunProbeAndMerge(t *testing.T) {
+func TestRunProbeAndRemux(t *testing.T) {
 	dir := t.TempDir()
 	input := filepath.Join(dir, "input.webm")
 	output := filepath.Join(dir, "output.mkv")
@@ -31,20 +31,23 @@ func TestRunProbeAndMerge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := puremux.NewSession(file, puremux.DefaultConfig())
+	muxer, err := media.NewMuxer(file, media.MuxOptions{Format: media.FormatWebM})
 	if err != nil {
 		t.Fatal(err)
 	}
-	track, err := session.AddTrack(puremux.Track{Codec: puremux.CodecVP9, IsVideo: true, Width: 16, Height: 16})
+	track, err := muxer.AddStream(media.Stream{Type: media.MediaVideo, Codec: media.CodecVP9,
+		TimeBase: media.Rational{Num: 1, Den: 1_000}, Width: 16, Height: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// VP9 profile-0 key frame: frame_marker=2, profile=0, show_existing=0,
 	// frame_type=0, show_frame=1, error_resilient=0 (LSB-first byte 0x82).
-	if err := session.WritePacket(&puremux.Packet{TrackID: track, PTS: 0, DTS: 0, Data: []byte{0x82}}); err != nil {
+	if err := muxer.WritePacket(context.Background(), &media.Packet{StreamIndex: track,
+		PTS: media.KnownTimestamp(0), DTS: media.KnownTimestamp(0), Duration: media.KnownTimestamp(40),
+		Flags: media.PacketKeyframe, Data: []byte{0x82}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.Close(); err != nil {
+	if err := muxer.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {
@@ -57,19 +60,25 @@ func TestRunProbeAndMerge(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := run(context.Background(), []string{"merge", "-o", output, input}, &stdout, &stderr); code != 0 {
-		t.Fatalf("merge = code %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	if code := run(context.Background(), []string{"remux", "-o", output, input}, &stdout, &stderr); code != 0 {
+		t.Fatalf("remux = code %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
 	}
-	if info, err := puremux.Probe(output); err != nil || info.Container != puremux.ContainerMKV {
-		t.Fatalf("output probe = %+v, %v", info, err)
+	source, err := media.OpenFile(output)
+	if err != nil {
+		t.Fatal(err)
 	}
+	demuxer, err := media.Open(context.Background(), source, media.OpenOptions{})
+	if err != nil || demuxer.Info().Format != media.FormatMatroska {
+		t.Fatalf("output probe = %+v, %v", demuxer, err)
+	}
+	_ = demuxer.Close()
 }
 
-func TestRunMergeHonorsCancellation(t *testing.T) {
+func TestRunRemuxHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout, stderr bytes.Buffer
-	code := run(ctx, []string{"merge", "-o", "out.webm", "in.webm"}, &stdout, &stderr)
+	code := run(ctx, []string{"remux", "-o", "out.webm", "in.webm"}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), context.Canceled.Error()) {
 		t.Fatalf("canceled merge = code %d, stderr %q", code, stderr.String())
 	}

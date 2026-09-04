@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"strings"
 
-	"github.com/famomatic/puremux/pkg/puremux"
+	"github.com/famomatic/puremux/pkg/media"
 )
 
 func main() {
@@ -30,9 +30,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		writeUsage(stdout)
 		return 0
 	case "probe":
-		return runProbe(args[1:], stdout, stderr)
-	case "merge":
-		return runMerge(ctx, args[1:], stdout, stderr)
+		return runProbe(ctx, args[1:], stdout, stderr)
+	case "remux":
+		return runRemux(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "puremux: unknown command %q\n", args[0])
 		writeUsage(stderr)
@@ -40,7 +40,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func runProbe(args []string, stdout, stderr io.Writer) int {
+func runProbe(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("probe", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprintln(stderr, "Usage: puremux probe INPUT") }
@@ -54,32 +54,39 @@ func runProbe(args []string, stdout, stderr io.Writer) int {
 		flags.Usage()
 		return 2
 	}
-	info, err := puremux.Probe(flags.Arg(0))
+	source, err := media.OpenFile(flags.Arg(0))
 	if err != nil {
 		fmt.Fprintf(stderr, "puremux: probe: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "container: %s\n", info.Container)
-	for _, track := range info.Tracks {
+	demuxer, err := media.Open(ctx, source, media.OpenOptions{})
+	if err != nil {
+		_ = source.Close()
+		fmt.Fprintf(stderr, "puremux: probe: %v\n", err)
+		return 1
+	}
+	defer demuxer.Close()
+	fmt.Fprintf(stdout, "container: %s\n", demuxer.Info().Format)
+	for _, track := range demuxer.Streams() {
 		kind := "unknown"
-		switch track.Kind {
-		case puremux.TrackVideo:
+		switch track.Type {
+		case media.MediaVideo:
 			kind = "video"
-		case puremux.TrackAudio:
+		case media.MediaAudio:
 			kind = "audio"
 		}
-		fmt.Fprintf(stdout, "track %d: %s %s\n", track.Number, kind, track.Codec)
+		fmt.Fprintf(stdout, "stream %d: %s %s\n", track.Index, kind, track.Codec)
 	}
 	return 0
 }
 
-func runMerge(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("merge", flag.ContinueOnError)
+func runRemux(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("remux", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var output string
-	flags.StringVar(&output, "o", "", "output .webm or .mkv path")
-	flags.StringVar(&output, "output", "", "output .webm or .mkv path")
-	flags.Usage = func() { fmt.Fprintln(stderr, "Usage: puremux merge -o OUTPUT INPUT [INPUT ...]") }
+	flags.StringVar(&output, "o", "", "output media path")
+	flags.StringVar(&output, "output", "", "output media path")
+	flags.Usage = func() { fmt.Fprintln(stderr, "Usage: puremux remux -o OUTPUT INPUT [INPUT ...]") }
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -90,8 +97,8 @@ func runMerge(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		flags.Usage()
 		return 2
 	}
-	if err := puremux.Merge(ctx, flags.Args(), output, puremux.DefaultConfig()); err != nil {
-		fmt.Fprintf(stderr, "puremux: merge: %v\n", err)
+	if err := media.RemuxFiles(ctx, flags.Args(), output, media.MuxOptions{}); err != nil {
+		fmt.Fprintf(stderr, "puremux: remux: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "wrote %s from %s\n", output, strings.Join(flags.Args(), ", "))
@@ -103,7 +110,7 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  puremux probe INPUT")
-	fmt.Fprintln(w, "  puremux merge -o OUTPUT.webm INPUT [INPUT ...]")
+	fmt.Fprintln(w, "  puremux remux -o OUTPUT INPUT [INPUT ...]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Output may be WebM (.webm) or Matroska (.mkv/.mka).")
+	fmt.Fprintln(w, "Output may be MP4 (.mp4/.m4a/.m4v), WebM (.webm), Matroska (.mkv/.mka), or MPEG-TS (.ts/.m2ts).")
 }

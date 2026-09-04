@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/famomatic/puremux/pkg/bitstream/aac"
-	puremuxfacade "github.com/famomatic/puremux/pkg/puremux"
 )
 
 func TestOpenHLSMasterAES128DiscontinuityAndSeek(t *testing.T) {
@@ -112,27 +111,35 @@ func TestHLSLivePlaylistRefresh(t *testing.T) {
 
 func TestHLSPreservesCrossTrackTimestampOffset(t *testing.T) {
 	var segment bytes.Buffer
-	session, err := puremuxfacade.NewSession(&segment, puremuxfacade.DefaultConfig())
+	muxer, err := NewMuxer(&segment, MuxOptions{Format: FormatWebM})
 	if err != nil {
 		t.Fatal(err)
 	}
-	video, err := session.AddTrack(puremuxfacade.Track{Codec: puremuxfacade.CodecVP9, IsVideo: true, Width: 16, Height: 16})
+	video, err := muxer.AddStream(Stream{Type: MediaVideo, Codec: CodecVP9,
+		TimeBase: nanosecondTimeBase, Width: 16, Height: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
-	audio, err := session.AddTrack(puremuxfacade.Track{Codec: puremuxfacade.CodecOpus, Channels: 2, SampleRate: 48000})
+	audio, err := muxer.AddStream(Stream{Type: MediaAudio, Codec: CodecOpus,
+		TimeBase: nanosecondTimeBase, Channels: 2, SampleRate: 48000,
+		Config: CodecConfig{Format: CodecConfigOpusHead,
+			Data: append([]byte("OpusHead"), 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0)}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// VP9's uncompressed header is LSB-first: 0x82 is a shown profile-0
 	// key frame. The Opus payload is one RFC 6716 TOC-only 20 ms packet.
-	if err := session.WritePacket(&puremuxfacade.Packet{TrackID: video, PTS: 0, DTS: 0, Data: []byte{0x82}}); err != nil {
+	if err := muxer.WritePacket(context.Background(), &Packet{StreamIndex: video,
+		PTS: KnownTimestamp(0), DTS: KnownTimestamp(0), Duration: KnownTimestamp(int64(20 * time.Millisecond)),
+		Flags: PacketKeyframe, Data: []byte{0x82}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.WritePacket(&puremuxfacade.Packet{TrackID: audio, PTS: 20 * time.Millisecond, DTS: 20 * time.Millisecond, Data: []byte{0xf8}}); err != nil {
+	if err := muxer.WritePacket(context.Background(), &Packet{StreamIndex: audio,
+		PTS: KnownTimestamp(int64(20 * time.Millisecond)), DTS: KnownTimestamp(int64(20 * time.Millisecond)),
+		Duration: KnownTimestamp(int64(20 * time.Millisecond)), Flags: PacketKeyframe, Data: []byte{0xf8}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.Close(); err != nil {
+	if err := muxer.Close(); err != nil {
 		t.Fatal(err)
 	}
 

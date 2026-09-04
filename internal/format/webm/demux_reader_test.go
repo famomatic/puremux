@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"math"
 	"os"
 	"testing"
 
@@ -68,5 +69,38 @@ func TestDemuxReaderCanceledAndMalformed(t *testing.T) {
 		if _, err := NewDemuxReader(bytes.NewReader(bad)); err == nil {
 			t.Errorf("malformed case %d accepted", i)
 		}
+	}
+}
+
+func TestQueueBlockTimestampAdditionBoundary(t *testing.T) {
+	// RFC 9559 Block fields are MSB-first/big-endian: 0x81 is track VINT 1,
+	// 00 01 is signed relative timecode +1, 0x80 marks a key SimpleBlock,
+	// and the final opaque byte is the single VP8 frame payload.
+	block := []byte{0x81, 0x00, 0x01, 0x80, 0x00}
+	newReader := func(clusterTicks uint64) *DemuxReader {
+		return &DemuxReader{
+			clusterTicks: clusterTicks,
+			metadata:     DemuxMetadata{TimestampScaleNS: 1},
+			trackMap: map[int]*DemuxTrack{
+				1: {Number: 1, Codec: core.CodecVP8, IsVideo: true},
+			},
+		}
+	}
+
+	overflow := newReader(math.MaxInt64)
+	if err := overflow.queueBlock(block, 0, true, 1, 0, false); err == nil {
+		t.Fatal("cluster timestamp plus relative timecode overflow was accepted")
+	}
+	if len(overflow.pending) != 0 {
+		t.Fatal("overflowing block queued a packet")
+	}
+
+	boundary := newReader(math.MaxInt64 - 2)
+	if err := boundary.queueBlock(block, 0, true, 1, 0, false); err != nil {
+		t.Fatalf("valid timestamp boundary rejected: %v", err)
+	}
+	if len(boundary.pending) != 1 || boundary.pending[0].TimestampNS != math.MaxInt64-1 ||
+		boundary.pending[0].DurationNS != 1 {
+		t.Fatalf("boundary packet = %+v", boundary.pending)
 	}
 }

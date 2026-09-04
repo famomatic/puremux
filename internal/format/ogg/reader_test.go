@@ -123,6 +123,14 @@ func TestOggBoundaries(t *testing.T) {
 	if _, err := parseOpusTags(append([]byte("OpusTags"), 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0)); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("oversized OpusTags = %v", err)
 	}
+	badComment := append([]byte("OpusTags"), 0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff)
+	if _, err := parseOpusTags(badComment); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("oversized OpusTags comment = %v", err)
+	}
+	badMapping := append([]byte("OpusHead"), 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 1, 1, 0, 0, 1)
+	if _, err := parseOpusHead(badMapping); err == nil {
+		t.Fatal("out-of-range Opus channel mapping accepted")
+	}
 }
 
 func makePage(flags byte, granule uint64, serial, sequence uint32, packets ...[]byte) []byte {

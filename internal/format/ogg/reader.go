@@ -500,13 +500,19 @@ func parseOpusHead(packet []byte) (OpusHead, error) {
 		return head, nil
 	}
 	needed := 21 + int(head.Channels)
-	if len(packet) < needed {
+	if len(packet) != needed {
 		return OpusHead{}, io.ErrUnexpectedEOF
 	}
 	head.StreamCount, head.CoupledCount = packet[19], packet[20]
 	head.ChannelMapping = append([]byte(nil), packet[21:needed]...)
-	if head.StreamCount == 0 || int(head.CoupledCount) > int(head.StreamCount) || int(head.StreamCount)+int(head.CoupledCount) > int(head.Channels) {
+	if head.StreamCount == 0 || head.CoupledCount > head.StreamCount || int(head.StreamCount)+int(head.CoupledCount) > 255 {
 		return OpusHead{}, errors.New("ogg: invalid Opus channel mapping")
+	}
+	decodedChannels := int(head.StreamCount) + int(head.CoupledCount)
+	for _, index := range head.ChannelMapping {
+		if index != 255 && int(index) >= decodedChannels {
+			return OpusHead{}, errors.New("ogg: Opus channel map index out of range")
+		}
 	}
 	return head, nil
 }
@@ -516,27 +522,29 @@ func parseOpusTags(packet []byte) (map[string]string, error) {
 		return nil, errors.New("ogg: invalid OpusTags")
 	}
 	offset := 8
-	vendorLength := int(binary.LittleEndian.Uint32(packet[offset : offset+4]))
+	vendorLengthRaw := binary.LittleEndian.Uint32(packet[offset : offset+4])
 	offset += 4
-	if vendorLength > len(packet)-offset-4 {
+	if len(packet)-offset < 4 || uint64(vendorLengthRaw) > uint64(len(packet)-offset-4) {
 		return nil, io.ErrUnexpectedEOF
 	}
+	vendorLength := int(vendorLengthRaw)
 	tags := map[string]string{"vendor": string(packet[offset : offset+vendorLength])}
 	offset += vendorLength
 	count := binary.LittleEndian.Uint32(packet[offset : offset+4])
 	offset += 4
-	if count > uint32(len(packet)/4) {
+	if uint64(count) > uint64((len(packet)-offset)/4) {
 		return nil, errors.New("ogg: excessive OpusTags comment count")
 	}
 	for range count {
 		if len(packet)-offset < 4 {
 			return nil, io.ErrUnexpectedEOF
 		}
-		length := int(binary.LittleEndian.Uint32(packet[offset : offset+4]))
+		lengthRaw := binary.LittleEndian.Uint32(packet[offset : offset+4])
 		offset += 4
-		if length > len(packet)-offset {
+		if uint64(lengthRaw) > uint64(len(packet)-offset) {
 			return nil, io.ErrUnexpectedEOF
 		}
+		length := int(lengthRaw)
 		comment := string(packet[offset : offset+length])
 		offset += length
 		if split := strings.IndexByte(comment, '='); split > 0 {

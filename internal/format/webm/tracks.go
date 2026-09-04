@@ -8,15 +8,17 @@ import (
 
 // TrackSpec is the muxer's view of a track for Tracks-element serialization.
 type TrackSpec struct {
-	Number       uint64 // TrackNumber (1-based)
-	UID          uint64 // TrackUID
-	Codec        core.CodecType
-	IsVideo      bool
-	Width        int
-	Height       int
-	Channels     int
-	SampleRate   float64
-	CodecPrivate []byte // optional (e.g. Opus headers, VP9 codec features)
+	Number        uint64 // TrackNumber (1-based)
+	UID           uint64 // TrackUID
+	Codec         core.CodecType
+	IsVideo       bool
+	Width         int
+	Height        int
+	Channels      int
+	SampleRate    float64
+	CodecDelayNS  uint64
+	SeekPreRollNS uint64
+	CodecPrivate  []byte // optional (e.g. Opus headers, VP9 codec features)
 }
 
 // codecIDFor returns the Matroska CodecID string for a codec.
@@ -100,6 +102,18 @@ func writeTrackEntry(w io.Writer, t TrackSpec) error {
 	}
 	if len(t.CodecPrivate) > 0 {
 		if err := writeBinary(&inner, idCodecPrivate, t.CodecPrivate); err != nil {
+			return err
+		}
+	}
+	// A_OPUS requires CodecDelay to be present even when pre-skip is zero.
+	// Other codecs retain the legacy optional/nonzero behavior.
+	if t.Codec == core.CodecOpus || t.CodecDelayNS > 0 {
+		if err := writeUint(&inner, idCodecDelay, t.CodecDelayNS); err != nil {
+			return err
+		}
+	}
+	if t.SeekPreRollNS > 0 {
+		if err := writeUint(&inner, idSeekPreRoll, t.SeekPreRollNS); err != nil {
 			return err
 		}
 	}

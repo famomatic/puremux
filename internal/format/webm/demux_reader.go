@@ -423,7 +423,12 @@ func (rd *DemuxReader) queueBlock(payload []byte, payloadPos int64, simple bool,
 	if rd.clusterTicks > math.MaxInt64 {
 		return errors.New("webm: timestamp overflow")
 	}
-	baseTicks := int64(rd.clusterTicks) + int64(b.relTimecode)
+	clusterTicks := int64(rd.clusterTicks)
+	relativeTicks := int64(b.relTimecode)
+	if relativeTicks > 0 && clusterTicks > math.MaxInt64-relativeTicks {
+		return errors.New("webm: timestamp overflow")
+	}
+	baseTicks := clusterTicks + relativeTicks
 	baseNS, ok := multiplyTimecode(baseTicks, rd.metadata.TimestampScaleNS)
 	if !ok {
 		return errors.New("webm: timestamp overflow")

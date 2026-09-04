@@ -2,6 +2,7 @@ package webm
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
 
@@ -54,6 +55,26 @@ func writeUint(w io.Writer, id uint32, v uint64) error {
 		n++
 	}
 	return writeElement(w, id, buf[8-n:])
+}
+
+// writeInt writes a signed EBML integer in the shortest two's-complement
+// big-endian representation that preserves its sign.
+func writeInt(w io.Writer, id uint32, v int64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(v))
+	width := 8
+	for width > 1 {
+		first, next := buf[8-width], buf[9-width]
+		if (first == 0x00 && next&0x80 == 0) || (first == 0xff && next&0x80 != 0) {
+			width--
+			continue
+		}
+		break
+	}
+	if width < 1 || width > 8 {
+		return errors.New("webm: invalid signed integer width")
+	}
+	return writeElement(w, id, buf[8-width:])
 }
 
 // writeFloat writes a 64-bit float element (Duration uses IEEE-754 double).

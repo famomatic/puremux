@@ -87,9 +87,10 @@ func (av1Detector) IsKeyframe(data []byte) bool {
 }
 
 // isAV1FrameHeaderKeyframe reads the minimal frame_header fields:
-//   frame_type (2 bits) where 0 = KEY_FRAME. show_existing_frame (1 bit)
-//   precedes frame_type. We decode a few leb128-derived bits from the
-//   frame header's first bytes.
+//
+//	frame_type (2 bits) where 0 = KEY_FRAME. show_existing_frame (1 bit)
+//	precedes frame_type. We decode a few leb128-derived bits from the
+//	frame header's first bytes.
 func isAV1FrameHeaderKeyframe(frame []byte) bool {
 	if len(frame) < 1 {
 		return false

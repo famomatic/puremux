@@ -43,16 +43,16 @@ func DefaultConfig() Config {
 // Metrics reports observable preprocessor side effects so callers can
 // detect stream degradation (ARCHITECTURE.md section 5.B overflow policy).
 type Metrics struct {
-	DroppedOverflow    uint64 // packets dropped due to buffer overflow
-	DroppedOutOfOrder  uint64 // packets dropped as too-late out-of-order
+	DroppedOverflow   uint64 // packets dropped due to buffer overflow
+	DroppedOutOfOrder uint64 // packets dropped as too-late out-of-order
 	// DetectedGaps counts timestamp gaps within the interpolatable range.
 	// The Enforcer does NOT synthesize replacement packets (no decoder, no
 	// sample counts); it only records that a gap was seen so callers can
 	// detect the discontinuity. The former name InterpolatedGaps was
 	// misleading because no interpolation actually occurs.
-	DetectedGaps uint64
+	DetectedGaps        uint64
 	AudioPacketsDropped uint64 // whole audio packets dropped by the Aligner
-	AudioPacketsDuped  uint64  // whole audio packets duplicated by the Aligner
+	AudioPacketsDuped   uint64 // whole audio packets duplicated by the Aligner
 }
 
 // Preprocessor corrects a single in-memory packet stream. It NEVER writes

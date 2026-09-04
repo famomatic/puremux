@@ -6,10 +6,10 @@ import (
 
 // SimpleBlock flags (Matroska spec, Block header byte 4).
 const (
-	flagKeyframe       = 0x80
-	flagInvisible       = 0x08
-	flagLacing          = 0x06
-	flagDiscardable    = 0x01
+	flagKeyframe    = 0x80
+	flagInvisible   = 0x08
+	flagLacing      = 0x06
+	flagDiscardable = 0x01
 )
 
 // EncodeSimpleBlock serializes a SimpleBlock payload (without the 0xA3

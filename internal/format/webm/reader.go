@@ -16,31 +16,31 @@ import (
 // the compressed payloads are copied verbatim and remain opaque
 // (ARCHITECTURE.md section 4).
 type Reader struct {
-	r        io.Reader
-	tracks   []ReadTrack
-	pos      int64
-	pending  []*Block // blocks read from current cluster, awaiting yield
+	r       io.Reader
+	tracks  []ReadTrack
+	pos     int64
+	pending []*Block // blocks read from current cluster, awaiting yield
 }
 
 // ReadTrack is a track parsed from the input WebM's Tracks element.
 type ReadTrack struct {
-	Number     int
-	Codec      core.CodecType
-	IsVideo    bool
-	Width      int
-	Height     int
-	Channels   int
-	SampleRate float64
+	Number       int
+	Codec        core.CodecType
+	IsVideo      bool
+	Width        int
+	Height       int
+	Channels     int
+	SampleRate   float64
 	CodecPrivate []byte
 }
 
 // Block is a decoded SimpleBlock from the input.
 type Block struct {
-	TrackNum  int
+	TrackNum    int
 	RelTimecode int16 // ms, relative to cluster
-	Keyframe  bool
-	Data      []byte
-	ClusterTC uint64 // absolute cluster timecode (ms)
+	Keyframe    bool
+	Data        []byte
+	ClusterTC   uint64 // absolute cluster timecode (ms)
 }
 
 // NewReader wraps a WebM input stream.
@@ -452,7 +452,7 @@ func codecTypeFromString(s string) core.CodecType {
 		return core.CodecFLAC
 	case "V_MPEG4/ISO/AVC":
 		return core.CodecH264
-	case "V_MPEGH/ISO/SHEVC":
+	case "V_MPEGH/ISO/HEVC":
 		return core.CodecHEVC
 	default:
 		return core.CodecUnknown

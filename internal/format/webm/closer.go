@@ -10,8 +10,8 @@ import (
 
 // CuePoint is a seek index entry pointing at a Cluster.
 type CuePoint struct {
-	Timecode         uint64 // absolute ms
-	Track            uint64 // track number
+	Timecode        uint64 // absolute ms
+	Track           uint64 // track number
 	ClusterPosition uint64 // byte offset relative to Segment body start
 }
 

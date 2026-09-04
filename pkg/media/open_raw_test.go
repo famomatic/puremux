@@ -194,6 +194,19 @@ func TestOpenRawMalformedBoundaries(t *testing.T) {
 	}
 }
 
+func TestVorbisCommentUint32LengthsDoNotOverflow(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"vendor":  {0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0},
+		"comment": {0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := parseVorbisComments(data, make(map[string]string)); !errors.Is(err, ErrInvalidData) {
+				t.Fatalf("error = %v, want ErrInvalidData", err)
+			}
+		})
+	}
+}
+
 func TestOpenRawRejectsEmptyHintedInputs(t *testing.T) {
 	for _, format := range []Format{FormatADTS, FormatMP3} {
 		if _, err := Open(context.Background(), MemorySource("empty", nil), OpenOptions{FormatHint: format}); !errors.Is(err, ErrInvalidData) {

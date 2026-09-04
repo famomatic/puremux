@@ -16,9 +16,9 @@ const (
 // A Track is immutable after registration with the muxer; runtime packet
 // state lives on Packet values, not on the Track.
 type Track struct {
-	ID       int
-	Kind     TrackKind
-	Codec    CodecType
+	ID    int
+	Kind  TrackKind
+	Codec CodecType
 	// Timebase is the codec clock period used to convert packet durations
 	// (when known) to time.Duration. For muxing-only use this is mostly
 	// informational; the muxer serializes time.Duration directly.

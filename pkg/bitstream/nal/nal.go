@@ -51,7 +51,7 @@ func AnnexBToLengthPrefixed(data []byte, lengthSize int) ([]byte, error) {
 			unitEnd--
 		}
 		length := unitEnd - unitStart
-		if length <= 0 || uint64(length) >= uint64(1)<<(8*lengthSize) || length > math.MaxUint32 {
+		if length <= 0 || uint64(length) >= uint64(1)<<(8*lengthSize) || uint64(length) > uint64(math.MaxUint32) {
 			return nil, errors.New("nal: unit does not fit configured length field")
 		}
 		var encoded [4]byte

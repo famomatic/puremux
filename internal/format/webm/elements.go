@@ -78,7 +78,7 @@ const (
 	codecIDVorbis = "A_VORBIS"
 	codecIDFLAC   = "A_FLAC"
 	codecIDH264   = "V_MPEG4/ISO/AVC"
-	codecIDHEVC   = "V_MPEGH/ISO/SHEVC"
+	codecIDHEVC   = "V_MPEGH/ISO/HEVC"
 )
 
 // TrackType values (Matroska spec).

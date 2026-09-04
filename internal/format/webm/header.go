@@ -1,9 +1,10 @@
 package webm
 
 import (
-	"github.com/famomatic/puremux/internal/format/ebml"
 	"io"
 	"time"
+
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 // Header is the bookkeeping the muxer needs to patch reserved fields on

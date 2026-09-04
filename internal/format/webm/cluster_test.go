@@ -2,6 +2,8 @@ package webm
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/famomatic/puremux/internal/format/ebml"
@@ -48,6 +50,46 @@ func TestClusterSeekablePatchesSize(t *testing.T) {
 	expectedLen := uint64(len(out) - 4 /*id*/ - 4 /*size width*/)
 	if dec != expectedLen {
 		t.Errorf("patched size = %d want %d", dec, expectedLen)
+	}
+}
+
+func TestBlockGroupExactBytesAndBoundaries(t *testing.T) {
+	ws := newMockSeeker()
+	cw, err := BeginCluster(ws, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.WriteBlockGroup(1, -2, false, 40, -128, []byte{0x65}); err != nil {
+		t.Fatal(err)
+	}
+	// Matroska Block is track VINT 0x81, signed big-endian timecode -2,
+	// flags 0, payload 0x65. Duration 40 is uint 0x28; ReferenceBlock 0
+	// marks an unknown dependency, and DiscardPadding -128 is a minimal
+	// signed one-byte integer.
+	want := []byte{
+		0xA0, 0x91,
+		0xA1, 0x85, 0x81, 0xff, 0xfe, 0x00, 0x65,
+		0x9B, 0x81, 0x28,
+		0xFB, 0x81, 0x00,
+		0x75, 0xA2, 0x81, 0x80,
+	}
+	if !bytes.Contains(ws.Bytes(), want) {
+		t.Fatalf("BlockGroup bytes not found:\n got % X\nwant % X", ws.Bytes(), want)
+	}
+	for _, tc := range []struct {
+		track, duration uint64
+	}{
+		{0, 1}, {16_384, 1}, {1, 0},
+	} {
+		if err := cw.WriteBlockGroup(tc.track, 0, true, tc.duration, 0, nil); err == nil {
+			t.Fatalf("track=%d duration=%d unexpectedly accepted", tc.track, tc.duration)
+		}
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.WriteBlockGroup(1, 0, true, 1, 0, nil); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("write after close = %v", err)
 	}
 }
 

@@ -1,8 +1,10 @@
 package webm
 
 import (
-	"github.com/famomatic/puremux/internal/format/ebml"
+	"errors"
 	"io"
+
+	"github.com/famomatic/puremux/internal/format/ebml"
 )
 
 // ClusterWriter accumulates SimpleBlocks within a single Cluster element.
@@ -76,6 +78,40 @@ func (cw *ClusterWriter) WriteSimpleBlock(trackNum uint64, relTimecode int16, ke
 	}
 	blk := EncodeSimpleBlock(trackNum, relTimecode, keyframe, payload)
 	return writeElement(cw.w, idSimpleBlock, blk)
+}
+
+// WriteBlockGroup writes one packet with an explicit BlockDuration. Unlike a
+// SimpleBlock this preserves duration for codecs whose frame length cannot be
+// inferred from the opaque payload. A non-keyframe carries ReferenceBlock=0,
+// the Matroska value for an unknown dependency, so readers do not mistake it
+// for a random-access point. DiscardPadding is expressed in signed nanoseconds
+// by the Matroska specification.
+func (cw *ClusterWriter) WriteBlockGroup(trackNum uint64, relTimecode int16, keyframe bool, duration uint64, discardPadding int64, payload []byte) error {
+	if !cw.open {
+		return io.ErrClosedPipe
+	}
+	if trackNum == 0 || trackNum > 16_383 || duration == 0 {
+		return errors.New("webm: invalid BlockGroup track or duration")
+	}
+	var group trackedBuf
+	block := EncodeSimpleBlock(trackNum, relTimecode, false, payload)
+	if err := writeBinary(&group, idBlock, block); err != nil {
+		return err
+	}
+	if err := writeUint(&group, idBlockDuration, duration); err != nil {
+		return err
+	}
+	if !keyframe {
+		if err := writeInt(&group, idReferenceBlock, 0); err != nil {
+			return err
+		}
+	}
+	if discardPadding != 0 {
+		if err := writeInt(&group, idDiscardPadding, discardPadding); err != nil {
+			return err
+		}
+	}
+	return writeElement(cw.w, idBlockGroup, group.Bytes())
 }
 
 // Close finalizes the cluster. For seekable sinks it patches the reserved

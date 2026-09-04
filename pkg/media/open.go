@@ -187,8 +187,21 @@ func newWebMDemuxer(src Source, rd *webm.DemuxReader, contextual *contextReadSee
 			stream.Disposition |= DispositionDefault
 		}
 		stream.Config.Data = append([]byte(nil), track.CodecPrivate...)
-		if stream.Codec == CodecOpus {
+		switch stream.Codec {
+		case CodecOpus:
 			stream.Config.Format = CodecConfigOpusHead
+		case CodecH264:
+			stream.Config.Format = CodecConfigAVCC
+		case CodecHEVC:
+			stream.Config.Format = CodecConfigHVCC
+		case CodecAV1:
+			stream.Config.Format = CodecConfigAV1C
+		case CodecVP9:
+			stream.Config.Format = CodecConfigVP9FeatureMetadata
+		case CodecFLAC:
+			stream.Config.Format = CodecConfigFLACStreamInfo
+		case CodecVorbis:
+			stream.Config.Format = CodecConfigVorbisHeaders
 		}
 		streams = append(streams, stream)
 	}

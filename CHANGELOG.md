@@ -3,6 +3,56 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## v0.2.0 — 2026-09-05
+
+### Breaking
+
+- Removed the complete `pkg/puremux` compatibility facade, including
+  `Session`, `Merge`, `Probe`, duration-based packets, and legacy aliases.
+- Made `pkg/media` the sole public demux, mux, remux, source, and manifest API.
+- Replaced the CLI `merge` command with `remux`; `probe` now uses `pkg/media`.
+
+### Added
+
+- Native progressive MP4 output for seekable destinations: 64-bit `mdat`,
+  version-1 timing headers and edit lists, `stts`, signed `ctts` v1, `stss`,
+  `stsc`, `stsz`, and automatic `stco`/`co64`.
+- Bounded fragmented MP4 output for any `io.Writer`: `mvex/trex`, `moof`,
+  `tfhd`, 64-bit `tfdt`, signed `trun` v1, GOP cuts, audio duration cuts, and
+  pooled fragment storage.
+- MP4 sample entries and configuration validation for H.264, HEVC, AV1, VP9,
+  AAC, Opus, and FLAC, including OpusHead-to-dOps and STREAMINFO-to-dfLa.
+- Exact-tick `media.Muxer`, deterministic multi-input `media.Remux`, and atomic
+  `media.RemuxFiles`. Cross-stream DTS comparison uses exact 192-bit products.
+- Direct WebM/Matroska and MPEG-TS backends under `media.NewMuxer`. EBML output
+  now records per-packet BlockDuration, ReferenceBlock, and DiscardPadding.
+- MP4 output support in `puremux remux -o output.mp4 ...`.
+
+### Fixed
+
+- Made AV1 MP4 output conformant by validating complete low-overhead
+  `configOBUs`, advertising the `av01` compatible brand, and writing mandatory
+  `colr/nclx` information when `av1C` has no Sequence Header OBU.
+- Separated Matroska VP9 feature metadata from MP4 `vpcC`, added checked
+  conversion in both remux directions, and enforced the registered VP9
+  profile, level, bit-depth, chroma, and zero initialization-data rules.
+- Converted complete RFC 9639 Matroska FLAC metadata chains to canonical MP4
+  `dfLa` while rejecting truncated or non-final chains.
+- Emitted the mandatory Matroska Opus `CodecDelay` element when pre-skip is
+  zero.
+
+### Verification
+
+- Added specification-derived big-endian/MSB-first box and codec-configuration
+  tests with nil, truncated, malformed, reserved-bit, overflow, and short-write
+  boundaries.
+- Progressive and fragmented writers round-trip exact PTS, DTS, duration,
+  keyframe state, codec configuration, and payload bytes.
+- Eyevinn/mp4ff v0.56.0 independently parses both layouts and extracts an
+  attributed real H.264 sample byte-for-byte through the emitted offsets.
+- The complete suite builds and runs with `CGO_ENABLED=0` and invokes no
+  external media binaries.
+
 ## v0.0.10 — 2026-07-27
 
 ### Fixed

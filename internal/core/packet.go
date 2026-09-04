@@ -25,7 +25,7 @@ const (
 	// implement the codec); they are carried opaque and read/written across
 	// MKV (and MP4 input). VP8-style NAL keyframe detection applies.
 	CodecH264 // H.264/AVC (V_MPEG4/ISO/AVC)
-	CodecHEVC // H.265/HEVC (V_MPEGH/ISO/SHEVC)
+	CodecHEVC // H.265/HEVC (V_MPEGH/ISO/HEVC)
 	// CodecMP3 is exposed for MPEG-TS and raw MPEG audio demuxing. Existing
 	// muxer capability tables intentionally do not accept it.
 	CodecMP3

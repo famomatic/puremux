@@ -397,7 +397,11 @@ func readID3v2(rs io.ReadSeeker, size int64) (int64, map[string]string, error) {
 		if id == "\x00\x00\x00\x00" {
 			break
 		}
-		length := int(binary.BigEndian.Uint32(body[offset+4 : offset+8]))
+		lengthRaw := binary.BigEndian.Uint32(body[offset+4 : offset+8])
+		if version != 4 && uint64(lengthRaw) > uint64(len(body)-offset-10) {
+			return 0, nil, ErrInvalidData
+		}
+		length := int(lengthRaw)
 		if version == 4 {
 			length = int(body[offset+4])<<21 | int(body[offset+5])<<14 | int(body[offset+6])<<7 | int(body[offset+7])
 		}
@@ -420,11 +424,12 @@ func parseVorbisComments(data []byte, metadata map[string]string) error {
 		if len(data)-offset < 4 {
 			return "", false
 		}
-		length := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+		lengthRaw := binary.LittleEndian.Uint32(data[offset : offset+4])
 		offset += 4
-		if length > len(data)-offset {
+		if uint64(lengthRaw) > uint64(len(data)-offset) {
 			return "", false
 		}
+		length := int(lengthRaw)
 		value := string(data[offset : offset+length])
 		offset += length
 		return value, true
@@ -437,9 +442,9 @@ func parseVorbisComments(data []byte, metadata map[string]string) error {
 	if len(data)-offset < 4 {
 		return ErrInvalidData
 	}
-	count := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+	count := binary.LittleEndian.Uint32(data[offset : offset+4])
 	offset += 4
-	if count > len(data)/4 {
+	if uint64(count) > uint64((len(data)-offset)/4) {
 		return ErrInvalidData
 	}
 	for range count {

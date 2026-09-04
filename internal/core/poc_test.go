@@ -415,6 +415,13 @@ func TestConfigOnlyDetection(t *testing.T) {
 	if hevc.IsConfigOnly(annexB(hevcTestSPS(t), hevcTestPPS(t), hevcSlice(t, hevcNalTypeIDRWRADL, 2, 0))) {
 		t.Fatal("HEVC AU with an IDR slice flagged config-only")
 	}
+	// H.265 packs nuh_temporal_id_plus1 in the low three bits of byte 1;
+	// zero is forbidden even for a parameter-set NAL.
+	invalidTemporalID := append([]byte(nil), hevcTestSPS(t)...)
+	invalidTemporalID[1] &^= 0x07
+	if hevc.IsConfigOnly(annexB(invalidTemporalID)) {
+		t.Fatal("HEVC parameter set with forbidden temporal_id_plus1 zero flagged config-only")
+	}
 }
 
 func TestPOCParserNilForNonNALCodecs(t *testing.T) {

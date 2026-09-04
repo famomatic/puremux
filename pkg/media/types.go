@@ -17,6 +17,7 @@ var (
 	ErrSourceChanged     = errors.New("media: source changed during access")
 	ErrUnsupportedFormat = errors.New("media: unsupported format")
 	ErrUnsupportedCodec  = errors.New("media: unsupported codec")
+	ErrIncompatible      = errors.New("media: incompatible input and output")
 )
 
 // Format identifies either a byte container or a manifest format.
@@ -311,6 +312,12 @@ const (
 	CodecConfigDOPS
 	CodecConfigAV1C
 	CodecConfigVPCC
+	// CodecConfigVorbisHeaders is the three mandatory Vorbis header packets
+	// encoded with Matroska/Xiph lacing.
+	CodecConfigVorbisHeaders
+	// CodecConfigVP9FeatureMetadata is the ID/length/value feature list used
+	// as Matroska V_VP9 CodecPrivate. It is not an MP4 vpcC record.
+	CodecConfigVP9FeatureMetadata
 )
 
 type CodecConfig struct {
