@@ -202,6 +202,15 @@ func (s *StreamingInputReader) consumePacket(packet []byte, offset int64) error 
 			return errors.New("mpegts: streaming PES exceeds size limit")
 		}
 		current.data = append(current.data, payload...)
+		if len(current.data) >= 6 {
+			packetLength := int(binary.BigEndian.Uint16(current.data[4:6]))
+			if packetLength != 0 && len(current.data) >= 6+packetLength {
+				if err := s.finishPES(current); err != nil {
+					return err
+				}
+				delete(s.active, pid)
+			}
+		}
 	}
 	return nil
 }

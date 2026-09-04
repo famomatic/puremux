@@ -202,7 +202,7 @@ func TestStreamingMPEGTSCloseUnblocksPacketRead(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	source := &blockingContextSource{data: encoded.Bytes(), blockAfter: 4, blocked: make(chan struct{}), closed: make(chan struct{})}
+	source := &blockingContextSource{data: encoded.Bytes(), blockAfter: 3, blocked: make(chan struct{}), closed: make(chan struct{})}
 	demuxer, err := Open(context.Background(), source, OpenOptions{FormatHint: FormatMPEGTS})
 	if err != nil {
 		t.Fatal(err)
