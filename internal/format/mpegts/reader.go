@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"sort"
 
 	"github.com/famomatic/puremux/internal/core"
@@ -49,6 +50,7 @@ type StreamingInputReader struct {
 	seenCC      map[uint16]bool
 	active      map[uint16]*pesBuffer
 	trackByPID  map[uint16]int
+	clocks      map[uint16]*pesClock
 	tracks      []InputTrack
 	pending     []InputPacket
 	eof         bool
@@ -68,6 +70,7 @@ func NewStreamingInputReader(r io.Reader) (*StreamingInputReader, error) {
 		seenCC:      make(map[uint16]bool),
 		active:      make(map[uint16]*pesBuffer),
 		trackByPID:  make(map[uint16]int),
+		clocks:      make(map[uint16]*pesClock),
 	}
 	for !s.ready() {
 		if err := s.pump(); err != nil {
@@ -226,7 +229,12 @@ func (s *StreamingInputReader) initializeTracks(section []byte) error {
 func (s *StreamingInputReader) finishPES(pes *pesBuffer) error {
 	index := s.trackByPID[pes.pid]
 	track := s.tracks[index]
-	packets, update, err := parsePES(pes, index, track.Codec)
+	clock := s.clocks[pes.pid]
+	if clock == nil {
+		clock = &pesClock{}
+		s.clocks[pes.pid] = clock
+	}
+	packets, update, err := parsePESWithClock(pes, index, track.Codec, clock)
 	if err != nil {
 		return err
 	}
@@ -371,6 +379,7 @@ func NewInputReader(r io.Reader) (*InputReader, error) {
 	sort.SliceStable(completed, func(i, j int) bool { return completed[i].offset < completed[j].offset })
 	reader := &InputReader{}
 	trackByPID := make(map[uint16]int)
+	clocks := make(map[uint16]*pesClock)
 	for _, pes := range completed {
 		typ := streamTypes[pes.pid]
 		codec := streamCodec(typ)
@@ -383,7 +392,12 @@ func NewInputReader(r io.Reader) (*InputReader, error) {
 			trackByPID[pes.pid] = index
 			reader.tracks = append(reader.tracks, InputTrack{PID: pes.pid, Codec: codec, Timescale: 90000})
 		}
-		packets, update, err := parsePES(pes, index, codec)
+		clock := clocks[pes.pid]
+		if clock == nil {
+			clock = &pesClock{}
+			clocks[pes.pid] = clock
+		}
+		packets, update, err := parsePESWithClock(pes, index, codec, clock)
 		if err != nil {
 			return nil, err
 		}
@@ -544,7 +558,41 @@ func streamCodec(typ byte) core.CodecType {
 	}
 }
 
+type timestampEpoch struct {
+	last  int64
+	epoch int64
+	seen  bool
+}
+
+type pesClock struct {
+	pts timestampEpoch
+	dts timestampEpoch
+}
+
+const (
+	pesTimestampMod  = int64(1) << 33
+	pesTimestampHalf = pesTimestampMod / 2
+)
+
+func (e *timestampEpoch) unwrap(raw int64) (int64, error) {
+	if e.seen && e.last-raw > pesTimestampHalf {
+		if e.epoch > math.MaxInt64-pesTimestampMod {
+			return 0, errors.New("mpegts: timestamp epoch overflow")
+		}
+		e.epoch += pesTimestampMod
+	}
+	e.last, e.seen = raw, true
+	if raw > math.MaxInt64-e.epoch {
+		return 0, errors.New("mpegts: timestamp overflow")
+	}
+	return raw + e.epoch, nil
+}
+
 func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, InputTrack, error) {
+	return parsePESWithClock(pes, track, codec, nil)
+}
+
+func parsePESWithClock(pes *pesBuffer, track int, codec core.CodecType, clock *pesClock) ([]InputPacket, InputTrack, error) {
 	data := pes.data
 	if len(data) < 9 || data[0] != 0 || data[1] != 0 || data[2] != 1 || data[6]&0xc0 != 0x80 {
 		return nil, InputTrack{}, errors.New("mpegts: invalid PES header")
@@ -591,6 +639,22 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 			return nil, InputTrack{}, err
 		}
 	}
+	if clock != nil && (flags == 2 || flags == 3) {
+		var err error
+		pts, err = clock.pts.unwrap(pts)
+		if err != nil {
+			return nil, InputTrack{}, err
+		}
+		if flags == 3 {
+			dts, err = clock.dts.unwrap(dts)
+			if err != nil {
+				return nil, InputTrack{}, err
+			}
+		} else {
+			dts = pts
+			clock.dts = clock.pts
+		}
+	}
 	payload := data[9+headerLength:]
 	trackInfo := InputTrack{Codec: codec, Timescale: 90000}
 	switch codec {
@@ -606,7 +670,11 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.ChannelConfig, header.SampleRate
 				trackInfo.Config, _ = aac.ASC(aac.Config{AudioObjectType: header.Profile, SampleRate: header.SampleRate, FrequencyIndex: header.FrequencyIndex, ChannelConfig: header.ChannelConfig})
 			}
-			packetPTS := pts*int64(header.SampleRate)/90000 + sampleOffset
+			basePTS, ok := scale90kToSamples(pts, int64(header.SampleRate))
+			if !ok || basePTS > math.MaxInt64-sampleOffset {
+				return nil, InputTrack{}, errors.New("mpegts: AAC timestamp overflow")
+			}
+			packetPTS := basePTS + sampleOffset
 			packets = append(packets, InputPacket{Track: track, Data: append([]byte(nil), payload[header.HeaderLength:header.FrameLength]...), PTS: packetPTS, DTS: packetPTS, Duration: int64(header.Samples), Keyframe: true, Offset: pes.offset})
 			sampleOffset += int64(header.Samples)
 			payload = payload[header.FrameLength:]
@@ -623,7 +691,11 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 			if trackInfo.SampleRate == 0 {
 				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.Channels, header.SampleRate
 			}
-			packetPTS := pts*int64(header.SampleRate)/90000 + sampleOffset
+			basePTS, ok := scale90kToSamples(pts, int64(header.SampleRate))
+			if !ok || basePTS > math.MaxInt64-sampleOffset {
+				return nil, InputTrack{}, errors.New("mpegts: MP3 timestamp overflow")
+			}
+			packetPTS := basePTS + sampleOffset
 			packets = append(packets, InputPacket{Track: track, Data: append([]byte(nil), payload[:header.FrameLength]...), PTS: packetPTS, DTS: packetPTS, Duration: int64(header.Samples), Keyframe: true, Offset: pes.offset})
 			sampleOffset += int64(header.Samples)
 			payload = payload[header.FrameLength:]
@@ -635,6 +707,22 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 		}
 		return []InputPacket{{Track: track, Data: append([]byte(nil), payload...), PTS: pts, DTS: dts, Keyframe: annexBKeyframe(codec, payload), Offset: pes.offset}}, trackInfo, nil
 	}
+}
+
+func scale90kToSamples(timestamp, sampleRate int64) (int64, bool) {
+	if timestamp < 0 || sampleRate <= 0 {
+		return 0, false
+	}
+	whole, remainder := timestamp/90000, timestamp%90000
+	if whole > math.MaxInt64/sampleRate {
+		return 0, false
+	}
+	base := whole * sampleRate
+	fraction := remainder * sampleRate / 90000
+	if base > math.MaxInt64-fraction {
+		return 0, false
+	}
+	return base + fraction, true
 }
 
 func decodeTimestamp(data []byte, prefix byte) (int64, error) {

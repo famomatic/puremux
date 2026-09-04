@@ -3,6 +3,7 @@ package mpegts
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"testing"
 	"time"
 
@@ -121,5 +122,40 @@ func TestInputReaderRejectsElementaryConfigurationChange(t *testing.T) {
 	}
 	if _, err := NewInputReader(bytes.NewReader(output.Bytes())); err == nil {
 		t.Fatal("AAC elementary configuration change was accepted")
+	}
+}
+
+func TestPESClockUnwraps33BitTimestamp(t *testing.T) {
+	clock := &pesClock{}
+	before := uint64(1)<<33 - 90000
+	after := uint64(45000)
+	makeVideoPES := func(timestamp uint64) *pesBuffer {
+		data := pesHeader(0xe0, timestamp, timestamp, 5)
+		data = append(data, 0, 0, 1, 0x65, 0) // H.264 IDR NAL, Annex-B framed.
+		return &pesBuffer{pid: 256, data: data}
+	}
+	first, _, err := parsePESWithClock(makeVideoPES(before), 0, core.CodecH264, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := parsePESWithClock(makeVideoPES(after), 0, core.CodecH264, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSecond := pesTimestampMod + int64(after)
+	if first[0].PTS != int64(before) || second[0].PTS != wantSecond || second[0].PTS <= first[0].PTS {
+		t.Fatalf("unwrapped PTS = %d then %d, want %d then %d", first[0].PTS, second[0].PTS, before, wantSecond)
+	}
+}
+
+func TestScale90kToSamplesAvoidsMultiplicationOverflow(t *testing.T) {
+	timestamp := int64(90000) * 60 * 60 * 24 * 365 * 100 // 100 years
+	got, ok := scale90kToSamples(timestamp, 48000)
+	want := int64(48000) * 60 * 60 * 24 * 365 * 100
+	if !ok || got != want {
+		t.Fatalf("100-year timestamp = %d, %v; want %d", got, ok, want)
+	}
+	if _, ok := scale90kToSamples(math.MaxInt64, math.MaxInt64); ok {
+		t.Fatal("overflowing timestamp conversion succeeded")
 	}
 }
