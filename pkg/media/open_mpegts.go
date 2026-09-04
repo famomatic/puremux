@@ -11,16 +11,29 @@ import (
 )
 
 type mpegTSDemuxer struct {
-	stateMu sync.Mutex
-	opMu    sync.Mutex
-	src     Source
-	rd      *mpegts.InputReader
-	streams []Stream
-	closed  bool
+	stateMu    sync.Mutex
+	opMu       sync.Mutex
+	src        Source
+	rd         mpegTSInputReader
+	streams    []Stream
+	seekable   bool
+	contextual *contextReader
+	closed     bool
 }
 
-func openMPEGTS(src Source, r io.Reader) (Demuxer, error) {
-	rd, err := mpegts.NewInputReader(r)
+type mpegTSInputReader interface {
+	Tracks() []mpegts.InputTrack
+	NextPacket() (mpegts.InputPacket, error)
+}
+
+func openMPEGTS(src Source, r io.Reader, seekable bool, contextual *contextReader) (Demuxer, error) {
+	var rd mpegTSInputReader
+	var err error
+	if seekable {
+		rd, err = mpegts.NewInputReader(r)
+	} else {
+		rd, err = mpegts.NewStreamingInputReader(r)
+	}
 	if err != nil {
 		return nil, errors.Join(ErrInvalidData, err)
 	}
@@ -39,7 +52,7 @@ func openMPEGTS(src Source, r io.Reader) (Demuxer, error) {
 		}
 		streams[i] = stream
 	}
-	return &mpegTSDemuxer{src: src, rd: rd, streams: streams}, nil
+	return &mpegTSDemuxer{src: src, rd: rd, streams: streams, seekable: seekable, contextual: contextual}, nil
 }
 
 func (d *mpegTSDemuxer) Streams() []Stream { return cloneStreams(d.streams) }
@@ -56,6 +69,9 @@ func (d *mpegTSDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	d.stateMu.Unlock()
 	if closed {
 		return nil, ErrClosed
+	}
+	if d.contextual != nil {
+		d.contextual.setContext(ctx)
 	}
 	p, err := d.rd.NextPacket()
 	if err != nil {
@@ -77,6 +93,9 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 	if err := validateSeekRequest(req, len(d.streams)); err != nil {
 		return SeekResult{}, err
 	}
+	if !d.seekable {
+		return SeekResult{}, ErrNotSeekable
+	}
 	index := req.StreamIndex
 	if index < 0 {
 		index = 0
@@ -95,7 +114,8 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 			return SeekResult{}, ErrInvalidData
 		}
 	}
-	actual, err := d.rd.SeekWithFlags(index, target, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
+	rd := d.rd.(*mpegts.InputReader)
+	actual, err := rd.SeekWithFlags(index, target, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
 	if err != nil {
 		return SeekResult{}, err
 	}

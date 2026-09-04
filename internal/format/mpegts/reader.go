@@ -37,6 +37,230 @@ type InputReader struct {
 	next    int
 }
 
+// StreamingInputReader incrementally parses a non-seekable transport stream.
+// It buffers at most one in-progress PES per PID plus packets discovered while
+// waiting for the PMT's audio configuration; it never waits for source EOF.
+type StreamingInputReader struct {
+	r           io.Reader
+	offset      int64
+	pmtPID      uint16
+	streamTypes map[uint16]byte
+	continuity  map[uint16]byte
+	seenCC      map[uint16]bool
+	active      map[uint16]*pesBuffer
+	trackByPID  map[uint16]int
+	tracks      []InputTrack
+	pending     []InputPacket
+	eof         bool
+}
+
+const maxStreamingPESSize = 64 << 20
+
+func NewStreamingInputReader(r io.Reader) (*StreamingInputReader, error) {
+	if r == nil {
+		return nil, errors.New("mpegts: nil streaming reader")
+	}
+	s := &StreamingInputReader{
+		r:           r,
+		pmtPID:      0xffff,
+		streamTypes: make(map[uint16]byte),
+		continuity:  make(map[uint16]byte),
+		seenCC:      make(map[uint16]bool),
+		active:      make(map[uint16]*pesBuffer),
+		trackByPID:  make(map[uint16]int),
+	}
+	for !s.ready() {
+		if err := s.pump(); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
+}
+
+func (s *StreamingInputReader) Tracks() []InputTrack {
+	out := append([]InputTrack(nil), s.tracks...)
+	for i := range out {
+		out[i].Config = append([]byte(nil), out[i].Config...)
+	}
+	return out
+}
+
+func (s *StreamingInputReader) NextPacket() (InputPacket, error) {
+	for len(s.pending) == 0 {
+		if s.eof {
+			return InputPacket{}, io.EOF
+		}
+		if err := s.pump(); err != nil {
+			return InputPacket{}, err
+		}
+	}
+	p := s.pending[0]
+	copy(s.pending, s.pending[1:])
+	s.pending[len(s.pending)-1] = InputPacket{}
+	s.pending = s.pending[:len(s.pending)-1]
+	return p, nil
+}
+
+func (s *StreamingInputReader) ready() bool {
+	if len(s.tracks) == 0 || len(s.pending) == 0 {
+		return false
+	}
+	for _, track := range s.tracks {
+		if (track.Codec == core.CodecAAC || track.Codec == core.CodecMP3) && track.SampleRate == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *StreamingInputReader) pump() error {
+	var packet [188]byte
+	n, err := io.ReadFull(s.r, packet[:])
+	if err != nil {
+		if errors.Is(err, io.EOF) && n == 0 {
+			s.eof = true
+			return s.flushActive()
+		}
+		return err
+	}
+	offset := s.offset
+	s.offset += 188
+	return s.consumePacket(packet[:], offset)
+}
+
+func (s *StreamingInputReader) consumePacket(packet []byte, offset int64) error {
+	if packet[0] != 0x47 || packet[1]&0x80 != 0 {
+		return errors.New("mpegts: invalid sync or transport error")
+	}
+	start := packet[1]&0x40 != 0
+	pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+	afc := packet[3] >> 4 & 3
+	if afc == 0 {
+		return errors.New("mpegts: reserved adaptation control")
+	}
+	payloadOffset := 4
+	discontinuity := false
+	if afc&2 != 0 {
+		length := int(packet[4])
+		if length > 183 || 5+length > len(packet) {
+			return errors.New("mpegts: adaptation field overruns packet")
+		}
+		if length > 0 {
+			discontinuity = packet[5]&0x80 != 0
+		}
+		payloadOffset = 5 + length
+	}
+	if afc&1 == 0 || payloadOffset == len(packet) {
+		return nil
+	}
+	cc := packet[3] & 15
+	if s.seenCC[pid] && !discontinuity && cc != (s.continuity[pid]+1)&15 {
+		return errors.New("mpegts: continuity counter gap")
+	}
+	s.seenCC[pid], s.continuity[pid] = true, cc
+	payload := packet[payloadOffset:]
+	if pid == 0 {
+		section, err := psiSection(payload, start)
+		if err != nil {
+			return err
+		}
+		if len(section) > 0 {
+			s.pmtPID, err = parsePAT(section)
+			return err
+		}
+		return nil
+	}
+	if pid == s.pmtPID {
+		section, err := psiSection(payload, start)
+		if err != nil {
+			return err
+		}
+		if len(section) > 0 {
+			if err := parsePMT(section, s.streamTypes); err != nil {
+				return err
+			}
+			return s.initializeTracks(section)
+		}
+		return nil
+	}
+	if _, known := s.trackByPID[pid]; !known {
+		return nil
+	}
+	if start {
+		if previous := s.active[pid]; previous != nil {
+			if err := s.finishPES(previous); err != nil {
+				return err
+			}
+		}
+		s.active[pid] = &pesBuffer{pid: pid, offset: offset}
+	}
+	if current := s.active[pid]; current != nil {
+		if len(current.data) > maxStreamingPESSize-len(payload) {
+			return errors.New("mpegts: streaming PES exceeds size limit")
+		}
+		current.data = append(current.data, payload...)
+	}
+	return nil
+}
+
+func (s *StreamingInputReader) initializeTracks(section []byte) error {
+	if len(s.tracks) != 0 {
+		return nil
+	}
+	programInfo := int(section[10]&15)<<8 | int(section[11])
+	for offset := 12 + programInfo; offset+5 <= len(section)-4; {
+		typ := section[offset]
+		pid := uint16(section[offset+1]&0x1f)<<8 | uint16(section[offset+2])
+		length := int(section[offset+3]&15)<<8 | int(section[offset+4])
+		offset += 5 + length
+		codec := streamCodec(typ)
+		if codec == core.CodecUnknown {
+			continue
+		}
+		s.trackByPID[pid] = len(s.tracks)
+		s.tracks = append(s.tracks, InputTrack{PID: pid, Codec: codec, Timescale: 90000})
+	}
+	return nil
+}
+
+func (s *StreamingInputReader) finishPES(pes *pesBuffer) error {
+	index := s.trackByPID[pes.pid]
+	track := s.tracks[index]
+	packets, update, err := parsePES(pes, index, track.Codec)
+	if err != nil {
+		return err
+	}
+	if update.SampleRate != 0 {
+		update.PID, update.Codec = pes.pid, track.Codec
+		if track.SampleRate != 0 && (track.SampleRate != update.SampleRate || track.Channels != update.Channels || track.Timescale != update.Timescale || !bytes.Equal(track.Config, update.Config)) {
+			return errors.New("mpegts: elementary stream configuration changed")
+		}
+		if track.SampleRate == 0 {
+			s.tracks[index] = update
+		}
+	}
+	s.pending = append(s.pending, packets...)
+	return nil
+}
+
+func (s *StreamingInputReader) flushActive() error {
+	completed := make([]*pesBuffer, 0, len(s.active))
+	for _, pes := range s.active {
+		completed = append(completed, pes)
+	}
+	sort.SliceStable(completed, func(i, j int) bool { return completed[i].offset < completed[j].offset })
+	for _, pes := range completed {
+		if err := s.finishPES(pes); err != nil {
+			return err
+		}
+	}
+	s.active = make(map[uint16]*pesBuffer)
+	if len(s.tracks) == 0 || len(s.pending) == 0 {
+		return errors.New("mpegts: no supported elementary packets")
+	}
+	return nil
+}
+
 type pesBuffer struct {
 	pid    uint16
 	offset int64

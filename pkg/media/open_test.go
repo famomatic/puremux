@@ -162,8 +162,10 @@ func TestOpenSequentialMPEGTSWithHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mux.WritePacket(&core.Packet{TrackID: track, Codec: core.CodecAAC, Data: frame, PTS: time.Second, DTS: time.Second}); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 3; i++ {
+		if err := mux.WritePacket(&core.Packet{TrackID: track, Codec: core.CodecAAC, Data: frame, PTS: time.Second + time.Duration(i)*time.Second, DTS: time.Second + time.Duration(i)*time.Second}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	source := &sequentialTestSource{reader: bytes.NewReader(encoded.Bytes())}
 	demuxer, err := Open(context.Background(), source, OpenOptions{FormatHint: FormatMPEGTS})
@@ -171,12 +173,63 @@ func TestOpenSequentialMPEGTSWithHint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer demuxer.Close()
+	if source.bytesRead >= len(encoded.Bytes()) {
+		t.Fatalf("streaming Open consumed all %d bytes instead of returning after the first completed PES", source.bytesRead)
+	}
+	if _, err := demuxer.Seek(context.Background(), SeekRequest{StreamIndex: -1}); !errors.Is(err, ErrNotSeekable) {
+		t.Fatalf("streaming seek = %v, want ErrNotSeekable", err)
+	}
 	packet, err := demuxer.ReadPacket(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(packet.Data, []byte{0x11, 0x22, 0x33}) {
 		t.Fatalf("packet data = % X", packet.Data)
+	}
+}
+
+func TestStreamingMPEGTSCloseUnblocksPacketRead(t *testing.T) {
+	config := aac.Config{AudioObjectType: 2, SampleRate: 48_000, FrequencyIndex: 3, ChannelConfig: 2}
+	frame, _ := aac.WrapADTS(config, []byte{1})
+	var encoded bytes.Buffer
+	mux := mpegts.New(&encoded)
+	track, err := mux.AddTrack(core.Track{ID: 1, Kind: core.TrackAudio, Codec: core.CodecAAC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := mux.WritePacket(&core.Packet{TrackID: track, Codec: core.CodecAAC, Data: frame, PTS: time.Duration(i) * time.Second, DTS: time.Duration(i) * time.Second}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := &blockingContextSource{data: encoded.Bytes(), blockAfter: 4, blocked: make(chan struct{}), closed: make(chan struct{})}
+	demuxer, err := Open(context.Background(), source, OpenOptions{FormatHint: FormatMPEGTS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := demuxer.ReadPacket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := demuxer.ReadPacket(context.Background())
+		done <- err
+	}()
+	select {
+	case <-source.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("packet read did not reach the streaming source")
+	}
+	if err := demuxer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("read unblocked with %v, want ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not unblock packet read")
 	}
 }
 
@@ -206,6 +259,49 @@ func (s *countingSeekSource) Read(p []byte) (int, error) {
 type sequentialTestSource struct {
 	reader    *bytes.Reader
 	bytesRead int
+}
+
+type blockingContextSource struct {
+	data       []byte
+	reads      int
+	blockAfter int
+	blocked    chan struct{}
+	closed     chan struct{}
+}
+
+func (s *blockingContextSource) Name() string { return "blocking.ts" }
+func (s *blockingContextSource) Read(p []byte) (int, error) {
+	return s.ReadContext(context.Background(), p)
+}
+func (s *blockingContextSource) ReadContext(ctx context.Context, p []byte) (int, error) {
+	if s.reads >= s.blockAfter {
+		select {
+		case <-s.blocked:
+		default:
+			close(s.blocked)
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-s.closed:
+			return 0, ErrClosed
+		}
+	}
+	start := s.reads * 188
+	if start >= len(s.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.data[start:min(start+188, len(s.data))])
+	s.reads++
+	return n, nil
+}
+func (s *blockingContextSource) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
 }
 
 func (s *sequentialTestSource) Name() string { return "sequential" }

@@ -112,13 +112,15 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 		return openFLAC(src, rs, contextual)
 	case FormatMPEGTS:
 		var reader io.Reader = rs
+		var streamingContext *contextReader
 		if !seekable {
 			reader = src
 			if contextSource, ok := src.(ContextSource); ok {
-				reader = &contextReader{source: contextSource, ctx: ctx}
+				streamingContext = &contextReader{source: contextSource, ctx: ctx}
+				reader = streamingContext
 			}
 		}
-		return openMPEGTS(src, reader)
+		return openMPEGTS(src, reader, seekable, streamingContext)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
 	}
@@ -126,11 +128,21 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 
 type contextReader struct {
 	source ContextSource
+	mu     sync.RWMutex
 	ctx    context.Context
 }
 
 func (r *contextReader) Read(p []byte) (int, error) {
-	return r.source.ReadContext(r.ctx, p)
+	r.mu.RLock()
+	ctx := r.ctx
+	r.mu.RUnlock()
+	return r.source.ReadContext(ctx, p)
+}
+
+func (r *contextReader) setContext(ctx context.Context) {
+	r.mu.Lock()
+	r.ctx = ctx
+	r.mu.Unlock()
 }
 
 type webMDemuxer struct {
