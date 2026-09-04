@@ -197,6 +197,9 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if !d.playlist.EndList {
 		return SeekResult{}, ErrNotSeekable
 	}
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return SeekResult{}, err
+	}
 	targetNS := req.Target
 	if req.StreamIndex >= 0 {
 		if req.StreamIndex >= len(d.streams) {
@@ -226,8 +229,11 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 		return SeekResult{}, err
 	}
 	localNS := targetNS - start
-	_, _ = d.current.Seek(ctx, SeekRequest{StreamIndex: -1, Target: localNS})
-	actual := start
+	localResult, err := d.current.Seek(ctx, SeekRequest{StreamIndex: -1, Target: localNS, Flags: req.Flags})
+	if err != nil {
+		return SeekResult{}, err
+	}
+	actual := start + localResult.Timestamp
 	if req.StreamIndex >= 0 {
 		actual, _ = nanosecondTimeBase.Rescale(actual, d.streams[req.StreamIndex].TimeBase)
 	}

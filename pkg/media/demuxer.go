@@ -1,15 +1,30 @@
 package media
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
-// SeekFlags describe whether a seek target must be a sync point and which
-// direction is acceptable when the exact target is unavailable.
+// SeekFlags control the eligible indexed point and direction. With no flags,
+// Seek chooses the earliest sync point at or after Target. SeekBackward
+// chooses the latest eligible point at or before Target. SeekAny permits
+// non-sync video points; audio points are always treated as sync points. A
+// container may return an earlier timestamp when decoding preroll is needed.
 type SeekFlags uint8
 
 const (
 	SeekBackward SeekFlags = 1 << iota
 	SeekAny
 )
+
+const knownSeekFlags = SeekBackward | SeekAny
+
+func validateSeekFlags(flags SeekFlags) error {
+	if flags & ^knownSeekFlags != 0 {
+		return errors.New("media: unknown seek flags")
+	}
+	return nil
+}
 
 type SeekRequest struct {
 	// StreamIndex selects the time base for Target. -1 means the demuxer's
@@ -37,6 +52,9 @@ type Demuxer interface {
 }
 
 type OpenOptions struct {
-	FormatHint    Format
+	// FormatHint bypasses probing. It is required for non-seekable Sources.
+	FormatHint Format
+	// MaxProbeBytes caps bytes read during format detection. Zero uses the
+	// implementation default; positive values below four are invalid.
 	MaxProbeBytes int64
 }

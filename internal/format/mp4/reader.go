@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 	"math"
-	"math/big"
+	"math/bits"
 
 	"github.com/famomatic/puremux/internal/core"
 )
@@ -32,9 +32,26 @@ func timestampLess(left int64, leftScale uint32, right int64, rightScale uint32)
 	if leftScale == 0 || rightScale == 0 {
 		return left < right
 	}
-	l := new(big.Int).Mul(big.NewInt(left), new(big.Int).SetUint64(uint64(rightScale)))
-	r := new(big.Int).Mul(big.NewInt(right), new(big.Int).SetUint64(uint64(leftScale)))
-	return l.Cmp(r) < 0
+	if left < 0 && right >= 0 {
+		return true
+	}
+	if left >= 0 && right < 0 {
+		return false
+	}
+	lHi, lLo := bits.Mul64(unsignedInt64(left), uint64(rightScale))
+	rHi, rLo := bits.Mul64(unsignedInt64(right), uint64(leftScale))
+	lessMagnitude := lHi < rHi || (lHi == rHi && lLo < rLo)
+	if left < 0 {
+		return !lessMagnitude && (lHi != rHi || lLo != rLo)
+	}
+	return lessMagnitude
+}
+
+func unsignedInt64(value int64) uint64 {
+	if value >= 0 {
+		return uint64(value)
+	}
+	return uint64(-(value + 1)) + 1
 }
 
 // Sample carries one opaque compressed sample with exact media-time ticks.
@@ -54,24 +71,40 @@ type Sample struct {
 // SeekNS positions every progressive track at the sync point selected from
 // trackNumber and returns that point in nanoseconds.
 func (rd *Reader) SeekNS(trackNumber int, targetNS int64) (int64, error) {
+	return rd.SeekNSWithFlags(trackNumber, targetNS, true, false)
+}
+
+// SeekNSWithFlags positions every track relative to an eligible sample on
+// trackNumber. With backward false it selects the earliest sample at or after
+// targetNS; any permits non-sync video samples.
+func (rd *Reader) SeekNSWithFlags(trackNumber int, targetNS int64, backward, any bool) (int64, error) {
 	if targetNS < 0 {
 		targetNS = 0
 	}
 	if len(rd.fragments) > 0 {
 		chosen := -1
+		var chosenNS int64
 		for i, sample := range rd.fragments {
-			if sample.track.info.Number != trackNumber || (sample.track.info.IsVideo && !sample.keyframe) {
+			if sample.track.info.Number != trackNumber || (!any && sample.track.info.IsVideo && !sample.keyframe) {
 				continue
 			}
-			if scaleToNS(sample.pts, sample.track.timescale) <= targetNS {
-				chosen = i
+			ns := scaleToNS(sample.pts, sample.track.timescale)
+			eligible := ns <= targetNS
+			if !backward {
+				eligible = ns >= targetNS
+			}
+			if eligible && (chosen < 0 || (backward && ns > chosenNS) || (!backward && ns < chosenNS)) {
+				chosen, chosenNS = i, ns
 			}
 		}
 		if chosen < 0 {
 			for i, sample := range rd.fragments {
-				if sample.track.info.Number == trackNumber {
-					chosen = i
-					break
+				if sample.track.info.Number != trackNumber || (!any && sample.track.info.IsVideo && !sample.keyframe) {
+					continue
+				}
+				ns := scaleToNS(sample.pts, sample.track.timescale)
+				if chosen < 0 || (backward && ns < chosenNS) || (!backward && ns > chosenNS) {
+					chosen, chosenNS = i, ns
 				}
 			}
 		}
@@ -99,14 +132,14 @@ func (rd *Reader) SeekNS(trackNumber int, targetNS int64) (int64, error) {
 	if selected < 0 {
 		return 0, errors.New("mp4: seek track not found")
 	}
-	index, actualUnits, err := rd.tracks[selected].findSeekIndex(targetNS, rd.tracks[selected].info.IsVideo)
+	index, actualUnits, err := rd.tracks[selected].findSeekIndex(targetNS, rd.tracks[selected].info.IsVideo && !any, backward)
 	if err != nil {
 		return 0, err
 	}
 	_ = index
 	actualNS := scaleToNS(actualUnits, rd.tracks[selected].timescale)
 	for _, track := range rd.tracks {
-		trackIndex, _, err := track.findSeekIndex(actualNS, track.info.IsVideo)
+		trackIndex, _, err := track.findSeekIndex(actualNS, track.info.IsVideo && !any, true)
 		if err != nil {
 			return 0, err
 		}
@@ -118,26 +151,54 @@ func (rd *Reader) SeekNS(trackNumber int, targetNS int64) (int64, error) {
 	return actualNS, nil
 }
 
-func (t *trackState) findSeekIndex(targetNS int64, keyOnly bool) (uint32, int64, error) {
+func (t *trackState) findSeekIndex(targetNS int64, keyOnly, backward bool) (uint32, int64, error) {
 	if err := t.initCursor(); err != nil {
 		return 0, 0, err
 	}
 	var chosen uint32
 	var chosenPTS int64
+	found := false
 	for t.consumed < t.totalSamples {
 		if !t.peekNext() {
 			break
 		}
 		ptsNS := scaleToNS(t.peek.pts, t.timescale)
-		if ptsNS > targetNS {
-			break
-		}
 		if !keyOnly || t.peek.keyframe {
-			chosen, chosenPTS = t.consumed, t.peek.pts
+			eligible := ptsNS <= targetNS
+			if !backward {
+				eligible = ptsNS >= targetNS
+			}
+			chosenNS := scaleToNS(chosenPTS, t.timescale)
+			if eligible && (!found || (backward && ptsNS > chosenNS) || (!backward && ptsNS < chosenNS)) {
+				chosen, chosenPTS, found = t.consumed, t.peek.pts, true
+			}
 		}
 		t.hasPeek = false
 		t.consumed++
 		t.advancePast(t.peek)
+	}
+	if !found {
+		if err := t.initCursor(); err != nil {
+			return 0, 0, err
+		}
+		for t.consumed < t.totalSamples {
+			if !t.peekNext() {
+				break
+			}
+			if !keyOnly || t.peek.keyframe {
+				ptsNS := scaleToNS(t.peek.pts, t.timescale)
+				chosenNS := scaleToNS(chosenPTS, t.timescale)
+				if !found || (backward && ptsNS < chosenNS) || (!backward && ptsNS > chosenNS) {
+					chosen, chosenPTS, found = t.consumed, t.peek.pts, true
+				}
+			}
+			t.hasPeek = false
+			t.consumed++
+			t.advancePast(t.peek)
+		}
+	}
+	if !found {
+		return 0, 0, errors.New("mp4: no eligible seek sample")
 	}
 	return chosen, chosenPTS, nil
 }
@@ -161,15 +222,24 @@ func scaleToNS(value int64, scale uint32) int64 {
 	if scale == 0 {
 		return 0
 	}
-	n := new(big.Int).Mul(big.NewInt(value), big.NewInt(1_000_000_000))
-	n.Quo(n, new(big.Int).SetUint64(uint64(scale)))
-	if !n.IsInt64() {
+	hi, lo := bits.Mul64(unsignedInt64(value), 1_000_000_000)
+	if hi >= uint64(scale) {
 		if value < 0 {
 			return math.MinInt64
 		}
 		return math.MaxInt64
 	}
-	return n.Int64()
+	quotient, _ := bits.Div64(hi, lo, uint64(scale))
+	if value < 0 {
+		if quotient >= uint64(1)<<63 {
+			return math.MinInt64
+		}
+		return -int64(quotient)
+	}
+	if quotient > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(quotient)
 }
 
 // NewReader wraps an MP4 input stream. The reader must implement

@@ -135,6 +135,9 @@ func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if err := d.ready(ctx); err != nil {
 		return SeekResult{}, err
 	}
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return SeekResult{}, err
+	}
 	index := req.StreamIndex
 	if index < 0 {
 		index = 0
@@ -163,7 +166,7 @@ func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 			break
 		}
 	}
-	actualNS, err := d.rd.SeekNS(trackNumber, targetNS)
+	actualNS, err := d.rd.SeekNSWithFlags(trackNumber, targetNS, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
 	if err != nil {
 		return SeekResult{}, err
 	}

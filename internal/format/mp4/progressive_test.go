@@ -78,6 +78,13 @@ func TestProgressiveExactTimingConfigMetadataAndSeek(t *testing.T) {
 	if sample, err := r.NextSample(); err != nil || sample.DTS != 0 || !sample.Keyframe {
 		t.Fatalf("sample after sync seek = %+v, %v", sample, err)
 	}
+	actual, err = r.SeekNSWithFlags(1, 30_000_000, false, true)
+	if err != nil || actual != 40_000_000 {
+		t.Fatalf("forward any-sample seek = %d, %v; want 40ms", actual, err)
+	}
+	if sample, err := r.NextSample(); err != nil || sample.PTS != 40 || sample.Keyframe {
+		t.Fatalf("sample after SeekAny = %+v, %v", sample, err)
+	}
 }
 
 func TestESDSAndEditListBoundaries(t *testing.T) {

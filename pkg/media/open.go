@@ -29,23 +29,38 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	rs, ok := src.(io.ReadSeeker)
-	if !ok {
-		return nil, ErrNotSeekable
+	if opts.MaxProbeBytes < 0 {
+		return nil, errors.New("media: MaxProbeBytes must not be negative")
+	}
+	rs, seekable := src.(io.ReadSeeker)
+	if !seekable && opts.FormatHint == FormatUnknown {
+		return nil, fmt.Errorf("%w: a non-seekable source requires FormatHint", ErrNotSeekable)
+	}
+	if !seekable && opts.FormatHint != FormatMPEGTS {
+		return nil, fmt.Errorf("%w: %s requires random access", ErrNotSeekable, opts.FormatHint)
 	}
 	var contextual *contextReadSeeker
-	if contextSource, ok := src.(ContextSource); ok {
-		contextual = &contextReadSeeker{ReadSeeker: rs, source: contextSource, ctx: ctx}
-		rs = contextual
+	if seekable {
+		if contextSource, ok := src.(ContextSource); ok {
+			contextual = &contextReadSeeker{ReadSeeker: rs, source: contextSource, ctx: ctx}
+			rs = contextual
+		}
 	}
 	format := opts.FormatHint
 	if format == FormatUnknown {
+		probeBytes := int64(12)
+		if opts.MaxProbeBytes > 0 && opts.MaxProbeBytes < probeBytes {
+			probeBytes = opts.MaxProbeBytes
+		}
+		if probeBytes < 4 {
+			return nil, errors.New("media: MaxProbeBytes must be at least 4 when probing")
+		}
 		var head [12]byte
 		pos, err := rs.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return nil, err
 		}
-		n, err := io.ReadFull(rs, head[:])
+		n, err := io.ReadFull(rs, head[:probeBytes])
 		if _, seekErr := rs.Seek(pos, io.SeekStart); seekErr != nil {
 			return nil, seekErr
 		}
@@ -96,10 +111,26 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 	case FormatFLAC:
 		return openFLAC(src, rs, contextual)
 	case FormatMPEGTS:
-		return openMPEGTS(src, rs, contextual)
+		var reader io.Reader = rs
+		if !seekable {
+			reader = src
+			if contextSource, ok := src.(ContextSource); ok {
+				reader = &contextReader{source: contextSource, ctx: ctx}
+			}
+		}
+		return openMPEGTS(src, reader)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
 	}
+}
+
+type contextReader struct {
+	source ContextSource
+	ctx    context.Context
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	return r.source.ReadContext(r.ctx, p)
 }
 
 type webMDemuxer struct {
@@ -220,6 +251,9 @@ func (d *webMDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 		return SeekResult{}, ErrClosed
 	}
 	d.stateMu.Unlock()
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return SeekResult{}, err
+	}
 	if d.contextual != nil {
 		d.contextual.setContext(ctx)
 	}
@@ -244,7 +278,7 @@ func (d *webMDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 		return SeekResult{}, fmt.Errorf("%w: zero WebM timestamp scale", ErrInvalidData)
 	}
 	ticks := uint64(targetNS) / metadata.TimestampScaleNS
-	actualTicks, err := d.rd.SeekTicks(ctx, ticks, trackNumber)
+	actualTicks, err := d.rd.SeekTicksWithFlags(ctx, ticks, trackNumber, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
 	if err != nil {
 		return SeekResult{}, err
 	}

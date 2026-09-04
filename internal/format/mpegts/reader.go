@@ -194,14 +194,50 @@ func (r *InputReader) NextPacket() (InputPacket, error) {
 }
 
 func (r *InputReader) Seek(track int, target int64) (int64, error) {
+	return r.SeekWithFlags(track, target, true, false)
+}
+
+// SeekWithFlags positions at an eligible packet in the requested direction.
+// Audio packets are sync points; video packets require keyframe=true unless
+// any is requested.
+func (r *InputReader) SeekWithFlags(track int, target int64, backward, any bool) (int64, error) {
 	if track < 0 || track >= len(r.tracks) {
 		return 0, errors.New("mpegts: track index out of range")
 	}
-	chosen := 0
+	chosen := -1
 	for i, packet := range r.packets {
-		if packet.Track == track && packet.PTS <= target && (packet.Keyframe || r.tracks[track].Codec == core.CodecAAC || r.tracks[track].Codec == core.CodecMP3) {
-			chosen = i
+		if packet.Track != track || (!any && !packet.Keyframe && r.tracks[track].Codec != core.CodecAAC && r.tracks[track].Codec != core.CodecMP3) {
+			continue
 		}
+		if backward {
+			if packet.PTS <= target {
+				chosen = i
+			}
+		} else if packet.PTS >= target {
+			chosen = i
+			break
+		}
+	}
+	if chosen < 0 {
+		if backward {
+			for i, packet := range r.packets {
+				if packet.Track == track && (any || packet.Keyframe || r.tracks[track].Codec == core.CodecAAC || r.tracks[track].Codec == core.CodecMP3) {
+					chosen = i
+					break
+				}
+			}
+		} else {
+			for i := len(r.packets) - 1; i >= 0; i-- {
+				packet := r.packets[i]
+				if packet.Track == track && (any || packet.Keyframe || r.tracks[track].Codec == core.CodecAAC || r.tracks[track].Codec == core.CodecMP3) {
+					chosen = i
+					break
+				}
+			}
+		}
+	}
+	if chosen < 0 {
+		return 0, errors.New("mpegts: no eligible seek packet")
 	}
 	r.next = chosen
 	return r.packets[chosen].PTS, nil

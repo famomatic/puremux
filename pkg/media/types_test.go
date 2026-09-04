@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"math"
+	"math/big"
+	"math/rand"
 	"testing"
 	"time"
 )
@@ -31,6 +33,60 @@ func TestRationalRescale(t *testing.T) {
 	if _, ok := from.Rescale(math.MaxInt64, Rational{Num: 1, Den: math.MaxInt64}); ok {
 		t.Fatal("overflowing Rescale unexpectedly succeeded")
 	}
+}
+
+func TestRationalRescaleMatchesBigIntOracle(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x505552454d5558))
+	values := []int64{math.MinInt64, math.MinInt64 + 1, -1, 0, 1, math.MaxInt64 - 1, math.MaxInt64}
+	for range 2_000 {
+		values = append(values, int64(rng.Uint64()))
+	}
+	for i, value := range values {
+		from := Rational{Num: nonZeroInt64(rng), Den: positiveInt64(rng)}
+		to := Rational{Num: nonZeroInt64(rng), Den: positiveInt64(rng)}
+		got, ok := from.Rescale(value, to)
+		want, wantOK := bigIntRescale(value, from.Num, to.Den, from.Den, to.Num)
+		if got != want || ok != wantOK {
+			t.Fatalf("case %d: %d * %d * %d / (%d * %d) = %d, %v; want %d, %v", i, value, from.Num, to.Den, from.Den, to.Num, got, ok, want, wantOK)
+		}
+	}
+}
+
+func TestRationalConversionsDoNotAllocate(t *testing.T) {
+	if got := testing.AllocsPerRun(1_000, func() {
+		_, _ = (Rational{Num: 1, Den: 48_000}).Rescale(960, Rational{Num: 1, Den: 1_000_000_000})
+	}); got != 0 {
+		t.Fatalf("Rescale allocations = %v, want 0", got)
+	}
+	if got := testing.AllocsPerRun(1_000, func() {
+		_, _ = (Rational{Num: 1, Den: 48_000}).Duration(960)
+	}); got != 0 {
+		t.Fatalf("Duration allocations = %v, want 0", got)
+	}
+}
+
+func nonZeroInt64(rng *rand.Rand) int64 {
+	for {
+		if value := int64(rng.Uint64()); value != 0 {
+			return value
+		}
+	}
+}
+
+func positiveInt64(rng *rand.Rand) int64 {
+	return int64(rng.Uint64()>>1) + 1
+}
+
+func bigIntRescale(value, n1, n2, d1, d2 int64) (int64, bool) {
+	n := big.NewInt(value)
+	n.Mul(n, big.NewInt(n1))
+	n.Mul(n, big.NewInt(n2))
+	n.Quo(n, big.NewInt(d1))
+	n.Quo(n, big.NewInt(d2))
+	if !n.IsInt64() {
+		return 0, false
+	}
+	return n.Int64(), true
 }
 
 func TestTimestampDistinguishesZeroFromUnknown(t *testing.T) {

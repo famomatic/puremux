@@ -225,6 +225,9 @@ func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekRe
 	if req.StreamIndex != -1 && req.StreamIndex != 0 {
 		return SeekResult{}, errors.New("media: raw audio stream index out of range")
 	}
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return SeekResult{}, err
+	}
 	if d.contextual != nil {
 		d.contextual.setContext(ctx)
 	}
@@ -236,12 +239,22 @@ func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekRe
 			return SeekResult{}, ErrInvalidData
 		}
 	}
-	d.next = 0
-	for i, frame := range d.frames {
-		if frame.pts > target {
-			break
+	d.next = len(d.frames) - 1
+	if req.Flags&SeekBackward != 0 {
+		d.next = 0
+		for i, frame := range d.frames {
+			if frame.pts > target {
+				break
+			}
+			d.next = i
 		}
-		d.next = i
+	} else {
+		for i, frame := range d.frames {
+			if frame.pts >= target {
+				d.next = i
+				break
+			}
+		}
 	}
 	actual := int64(0)
 	if len(d.frames) > 0 {

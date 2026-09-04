@@ -222,6 +222,9 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	if d.dynamic {
 		return SeekResult{}, ErrNotSeekable
 	}
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return SeekResult{}, err
+	}
 	targetNS := req.Target
 	if req.StreamIndex >= 0 {
 		if req.StreamIndex >= len(d.streams) {
@@ -249,8 +252,11 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 		return SeekResult{}, err
 	}
 	start := int64(d.representation.Segments[index].Start)
-	_, _ = d.current.Seek(ctx, SeekRequest{StreamIndex: -1, Target: targetNS - start})
-	actual := start
+	localResult, err := d.current.Seek(ctx, SeekRequest{StreamIndex: -1, Target: targetNS - start, Flags: req.Flags})
+	if err != nil {
+		return SeekResult{}, err
+	}
+	actual := start + localResult.Timestamp
 	if req.StreamIndex >= 0 {
 		actual, _ = nanosecondTimeBase.Rescale(actual, d.streams[req.StreamIndex].TimeBase)
 	}

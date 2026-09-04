@@ -39,6 +39,29 @@ func TestOpenADTSRawPacketsAndSeek(t *testing.T) {
 	}
 }
 
+func TestSeekFlagsChooseDirectionAndRejectUnknownBits(t *testing.T) {
+	config := aac.Config{AudioObjectType: 2, SampleRate: 44100, FrequencyIndex: 4, ChannelConfig: 2}
+	first, _ := aac.WrapADTS(config, []byte{1})
+	second, _ := aac.WrapADTS(config, []byte{2})
+	d, err := Open(context.Background(), MemorySource("seek.aac", append(first, second...)), OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	forward, err := d.Seek(context.Background(), SeekRequest{StreamIndex: 0, Target: 512})
+	if err != nil || forward.Timestamp != 1024 {
+		t.Fatalf("forward seek = %+v, %v; want 1024", forward, err)
+	}
+	backward, err := d.Seek(context.Background(), SeekRequest{StreamIndex: 0, Target: 512, Flags: SeekBackward})
+	if err != nil || backward.Timestamp != 0 {
+		t.Fatalf("backward seek = %+v, %v; want 0", backward, err)
+	}
+	if _, err := d.Seek(context.Background(), SeekRequest{StreamIndex: 0, Flags: SeekFlags(0x80)}); err == nil {
+		t.Fatal("unknown seek flag was silently accepted")
+	}
+}
+
 func TestOpenMP3WithID3Metadata(t *testing.T) {
 	frameHeader := []byte{0xff, 0xfb, 0x90, 0x64}
 	frame := append(append([]byte(nil), frameHeader...), make([]byte, 417-4)...)

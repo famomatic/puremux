@@ -19,11 +19,8 @@ type mpegTSDemuxer struct {
 	closed  bool
 }
 
-func openMPEGTS(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demuxer, error) {
-	if contextual != nil {
-		contextual.setContext(context.Background())
-	}
-	rd, err := mpegts.NewInputReader(rs)
+func openMPEGTS(src Source, r io.Reader) (Demuxer, error) {
+	rd, err := mpegts.NewInputReader(r)
 	if err != nil {
 		return nil, errors.Join(ErrInvalidData, err)
 	}
@@ -77,6 +74,9 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 	if err := ctx.Err(); err != nil {
 		return SeekResult{}, err
 	}
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return SeekResult{}, err
+	}
 	index := req.StreamIndex
 	if index < 0 {
 		index = 0
@@ -98,7 +98,7 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 			return SeekResult{}, ErrInvalidData
 		}
 	}
-	actual, err := d.rd.Seek(index, target)
+	actual, err := d.rd.SeekWithFlags(index, target, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
 	if err != nil {
 		return SeekResult{}, err
 	}

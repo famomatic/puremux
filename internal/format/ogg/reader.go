@@ -199,6 +199,13 @@ func (r *Reader) NextPacket(ctx context.Context) (*Packet, error) {
 }
 
 func (r *Reader) SeekSamples(ctx context.Context, target int64) (int64, error) {
+	return r.SeekSamplesWithDirection(ctx, target, true)
+}
+
+// SeekSamplesWithDirection positions at the nearest indexed audio page in
+// the requested direction. Ogg Opus packets are independently decodable, so
+// every indexed packet is an eligible sync point.
+func (r *Reader) SeekSamplesWithDirection(ctx context.Context, target int64, backward bool) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -210,19 +217,52 @@ func (r *Reader) SeekSamples(ctx context.Context, target int64) (int64, error) {
 	if target < 0 {
 		target = 0
 	}
-	wanted := uint64(target) + uint64(r.head.PreSkip)
-	choice := 0
+	choice := -1
+	lastAudio := -1
+	pageStart := func(index int) int64 {
+		for i := index - 1; i >= 0; i-- {
+			granule := r.pages[i].granule
+			if granule == math.MaxUint64 || granule <= uint64(r.head.PreSkip) {
+				continue
+			}
+			if granule-uint64(r.head.PreSkip) > math.MaxInt64 {
+				return math.MaxInt64
+			}
+			return int64(granule - uint64(r.head.PreSkip))
+		}
+		return 0
+	}
 	for i := range r.pages {
 		if r.pages[i].offset >= r.firstAudio {
-			choice = i
-			break
+			if choice < 0 {
+				choice = i
+			}
+			lastAudio = i
 		}
 	}
-	for i, p := range r.pages {
-		if p.granule == math.MaxUint64 || p.granule > wanted {
-			continue
+	if backward {
+		for i, p := range r.pages {
+			if p.offset < r.firstAudio || pageStart(i) > target {
+				continue
+			}
+			choice = i
 		}
-		choice = i
+	} else {
+		found := false
+		for i, p := range r.pages {
+			if p.offset < r.firstAudio || pageStart(i) < target {
+				continue
+			}
+			choice = i
+			found = true
+			break
+		}
+		if !found {
+			choice = lastAudio
+		}
+	}
+	if choice < 0 {
+		return 0, errors.New("ogg: no audio seek page")
 	}
 	for choice > 0 && r.pages[choice].flags&0x01 != 0 {
 		choice--
@@ -233,11 +273,7 @@ func (r *Reader) SeekSamples(ctx context.Context, target int64) (int64, error) {
 	r.partial = nil
 	r.pending = nil
 	r.headerPackets = r.pages[choice].headersBefore
-	actual := int64(0)
-	if granule := r.pages[choice].granule; granule != math.MaxUint64 && granule > uint64(r.head.PreSkip) {
-		actual = int64(granule - uint64(r.head.PreSkip))
-	}
-	return actual, nil
+	return pageStart(choice), nil
 }
 
 func (r *Reader) scan() error {

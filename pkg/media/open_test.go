@@ -10,8 +10,12 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/famomatic/puremux/internal/core"
+	"github.com/famomatic/puremux/internal/format/mpegts"
 	oggformat "github.com/famomatic/puremux/internal/format/ogg"
+	"github.com/famomatic/puremux/pkg/bitstream/aac"
 )
 
 func TestOpenOfficialLibwebmFixture(t *testing.T) {
@@ -125,6 +129,91 @@ func TestOpenBoundariesAndSeek(t *testing.T) {
 	if _, err := Open(canceled, MemorySource("canceled", []byte("nope")), OpenOptions{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Open = %v", err)
 	}
+}
+
+func TestOpenHonorsMaxProbeBytes(t *testing.T) {
+	source := &countingSeekSource{Reader: bytes.NewReader([]byte("not-a-format"))}
+	if _, err := Open(context.Background(), source, OpenOptions{MaxProbeBytes: 4}); !errors.Is(err, ErrUnsupportedFormat) {
+		t.Fatalf("Open error = %v, want ErrUnsupportedFormat", err)
+	}
+	if source.bytesRead != 4 {
+		t.Fatalf("probe read %d bytes, want exactly 4", source.bytesRead)
+	}
+	for _, limit := range []int64{-1, 1, 3} {
+		source = &countingSeekSource{Reader: bytes.NewReader([]byte("not-a-format"))}
+		if _, err := Open(context.Background(), source, OpenOptions{MaxProbeBytes: limit}); err == nil {
+			t.Fatalf("MaxProbeBytes=%d unexpectedly succeeded", limit)
+		}
+		if source.bytesRead != 0 {
+			t.Fatalf("MaxProbeBytes=%d read %d bytes before validation", limit, source.bytesRead)
+		}
+	}
+}
+
+func TestOpenSequentialMPEGTSWithHint(t *testing.T) {
+	config := aac.Config{AudioObjectType: 2, SampleRate: 48_000, FrequencyIndex: 3, ChannelConfig: 2}
+	frame, err := aac.WrapADTS(config, []byte{0x11, 0x22, 0x33})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	mux := mpegts.New(&encoded)
+	track, err := mux.AddTrack(core.Track{ID: 7, Kind: core.TrackAudio, Codec: core.CodecAAC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.WritePacket(&core.Packet{TrackID: track, Codec: core.CodecAAC, Data: frame, PTS: time.Second, DTS: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	source := &sequentialTestSource{reader: bytes.NewReader(encoded.Bytes())}
+	demuxer, err := Open(context.Background(), source, OpenOptions{FormatHint: FormatMPEGTS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer demuxer.Close()
+	packet, err := demuxer.ReadPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(packet.Data, []byte{0x11, 0x22, 0x33}) {
+		t.Fatalf("packet data = % X", packet.Data)
+	}
+}
+
+func TestOpenSequentialRequiresHintWithoutConsumingSource(t *testing.T) {
+	source := &sequentialTestSource{reader: bytes.NewReader([]byte{0x47, 0, 0, 0})}
+	if _, err := Open(context.Background(), source, OpenOptions{}); !errors.Is(err, ErrNotSeekable) {
+		t.Fatalf("Open error = %v, want ErrNotSeekable", err)
+	}
+	if source.bytesRead != 0 {
+		t.Fatalf("Open consumed %d bytes before rejecting missing hint", source.bytesRead)
+	}
+}
+
+type countingSeekSource struct {
+	*bytes.Reader
+	bytesRead int
+}
+
+func (s *countingSeekSource) Name() string { return "counting" }
+func (s *countingSeekSource) Close() error { return nil }
+func (s *countingSeekSource) Read(p []byte) (int, error) {
+	n, err := s.Reader.Read(p)
+	s.bytesRead += n
+	return n, err
+}
+
+type sequentialTestSource struct {
+	reader    *bytes.Reader
+	bytesRead int
+}
+
+func (s *sequentialTestSource) Name() string { return "sequential" }
+func (s *sequentialTestSource) Close() error { return nil }
+func (s *sequentialTestSource) Read(p []byte) (int, error) {
+	n, err := s.reader.Read(p)
+	s.bytesRead += n
+	return n, err
 }
 
 func mediaTestOggPage(flags byte, granule uint64, serial, sequence uint32, packets ...[]byte) []byte {

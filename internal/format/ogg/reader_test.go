@@ -79,6 +79,33 @@ func TestOggOpusPacketsTimingAndSeek(t *testing.T) {
 	}
 }
 
+func TestOggSeekDirectionUsesPageStart(t *testing.T) {
+	head := append([]byte("OpusHead"), 1, 2, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0)
+	tags := opusTags("test-vendor")
+	// RFC 6716 TOC 0xF8 is one independently decodable 960-sample packet.
+	stream := append(makePage(0x02, 0, 9, 0, head), makePage(0, 0, 9, 1, tags)...)
+	stream = append(stream, makePage(0, 312+960, 9, 2, []byte{0xf8, 1})...)
+	stream = append(stream, makePage(0x04, 312+2*960, 9, 3, []byte{0xf8, 2})...)
+	r, err := NewReader(bytes.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward, err := r.SeekSamplesWithDirection(context.Background(), 500, false)
+	if err != nil || forward != 960 {
+		t.Fatalf("forward seek = %d, %v; want 960", forward, err)
+	}
+	if packet, err := r.NextPacket(context.Background()); err != nil || packet.PTS != 960 || packet.Data[1] != 2 {
+		t.Fatalf("forward packet = %+v, %v", packet, err)
+	}
+	backward, err := r.SeekSamplesWithDirection(context.Background(), 500, true)
+	if err != nil || backward != 0 {
+		t.Fatalf("backward seek = %d, %v; want 0", backward, err)
+	}
+	if packet, err := r.NextPacket(context.Background()); err != nil || packet.PTS != 0 || packet.Data[1] != 1 {
+		t.Fatalf("backward packet = %+v, %v", packet, err)
+	}
+}
+
 func TestOggBoundaries(t *testing.T) {
 	for _, data := range [][]byte{nil, []byte("OggS"), makePage(0x02, 0, 1, 0, []byte("not opus"))} {
 		if _, err := NewReader(bytes.NewReader(data)); err == nil {

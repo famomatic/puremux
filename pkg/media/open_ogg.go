@@ -101,6 +101,9 @@ func (d *oggDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if req.StreamIndex != -1 && req.StreamIndex != 0 {
 		return SeekResult{}, errors.New("media: Ogg stream index out of range")
 	}
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return SeekResult{}, err
+	}
 	if d.contextual != nil {
 		d.contextual.setContext(ctx)
 	}
@@ -112,7 +115,7 @@ func (d *oggDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 			return SeekResult{}, errors.New("media: Ogg seek timestamp overflow")
 		}
 	}
-	actual, err := d.rd.SeekSamples(ctx, target)
+	actual, err := d.rd.SeekSamplesWithDirection(ctx, target, req.Flags&SeekBackward != 0)
 	if err != nil {
 		return SeekResult{}, err
 	}

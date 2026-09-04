@@ -339,6 +339,12 @@ func (rd *DemuxReader) NextPacket(ctx context.Context) (*DemuxPacket, error) {
 }
 
 func (rd *DemuxReader) SeekTicks(ctx context.Context, target uint64, track int) (uint64, error) {
+	return rd.SeekTicksWithFlags(ctx, target, track, true, false)
+}
+
+// SeekTicksWithFlags selects a cue (sync seek) or cluster (SeekAny) in the
+// requested direction.
+func (rd *DemuxReader) SeekTicksWithFlags(ctx context.Context, target uint64, track int, backward, any bool) (uint64, error) {
 	rd.mu.Lock()
 	defer rd.mu.Unlock()
 	if rd.closed {
@@ -349,21 +355,41 @@ func (rd *DemuxReader) SeekTicks(ctx context.Context, target uint64, track int) 
 	}
 	var pos int64 = -1
 	var actual uint64
-	for _, cue := range rd.cues {
-		if track >= 0 && int(cue.track) != track {
-			continue
+	choose := func(candidate int64, ticks uint64) {
+		if candidate < rd.segmentStart || candidate >= rd.segmentEnd {
+			return
 		}
-		if cue.timeTicks > target {
-			continue
+		eligible := ticks <= target
+		if !backward {
+			eligible = ticks >= target
 		}
-		candidate, ok := addInt64Uint64(rd.segmentStart, cue.position)
-		if ok && candidate >= rd.segmentStart && candidate < rd.segmentEnd {
-			pos, actual = candidate, cue.timeTicks
+		if !eligible {
+			return
+		}
+		if pos < 0 || (backward && ticks > actual) || (!backward && ticks < actual) {
+			pos, actual = candidate, ticks
+		}
+	}
+	if !any {
+		for _, cue := range rd.cues {
+			if track >= 0 && int(cue.track) != track {
+				continue
+			}
+			candidate, ok := addInt64Uint64(rd.segmentStart, cue.position)
+			if ok {
+				choose(candidate, cue.timeTicks)
+			}
 		}
 	}
 	if pos < 0 {
 		for _, cluster := range rd.clusters {
-			if cluster.timeTicks <= target {
+			choose(cluster.position, cluster.timeTicks)
+		}
+	}
+	// Clamp at an endpoint when the requested direction has no candidate.
+	if pos < 0 {
+		for _, cluster := range rd.clusters {
+			if pos < 0 || (backward && cluster.timeTicks < actual) || (!backward && cluster.timeTicks > actual) {
 				pos, actual = cluster.position, cluster.timeTicks
 			}
 		}
