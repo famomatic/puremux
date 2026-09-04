@@ -68,7 +68,7 @@ func TestOpenHLSMasterAES128DiscontinuityAndSeek(t *testing.T) {
 		t.Fatalf("seek=%+v err=%v", result, err)
 	}
 	second, err = d.ReadPacket(context.Background())
-	if err != nil || !bytes.Equal(second.Data, []byte{8, 8, 8}) {
+	if err != nil || !bytes.Equal(second.Data, []byte{8, 8, 8}) || second.PTS.Value != 44100 {
 		t.Fatalf("packet after seek=%+v err=%v", second, err)
 	}
 }
@@ -164,6 +164,41 @@ func TestHLSPreservesCrossTrackTimestampOffset(t *testing.T) {
 	defer second.Release()
 	if first.StreamIndex != 0 || first.PTS.Value != 0 || second.StreamIndex != 1 || second.PTS.Value != int64(20*time.Millisecond) {
 		t.Fatalf("shifted packets = stream/PTS %d/%d then %d/%d", first.StreamIndex, first.PTS.Value, second.StreamIndex, second.PTS.Value)
+	}
+}
+
+func TestHLSIntraSegmentSeekKeepsLocalTimestamp(t *testing.T) {
+	config := aac.Config{AudioObjectType: 2, SampleRate: 44100, FrequencyIndex: 4, ChannelConfig: 2}
+	first, _ := aac.WrapADTS(config, []byte{1})
+	second, _ := aac.WrapADTS(config, []byte{2})
+	segment := append(first, second...)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.m3u8":
+			fmt.Fprint(w, "#EXTM3U\n#EXTINF:1,\nsegment.aac\n#EXT-X-ENDLIST\n")
+		case "/segment.aac":
+			_, _ = w.Write(segment)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	demuxer, err := OpenHLS(context.Background(), server.URL+"/index.m3u8", HLSOptions{Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer demuxer.Close()
+	result, err := demuxer.Seek(context.Background(), SeekRequest{StreamIndex: 0, Target: 1024})
+	if err != nil || result.Timestamp != 1024 {
+		t.Fatalf("seek result = %+v, %v", result, err)
+	}
+	p, err := demuxer.ReadPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Release()
+	if p.PTS.Value != 1024 || !bytes.Equal(p.Data, []byte{2}) {
+		t.Fatalf("packet after intra-segment seek = %+v", p)
 	}
 }
 

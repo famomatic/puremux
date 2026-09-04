@@ -140,23 +140,17 @@ func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	for {
 		p, err := d.current.ReadPacket(ctx)
 		if err == nil {
+			if p.StreamIndex < 0 || p.StreamIndex >= len(d.streams) {
+				p.Release()
+				return nil, ErrInvalidData
+			}
 			stream := d.streams[p.StreamIndex]
 			if !d.shiftSet {
-				anchor := int64(0)
-				if p.PTS.Valid {
-					anchor = p.PTS.Value
-				} else if p.DTS.Valid {
-					anchor = p.DTS.Value
-				}
-				anchorNS, ok := stream.TimeBase.Rescale(anchor, nanosecondTimeBase)
-				if !ok {
+				var err error
+				d.shiftNS, err = segmentTimestampShift(p, stream.TimeBase, d.baseNS)
+				if err != nil {
 					p.Release()
-					return nil, ErrInvalidData
-				}
-				d.shiftNS, ok = checkedSubInt64(d.baseNS, anchorNS)
-				if !ok {
-					p.Release()
-					return nil, ErrInvalidData
+					return nil, err
 				}
 				d.shiftSet = true
 			}
@@ -237,22 +231,55 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if err := d.openSegment(ctx, index); err != nil {
 		return SeekResult{}, err
 	}
-	localNS := targetNS - start
-	localResult, err := d.current.Seek(ctx, SeekRequest{StreamIndex: -1, Target: localNS, Flags: req.Flags})
+	if err := d.primeSegmentShift(ctx); err != nil {
+		return SeekResult{}, err
+	}
+	localRequest := SeekRequest{StreamIndex: -1, Target: targetNS - start, Flags: req.Flags}
+	segmentStartTicks := int64(0)
+	if req.StreamIndex >= 0 {
+		var ok bool
+		segmentStartTicks, ok = nanosecondTimeBase.Rescale(start, d.streams[req.StreamIndex].TimeBase)
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
+		localRequest.StreamIndex = req.StreamIndex
+		localRequest.Target, ok = checkedSubInt64(req.Target, segmentStartTicks)
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
+	}
+	localResult, err := d.current.Seek(ctx, localRequest)
 	if err != nil {
 		return SeekResult{}, err
+	}
+	if req.StreamIndex >= 0 {
+		actual, ok := checkedAddInt64(segmentStartTicks, localResult.Timestamp)
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
+		return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 	}
 	actual, ok := checkedAddInt64(start, localResult.Timestamp)
 	if !ok {
 		return SeekResult{}, ErrInvalidData
 	}
-	if req.StreamIndex >= 0 {
-		actual, ok = nanosecondTimeBase.Rescale(actual, d.streams[req.StreamIndex].TimeBase)
-		if !ok {
-			return SeekResult{}, ErrInvalidData
-		}
-	}
 	return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
+}
+
+func (d *hlsDemuxer) primeSegmentShift(ctx context.Context) error {
+	p, err := d.current.ReadPacket(ctx)
+	if err != nil {
+		return err
+	}
+	defer p.Release()
+	if p.StreamIndex < 0 || p.StreamIndex >= len(d.streams) {
+		return ErrInvalidData
+	}
+	d.shiftNS, err = segmentTimestampShift(p, d.streams[p.StreamIndex].TimeBase, d.baseNS)
+	if err == nil {
+		d.shiftSet = true
+	}
+	return err
 }
 
 func (d *hlsDemuxer) Close() error {
@@ -566,6 +593,24 @@ func shiftPacketTimestamps(packet *Packet, timeBase Rational, shiftNS int64) err
 		packet.DTS.Value = adjusted
 	}
 	return nil
+}
+
+func segmentTimestampShift(packet *Packet, timeBase Rational, baseNS int64) (int64, error) {
+	anchor := int64(0)
+	if packet.PTS.Valid {
+		anchor = packet.PTS.Value
+	} else if packet.DTS.Valid {
+		anchor = packet.DTS.Value
+	}
+	anchorNS, ok := timeBase.Rescale(anchor, nanosecondTimeBase)
+	if !ok {
+		return 0, ErrInvalidData
+	}
+	shift, ok := checkedSubInt64(baseNS, anchorNS)
+	if !ok {
+		return 0, ErrInvalidData
+	}
+	return shift, nil
 }
 
 var _ Demuxer = (*hlsDemuxer)(nil)

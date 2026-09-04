@@ -70,7 +70,7 @@ func TestOpenDASHSegmentListRangesAndSeek(t *testing.T) {
 		t.Fatalf("seek=%+v err=%v", result, err)
 	}
 	p, err = d.ReadPacket(context.Background())
-	if err != nil || p.Data[0] != 3 || rangeRequests.Load() != 3 {
+	if err != nil || p.Data[0] != 3 || p.PTS.Value != 48000 || rangeRequests.Load() != 3 {
 		t.Fatalf("after seek=%+v requests=%d err=%v", p, rangeRequests.Load(), err)
 	}
 }
