@@ -90,6 +90,7 @@ type Session struct {
 	segTc0Set  bool          // true once segmentTc0 has been captured from the first emitted packet
 	started    bool
 	closed     bool
+	closeErr   error
 
 	// tsMux is the MPEG-TS backend, non-nil only when
 	// Config.OutputContainer == ContainerMPEGTS. The EBML fields above are
@@ -301,8 +302,11 @@ func (s *Session) pushThroughAligner(trackNum int, pp *core.Packet) error {
 	} else {
 		aligned = append(aligned, pp)
 	}
-	for _, ap := range aligned {
+	for i, ap := range aligned {
 		if err := s.writeBlock(trackNum, ap); err != nil {
+			for _, pending := range aligned[i:] {
+				core.ReleasePacket(pending)
+			}
 			return err
 		}
 		// writeBlock copies the payload into the container synchronously, so the
@@ -450,11 +454,12 @@ func (s *Session) resolveAudioSync() {
 // Close finalizes the session. For seekable sinks it patches the reserved
 // Duration and Segment size, and writes Cues + SeekHead. For non-seekable
 // sinks it flushes the streaming-mode tail.
-func (s *Session) Close() error {
+func (s *Session) Close() (retErr error) {
 	if s.closed {
-		return nil
+		return s.closeErr
 	}
 	s.closed = true
+	defer func() { s.closeErr = retErr }()
 	// Drain the per-track presentation stages and DTS synthesizers first: a
 	// stream shorter than a startup probe still holds every frame in them
 	// (in which case even the header is unwritten — writePacket below writes
@@ -506,22 +511,40 @@ func (s *Session) Close() error {
 	// until now), then any audio still held in the Aligner pending queues, so
 	// no tail packets are lost. Enforcers are drained first because a flushed
 	// video keyframe may unlock the audio aligners' sync start.
-	for trackNum, enf := range s.enforcers {
+	enforcerTracks := make([]int, 0, len(s.enforcers))
+	for trackNum := range s.enforcers {
+		enforcerTracks = append(enforcerTracks, trackNum)
+	}
+	slices.Sort(enforcerTracks)
+	for _, trackNum := range enforcerTracks {
+		enf := s.enforcers[trackNum]
 		var processed []*core.Packet
 		emit := func(out *core.Packet) { processed = append(processed, out) }
 		enf.Flush(emit)
-		for _, pp := range processed {
+		for i, pp := range processed {
 			if err := s.pushThroughAligner(trackNum, pp); err != nil {
+				for _, pending := range processed[i+1:] {
+					core.ReleasePacket(pending)
+				}
 				return err
 			}
 		}
 	}
-	for trackNum, al := range s.aligners {
+	alignerTracks := make([]int, 0, len(s.aligners))
+	for trackNum := range s.aligners {
+		alignerTracks = append(alignerTracks, trackNum)
+	}
+	slices.Sort(alignerTracks)
+	for _, trackNum := range alignerTracks {
+		al := s.aligners[trackNum]
 		var flushed []*core.Packet
 		emit := func(out *core.Packet) { flushed = append(flushed, out) }
 		al.Flush(emit)
-		for _, ap := range flushed {
+		for i, ap := range flushed {
 			if err := s.writeBlock(trackNum, ap); err != nil {
+				for _, pending := range flushed[i:] {
+					core.ReleasePacket(pending)
+				}
 				return err
 			}
 			core.ReleasePacket(ap)
