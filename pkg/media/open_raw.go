@@ -92,10 +92,19 @@ func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demux
 	if err != nil {
 		return nil, err
 	}
+	audioEnd, id3v1, err := readID3v1(rs, size, offset)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range id3v1 {
+		if _, exists := metadata[key]; !exists {
+			metadata[key] = value
+		}
+	}
 	var frames []audioFrameIndex
 	var pts int64
 	var sampleRate, channels int
-	for offset < size {
+	for offset < audioEnd {
 		if _, err := rs.Seek(offset, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -104,13 +113,13 @@ func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demux
 			return nil, err
 		}
 		header, err := mp3.ParseHeader(headerBytes[:])
-		if err != nil || int64(header.FrameLength) > size-offset {
+		if err != nil || int64(header.FrameLength) > audioEnd-offset {
 			return nil, ErrInvalidData
 		}
 		if sampleRate == 0 {
 			sampleRate, channels = header.SampleRate, header.Channels
-		} else if sampleRate != header.SampleRate {
-			return nil, errors.New("media: MP3 sample rate changed")
+		} else if sampleRate != header.SampleRate || channels != header.Channels {
+			return nil, errors.New("media: MP3 configuration changed")
 		}
 		frames = append(frames, audioFrameIndex{offset: offset, size: header.FrameLength, pts: pts, duration: int64(header.Samples)})
 		pts += int64(header.Samples)
@@ -136,14 +145,24 @@ func openFLAC(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 	}
 	var streamInfo flac.StreamInfo
 	var streamInfoRaw []byte
+	seenStreamInfo := false
 	metadata := make(map[string]string)
-	for {
+	for blockIndex := 0; ; blockIndex++ {
 		var header [4]byte
 		if _, err := io.ReadFull(rs, header[:]); err != nil {
 			return nil, err
 		}
 		last := header[0]&0x80 != 0
 		typ := header[0] & 0x7f
+		if blockIndex == 0 && typ != 0 {
+			return nil, errors.New("media: FLAC STREAMINFO must be the first metadata block")
+		}
+		if typ == 0 && seenStreamInfo {
+			return nil, errors.New("media: duplicate FLAC STREAMINFO")
+		}
+		if typ == 127 {
+			return nil, errors.New("media: invalid FLAC metadata block type")
+		}
 		length := int(header[1])<<16 | int(header[2])<<8 | int(header[3])
 		if length > 16<<20 {
 			return nil, ErrInvalidData
@@ -158,6 +177,7 @@ func openFLAC(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 			if err != nil {
 				return nil, err
 			}
+			seenStreamInfo = true
 			streamInfoRaw = append([]byte(nil), payload...)
 		case 4:
 			if err := parseVorbisComments(payload, metadata); err != nil {
@@ -168,12 +188,45 @@ func openFLAC(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 			break
 		}
 	}
-	audioStart, _ := rs.Seek(0, io.SeekCurrent)
+	audioStart, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
 	frames, err := indexFLACFrames(rs, size, audioStart, streamInfo)
 	if err != nil {
 		return nil, err
 	}
 	return newIndexedAudio(src, rs, FormatFLAC, CodecFLAC, streamInfo.SampleRate, streamInfo.Channels, streamInfoRaw, CodecConfigFLACStreamInfo, frames, metadata, contextual), nil
+}
+
+func readID3v1(rs io.ReadSeeker, size, audioStart int64) (int64, map[string]string, error) {
+	metadata := make(map[string]string)
+	if size-audioStart < 128 {
+		return size, metadata, nil
+	}
+	if _, err := rs.Seek(size-128, io.SeekStart); err != nil {
+		return 0, nil, err
+	}
+	var tag [128]byte
+	if _, err := io.ReadFull(rs, tag[:]); err != nil {
+		return 0, nil, err
+	}
+	if string(tag[:3]) != "TAG" {
+		return size, metadata, nil
+	}
+	readField := func(data []byte) string {
+		return strings.TrimRight(string(data), "\x00 ")
+	}
+	for key, value := range map[string]string{
+		"title":  readField(tag[3:33]),
+		"artist": readField(tag[33:63]),
+		"album":  readField(tag[63:93]),
+	} {
+		if value != "" {
+			metadata[key] = value
+		}
+	}
+	return size - 128, metadata, nil
 }
 
 func newIndexedAudio(src Source, rs io.ReadSeeker, format Format, codec CodecID, sampleRate, channels int, config []byte, configFormat CodecConfigFormat, frames []audioFrameIndex, metadata map[string]string, contextual *contextReadSeeker) *indexedAudioDemuxer {

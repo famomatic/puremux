@@ -106,6 +106,36 @@ func TestOpenMP3WithID3Metadata(t *testing.T) {
 	}
 }
 
+func TestOpenMP3WithID3v1TailAndConfigurationChange(t *testing.T) {
+	frameHeader := []byte{0xff, 0xfb, 0x90, 0x64}
+	frame := append(append([]byte(nil), frameHeader...), make([]byte, 417-4)...)
+	tag := make([]byte, 128)
+	copy(tag, "TAG")
+	copy(tag[3:33], "Tail title")
+	copy(tag[33:63], "Tail artist")
+	d, err := Open(context.Background(), MemorySource("tagged.mp3", append(frame, tag...)), OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if got := d.Streams()[0].Metadata; got["title"] != "Tail title" || got["artist"] != "Tail artist" {
+		t.Fatalf("ID3v1 metadata = %v", got)
+	}
+	if _, err := d.ReadPacket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ReadPacket(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after audio before ID3v1 = %v, want EOF", err)
+	}
+
+	// MPEG-1 Layer III, 128 kb/s, 44.1 kHz, single-channel mode. A channel
+	// layout change is decoder configuration, not a seamless frame change.
+	mono := append([]byte{0xff, 0xfb, 0x90, 0xc4}, make([]byte, 417-4)...)
+	if _, err := Open(context.Background(), MemorySource("changed.mp3", append(frame, mono...)), OpenOptions{}); err == nil {
+		t.Fatal("MP3 channel configuration change was accepted")
+	}
+}
+
 func TestOpenFLACFramesAndComments(t *testing.T) {
 	streamInfo := make([]byte, 34)
 	binary.BigEndian.PutUint16(streamInfo[0:2], 256)
@@ -141,10 +171,20 @@ func TestOpenFLACFramesAndComments(t *testing.T) {
 }
 
 func TestOpenRawMalformedBoundaries(t *testing.T) {
+	validStreamInfo := make([]byte, 34)
+	binary.BigEndian.PutUint16(validStreamInfo[0:2], 256)
+	binary.BigEndian.PutUint16(validStreamInfo[2:4], 256)
+	binary.BigEndian.PutUint64(validStreamInfo[10:18], uint64(44100)<<44|uint64(1)<<41|uint64(15)<<36)
 	for name, data := range map[string][]byte{
 		"adts truncated":          {0xff, 0xf1, 0x50, 0x80},
 		"mp3 overrun":             append([]byte{0xff, 0xfb, 0x90, 0x64}, make([]byte, 8)...),
 		"flac truncated metadata": append([]byte("fLaC"), 0x80, 0, 0, 34),
+		"flac streaminfo not first": append(append([]byte("fLaC"), metadataBlock(4, true,
+			vorbisCommentFixture("vendor"))...), flacFrameFixture(0, 1)...),
+		"flac duplicate streaminfo": append(append(append([]byte("fLaC"), metadataBlock(0, false, validStreamInfo)...),
+			metadataBlock(0, true, validStreamInfo)...), flacFrameFixture(0, 1)...),
+		"flac forbidden metadata type": append(append(append([]byte("fLaC"), metadataBlock(0, false, validStreamInfo)...),
+			metadataBlock(127, true, nil)...), flacFrameFixture(0, 1)...),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Open(context.Background(), MemorySource(name, data), OpenOptions{}); err == nil {
