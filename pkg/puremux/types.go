@@ -13,6 +13,10 @@ type Packet = core.Packet
 // CodecType identifies the compressed codec carried by a Packet or Track.
 type CodecType = core.CodecType
 
+// TrackKind classifies a probed track without requiring callers to import an
+// internal package.
+type TrackKind = core.TrackKind
+
 // Codec constants re-exported for external callers.
 const (
 	CodecUnknown = core.CodecUnknown
@@ -26,4 +30,8 @@ const (
 	CodecH264    = core.CodecH264
 	CodecHEVC    = core.CodecHEVC
 	CodecMP3     = core.CodecMP3
+
+	TrackUnknown = core.TrackUnknown
+	TrackVideo   = core.TrackVideo
+	TrackAudio   = core.TrackAudio
 )
