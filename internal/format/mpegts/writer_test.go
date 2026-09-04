@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
+	"math/big"
 	"testing"
 	"time"
 
@@ -336,6 +338,23 @@ func TestMuxerTimestampBaseAndClamp(t *testing.T) {
 	// and would still satisfy the <= ptsMask bound) is caught.
 	if got := m.toTicks(100*time.Second + 30*time.Hour); got != 1130965408 {
 		t.Fatalf("30h ticks = %d, want 1130965408 (no overflow, masked to 33-bit)", got)
+	}
+	// The full signed duration span is wider than int64 subtraction. Derive
+	// the expected 90 kHz clock with a big.Int oracle, round half-up, then
+	// apply the 33-bit PES field mask.
+	m.base = time.Duration(math.MinInt64)
+	n := new(big.Int).SetUint64(math.MaxUint64)
+	n.Mul(n, big.NewInt(tickNum))
+	n.Add(n, big.NewInt(tickDen/2))
+	n.Quo(n, big.NewInt(tickDen))
+	n.Add(n, big.NewInt(ptsOffset))
+	n.And(n, new(big.Int).SetUint64(ptsMask))
+	if got := m.toTicks(time.Duration(math.MaxInt64)); got != n.Uint64() {
+		t.Fatalf("full-span ticks = %d, want %d", got, n.Uint64())
+	}
+	m.base = time.Duration(math.MaxInt64)
+	if got := m.toTicks(time.Duration(math.MinInt64)); got != 0 {
+		t.Fatalf("negative full-span ticks = %d, want clamp 0", got)
 	}
 }
 

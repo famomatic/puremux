@@ -31,10 +31,9 @@ const (
 
 	// ptsHz is the PES/PCR base clock.
 	ptsHz = 90000
-	// tickNum/tickDen is ptsHz/1e9 reduced (gcd 10000). toTicks multiplies the
-	// nanosecond offset by tickNum, so the reduced numerator (9 vs 90000) keeps
-	// int64(rel)*tickNum from overflowing until ~32 years of stream, instead of
-	// ~28.5 h with the unreduced ptsHz*rel (a 24/7 live session would hit that).
+	// tickNum/tickDen is ptsHz/1e9 reduced (gcd 10000). toTicks divides the
+	// unsigned timestamp distance before multiplying, covering the complete
+	// time.Duration range without an overflowing signed subtraction/product.
 	tickNum = 9
 	tickDen = 100_000
 	// ptsMask keeps PES timestamps within their 33-bit field.
@@ -205,18 +204,30 @@ func (m *Muxer) Close() error { return nil }
 // (e.g. 1024-sample AAC frames at 48 kHz = 1920.0 ticks but 21333333ns) do
 // not drift a tick low under truncation.
 func (m *Muxer) toTicks(d time.Duration) uint64 {
-	rel := d - m.base
-	ticks := int64(ptsOffset) + divRound(int64(rel)*tickNum, tickDen)
-	// Clamp anything beyond the 10s headroom rather than wrapping negative.
-	return uint64(max(ticks, 0)) & ptsMask
+	delta, negative := durationDeltaTicks(d, m.base)
+	if negative {
+		if delta >= ptsOffset {
+			return 0
+		}
+		return (uint64(ptsOffset) - delta) & ptsMask
+	}
+	return (uint64(ptsOffset) + delta) & ptsMask
 }
 
-// divRound divides rounding half away from zero.
-func divRound(n, d int64) int64 {
-	if n >= 0 {
-		return (n + d/2) / d
+// durationDeltaTicks returns round(abs(value-base)*9/100000) and the sign of
+// value-base. Unsigned subtraction represents the full distance between two
+// int64 endpoints (up to 2^64-1), which a time.Duration subtraction cannot.
+func durationDeltaTicks(value, base time.Duration) (uint64, bool) {
+	negative := value < base
+	var magnitude uint64
+	if negative {
+		magnitude = uint64(base) - uint64(value)
+	} else {
+		magnitude = uint64(value) - uint64(base)
 	}
-	return (n - d/2) / d
+	whole, remainder := magnitude/tickDen, magnitude%tickDen
+	ticks := whole*tickNum + (remainder*tickNum+tickDen/2)/tickDen
+	return ticks, negative
 }
 
 // emitTables (re)emits PAT+PMT at the start and periodically.
