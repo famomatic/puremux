@@ -320,7 +320,7 @@ func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 		// offset); no EBML cluster/cue bookkeeping applies.
 		return s.tsMux.WritePacket(p)
 	}
-	absMs := uint64(p.DTS / time.Millisecond)
+	blockTime := p.PTS
 	// Capture the segment origin from the first packet actually written.
 	if !s.segTc0Set {
 		s.segmentTc0 = p.DTS
@@ -331,11 +331,12 @@ func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 	// Packets are monotonic post-Enforcer, so absMs >= segStartMs; clamp to be
 	// safe. Both the Cluster Timestamp and the Cue time use this normalized
 	// value so they agree (a prerequisite for correct seeking).
-	segStartMs := uint64(s.segmentTc0 / time.Millisecond)
-	normMs := uint64(0)
-	if absMs > segStartMs {
-		normMs = absMs - segStartMs
+	segStartMs := int64(s.segmentTc0 / time.Millisecond)
+	normSigned := int64(blockTime/time.Millisecond) - segStartMs
+	if normSigned < 0 {
+		normSigned = 0
 	}
+	normMs := uint64(normSigned)
 
 	// Open a new cluster if none, or if the relative timecode would overflow
 	// the SimpleBlock int16 range. Use signed math: normMs may precede the
@@ -372,7 +373,9 @@ func (s *Session) writeBlock(trackNum int, p *core.Packet) error {
 	}
 
 	relTc := int16(relFromCluster)
-	s.lastTcMs = normMs
+	if normMs > s.lastTcMs {
+		s.lastTcMs = normMs
+	}
 	spec := s.tracks[s.trackByID[trackNum]]
 	return s.cluster.WriteSimpleBlock(spec.Number, relTc, p.IsKeyframe, p.Data)
 }

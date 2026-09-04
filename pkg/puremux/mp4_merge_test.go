@@ -8,7 +8,24 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestMP4TicksToDurationBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		ticks int64
+		scale uint32
+		want  time.Duration
+	}{{80, 1000, 80 * time.Millisecond}, {-40, 1000, -40 * time.Millisecond}} {
+		got, ok := mp4TicksToDuration(tc.ticks, tc.scale)
+		if !ok || got != tc.want {
+			t.Fatalf("ticks %d/%d = %v,%v", tc.ticks, tc.scale, got, ok)
+		}
+	}
+	if _, ok := mp4TicksToDuration(1, 0); ok {
+		t.Fatal("zero timescale accepted")
+	}
+}
 
 // MP4 box helpers (ISO/IEC 14496-12), spec-derived. These mirror the
 // internal mp4 test builders so the end-to-end test stays self-contained in

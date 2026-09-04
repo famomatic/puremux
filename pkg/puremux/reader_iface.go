@@ -15,6 +15,11 @@ type InputBlock struct {
 	TrackNum int
 	// AbsMs is the block's absolute timecode in milliseconds.
 	AbsMs uint64
+	// PTS/DTS retain presentation/decode timing when the source exposes both.
+	// Legacy readers leave ExactTiming false and use AbsMs for both.
+	PTS         time.Duration
+	DTS         time.Duration
+	ExactTiming bool
 	// Keyframe is true for sync frames (video). Audio readers set false.
 	Keyframe bool
 	Data     []byte
@@ -25,6 +30,16 @@ func (b *InputBlock) AbsTimecode() uint64 { return b.AbsMs }
 
 // Duration returns the block's absolute timecode as a time.Duration.
 func (b *InputBlock) Duration() time.Duration {
+	if b.ExactTiming {
+		return b.DTS
+	}
+	return time.Duration(b.AbsMs) * time.Millisecond
+}
+
+func (b *InputBlock) PresentationTime() time.Duration {
+	if b.ExactTiming {
+		return b.PTS
+	}
 	return time.Duration(b.AbsMs) * time.Millisecond
 }
 

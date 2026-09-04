@@ -2,6 +2,7 @@ package puremux
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -220,6 +221,47 @@ func TestSessionClusterRolloverTimecodes(t *testing.T) {
 		if got[i] != wantMs[i] {
 			t.Errorf("block %d timecode = %d want %d", i, got[i], wantMs[i])
 		}
+	}
+}
+
+func TestSessionWritesPresentationTimestampAndTracksMaximumDuration(t *testing.T) {
+	var buf seekBuf
+	s, err := NewSession(&buf, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	track, err := s.AddTrack(Track{Codec: CodecVP9, IsVideo: true, Width: 16, Height: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []*Packet{
+		{TrackID: track, Codec: CodecVP9, DTS: 0, PTS: 80 * time.Millisecond, IsKeyframe: true, Data: []byte{0x80}},
+		{TrackID: track, Codec: CodecVP9, DTS: 40 * time.Millisecond, PTS: 0, Data: []byte{0x81}},
+	} {
+		if err := s.WritePacket(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := webm.NewDemuxReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := rd.NextPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := rd.NextPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.TimestampNS != int64(80*time.Millisecond) || second.TimestampNS != 0 {
+		t.Fatalf("presentation timestamps = %d, %d", first.TimestampNS, second.TimestampNS)
+	}
+	if got := rd.Metadata().Duration; got != 80*time.Millisecond {
+		t.Fatalf("duration = %v, want 80ms maximum PTS", got)
 	}
 }
 

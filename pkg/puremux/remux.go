@@ -187,7 +187,7 @@ func remuxInputs(inputs []string, containers []Container, w io.Writer, cfg Confi
 		p := &core.Packet{
 			TrackID:    outTrack,
 			DTS:        blk.Duration(),
-			PTS:        blk.Duration(),
+			PTS:        blk.PresentationTime(),
 			IsKeyframe: blk.Keyframe,
 			Codec:      trackCodec(src.tracks, blk.TrackNum),
 			Data:       blk.Data,
