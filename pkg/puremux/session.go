@@ -7,7 +7,9 @@
 package puremux
 
 import (
+	"errors"
 	"io"
+	"math"
 	"slices"
 	"time"
 
@@ -102,6 +104,9 @@ func (s *Session) isTS() bool { return s.cfg.OutputContainer == ContainerMPEGTS 
 // io.Seeker the session runs in seekable mode (patches Duration/Cues on
 // Close); otherwise it runs in streaming mode.
 func NewSession(w io.Writer, cfg Config) (*Session, error) {
+	if w == nil {
+		return nil, errors.New("puremux: nil output writer")
+	}
 	ws := &seekWriter{w: w}
 	if _, ok := w.(io.Seeker); ok {
 		ws.seekable = true
@@ -113,6 +118,12 @@ func NewSession(w io.Writer, cfg Config) (*Session, error) {
 	// an invalid WebM scale; normalize it here so the header and blocks agree.
 	if cfg.TimecodeScale == 0 {
 		cfg.TimecodeScale = 1_000_000
+	}
+	if cfg.OutputContainer != ContainerMPEGTS && cfg.TimecodeScale != 1_000_000 {
+		return nil, errors.New("puremux: WebM/Matroska currently requires a 1ms TimecodeScale")
+	}
+	if cfg.OutputContainer != ContainerMPEGTS && cfg.Preprocessor.MinMonotonicStep < cfg.TimecodeScale {
+		cfg.Preprocessor.MinMonotonicStep = cfg.TimecodeScale
 	}
 	// MPEG-TS PES timestamps are quantized to the 90 kHz clock (one tick =
 	// ceil(1e9/90000) = 11112 ns). The monotonic-DTS nudge advances by
@@ -152,6 +163,9 @@ type ptsStage struct {
 // AddTrack registers a media track. Returns the assigned track number (1-based)
 // to use in Packet.TrackID. Must be called before the first WritePacket.
 func (s *Session) AddTrack(t Track) (int, error) {
+	if s.closed {
+		return 0, io.ErrClosedPipe
+	}
 	// Tracks are serialized into the header on the first WritePacket; adding one
 	// afterward would produce SimpleBlocks referencing a track number absent
 	// from the header (an invalid file).
@@ -165,6 +179,12 @@ func (s *Session) AddTrack(t Track) (int, error) {
 	if !codecAllowed(out, t.Codec) {
 		return 0, errUnsupportedCodec
 	}
+	if t.IsVideo != t.Codec.IsVideo() {
+		return 0, errors.New("puremux: track kind does not match codec")
+	}
+	if t.Width < 0 || t.Height < 0 || t.Channels < 0 || math.IsNaN(t.SampleRate) || math.IsInf(t.SampleRate, 0) || t.SampleRate < 0 {
+		return 0, errors.New("puremux: invalid track dimensions or audio parameters")
+	}
 	num := len(s.tracks) + 1
 	spec := webm.TrackSpec{
 		Number:       uint64(num),
@@ -175,7 +195,7 @@ func (s *Session) AddTrack(t Track) (int, error) {
 		Height:       t.Height,
 		Channels:     t.Channels,
 		SampleRate:   t.SampleRate,
-		CodecPrivate: t.CodecPrivate,
+		CodecPrivate: append([]byte(nil), t.CodecPrivate...),
 	}
 	s.tracks = append(s.tracks, spec)
 	idx := len(s.tracks) - 1
@@ -197,7 +217,20 @@ func (s *Session) WritePacket(p *core.Packet) error {
 	if s.closed {
 		return io.ErrClosedPipe
 	}
-	return s.writePacket(p)
+	if p == nil {
+		return nil
+	}
+	if _, ok := s.enforcers[p.TrackID]; !ok {
+		return errUnknownTrack
+	}
+	owned := core.AcquirePacket()
+	owned.Data = append(owned.Data[:0], p.Data...)
+	owned.PTS = p.PTS
+	owned.DTS = p.DTS
+	owned.IsKeyframe = p.IsKeyframe
+	owned.Codec = p.Codec
+	owned.TrackID = p.TrackID
+	return s.writePacket(owned)
 }
 
 // writePacket is WritePacket without the closed-session guard, so Close can
@@ -207,18 +240,19 @@ func (s *Session) writePacket(p *core.Packet) error {
 	if p == nil {
 		return nil
 	}
-	// Lazy header write on first packet (we now know tracks are finalized).
-	if !s.started {
-		if err := s.writeHeader(); err != nil {
-			return err
-		}
-		s.started = true
-	}
-
 	trackNum := p.TrackID
 	enf, ok := s.enforcers[trackNum]
 	if !ok {
+		core.ReleasePacket(p)
 		return errUnknownTrack
+	}
+	// Lazy header write on first packet (we now know tracks are finalized).
+	if !s.started {
+		if err := s.writeHeader(); err != nil {
+			core.ReleasePacket(p)
+			return err
+		}
+		s.started = true
 	}
 
 	// Pipeline: Enforcer (monotonic DTS, jitter reorder) -> Aligner (keyframe
@@ -550,6 +584,9 @@ type seekWriter struct {
 func (sw *seekWriter) Write(p []byte) (int, error) {
 	n, err := sw.w.Write(p)
 	sw.off += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
 	return n, err
 }
 

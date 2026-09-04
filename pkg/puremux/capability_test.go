@@ -24,7 +24,9 @@ func writeTmp(t *testing.T, ext string, b []byte) string {
 
 // EBML header magic: idEBML Element ID = 0x1A45DFA3 (class 4, RFC 8794).
 // Full minimal WebM EBML header bytes (derived from the writer):
-//   1A 45 DF A3  <size>  42 82 <len> "webm"  ...
+//
+//	1A 45 DF A3  <size>  42 82 <len> "webm"  ...
+//
 // We construct the smallest valid framing by hand from the spec.
 func webmHeaderBytes(t *testing.T) []byte {
 	t.Helper()
@@ -119,6 +121,17 @@ func TestDetectContainerTruncated(t *testing.T) {
 	_, err := DetectContainer(p)
 	if !errors.Is(err, ErrUnsupportedInput) {
 		t.Errorf("truncated got err %v want ErrUnsupportedInput", err)
+	}
+}
+
+func TestDetectContainerFourByteEBMLDoesNotPanic(t *testing.T) {
+	p := writeTmp(t, "webm", []byte{0x1A, 0x45, 0xDF, 0xA3})
+	c, err := DetectContainer(p)
+	if err != nil {
+		t.Fatalf("four-byte EBML: %v", err)
+	}
+	if c != ContainerWebM {
+		t.Fatalf("container = %v, want webm extension fallback", c)
 	}
 }
 

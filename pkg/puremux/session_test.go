@@ -2,6 +2,7 @@ package puremux
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -15,6 +16,15 @@ import (
 type seekBuf struct {
 	buf []byte
 	pos int
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return len(p) - 1, nil
 }
 
 func (s *seekBuf) Write(p []byte) (int, error) {
@@ -103,6 +113,55 @@ func TestSessionSeekableVP9Opus(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte{0xA3}) {
 		t.Error("missing SimpleBlock")
+	}
+}
+
+func TestSessionWritePacketCopiesCallerPacket(t *testing.T) {
+	var buf bytes.Buffer
+	s, err := NewSession(&buf, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	track, err := s.AddTrack(Track{Codec: CodecVP9, IsVideo: true, Width: 16, Height: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Packet{TrackID: track, Codec: CodecVP9, IsKeyframe: true, Data: []byte{0x82, 0x11, 0x22}}
+	if err := s.WritePacket(p); err != nil {
+		t.Fatal(err)
+	}
+	p.Data[0], p.TrackID, p.DTS = 0x00, 999, time.Hour
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte{0x82, 0x11, 0x22}) {
+		t.Fatal("serialized payload followed caller mutation")
+	}
+}
+
+func TestSessionRejectsNilWriterAndUnsupportedTimecodeScale(t *testing.T) {
+	if _, err := NewSession(nil, DefaultConfig()); err == nil {
+		t.Fatal("nil writer accepted")
+	}
+	cfg := DefaultConfig()
+	cfg.TimecodeScale = 1
+	if _, err := NewSession(io.Discard, cfg); err == nil {
+		t.Fatal("unsupported timecode scale accepted")
+	}
+}
+
+func TestSessionSurfacesShortWrite(t *testing.T) {
+	s, err := NewSession(shortWriter{}, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	track, err := s.AddTrack(Track{Codec: CodecVP9, IsVideo: true, Width: 16, Height: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.WritePacket(&Packet{TrackID: track, Codec: CodecVP9, IsKeyframe: true, Data: []byte{0x82}})
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("error = %v, want io.ErrShortWrite", err)
 	}
 }
 

@@ -254,6 +254,9 @@ func DetectContainerReader(name string, r io.Reader) (Container, error) {
 //
 // We walk only the header framing bytes; no codec payload is touched.
 func detectEBMLContainer(name string, b []byte) Container {
+	if len(b) <= 4 {
+		return ebmlByExtension(name)
+	}
 	off := 4 // skip idEBML
 	// skip EBML element size VINT
 	w := ebmlVINTWidth(b[off])

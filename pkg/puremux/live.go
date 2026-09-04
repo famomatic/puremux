@@ -185,7 +185,7 @@ func (s *Session) WriteADTS(trackID int, chunk []byte, pts time.Duration) error 
 		p.DTS = pts
 		p.Codec = spec.Codec
 		p.TrackID = trackID
-		if werr = s.WritePacket(p); werr != nil {
+		if werr = s.writePacket(p); werr != nil {
 			return false
 		}
 		pts += info.Duration()

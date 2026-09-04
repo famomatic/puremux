@@ -142,6 +142,49 @@ func TestMergeRejectsBadInputMagic(t *testing.T) {
 	}
 }
 
+func TestMergeRejectsOutputAliasingInputWithoutDataLoss(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "media.webm")
+	writeWebMFile(t, path)
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Merge(context.Background(), []string{path}, path, DefaultConfig()); err == nil {
+		t.Fatal("expected alias rejection")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("input disappeared: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("input changed after alias rejection")
+	}
+}
+
+func TestMergeFailurePreservesExistingOutput(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "broken.webm")
+	out := filepath.Join(dir, "out.webm")
+	if err := os.WriteFile(in, []byte{0x1A, 0x45, 0xDF, 0xA3}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("existing output")
+	if err := os.WriteFile(out, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Merge(context.Background(), []string{in}, out, DefaultConfig()); err == nil {
+		t.Fatal("expected malformed input failure")
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("existing output changed: %q", got)
+	}
+}
+
 func TestMergeTwoInputsMerged(t *testing.T) {
 	// Two single-track WebM inputs (one video, one audio) merged into one WebM.
 	dir := t.TempDir()
