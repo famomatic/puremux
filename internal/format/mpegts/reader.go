@@ -1,6 +1,7 @@
 package mpegts
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -165,7 +166,13 @@ func NewInputReader(r io.Reader) (*InputReader, error) {
 		if update.SampleRate != 0 {
 			update.PID = pes.pid
 			update.Codec = codec
-			reader.tracks[index] = update
+			existing := reader.tracks[index]
+			if existing.SampleRate != 0 && (existing.SampleRate != update.SampleRate || existing.Channels != update.Channels || existing.Timescale != update.Timescale || !bytes.Equal(existing.Config, update.Config)) {
+				return nil, errors.New("mpegts: elementary stream configuration changed")
+			}
+			if existing.SampleRate == 0 {
+				reader.tracks[index] = update
+			}
 		}
 		reader.packets = append(reader.packets, packets...)
 	}
@@ -318,29 +325,44 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 	if len(data) < 9 || data[0] != 0 || data[1] != 0 || data[2] != 1 || data[6]&0xc0 != 0x80 {
 		return nil, InputTrack{}, errors.New("mpegts: invalid PES header")
 	}
+	packetLength := int(binary.BigEndian.Uint16(data[4:6]))
+	if packetLength != 0 {
+		end := 6 + packetLength
+		if end > len(data) {
+			return nil, InputTrack{}, io.ErrUnexpectedEOF
+		}
+		data = data[:end]
+	}
 	headerLength := int(data[8])
 	if 9+headerLength > len(data) {
 		return nil, InputTrack{}, io.ErrUnexpectedEOF
 	}
 	pts, dts := int64(0), int64(0)
 	flags := data[7] >> 6
-	if flags&2 != 0 {
+	if flags == 1 {
+		return nil, InputTrack{}, errors.New("mpegts: forbidden PTS_DTS_flags value")
+	}
+	if flags == 2 || flags == 3 {
 		if headerLength < 5 {
 			return nil, InputTrack{}, io.ErrUnexpectedEOF
 		}
 		var err error
-		pts, err = decodeTimestamp(data[9:14])
+		prefix := byte(2)
+		if flags == 3 {
+			prefix = 3
+		}
+		pts, err = decodeTimestamp(data[9:14], prefix)
 		if err != nil {
 			return nil, InputTrack{}, err
 		}
 		dts = pts
 	}
-	if flags&1 != 0 {
+	if flags == 3 {
 		if headerLength < 10 {
 			return nil, InputTrack{}, io.ErrUnexpectedEOF
 		}
 		var err error
-		dts, err = decodeTimestamp(data[14:19])
+		dts, err = decodeTimestamp(data[14:19], 1)
 		if err != nil {
 			return nil, InputTrack{}, err
 		}
@@ -350,6 +372,7 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 	switch codec {
 	case core.CodecAAC:
 		var packets []InputPacket
+		var sampleOffset int64
 		for len(payload) > 0 {
 			header, err := aac.ParseADTS(payload)
 			if err != nil {
@@ -359,14 +382,15 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.ChannelConfig, header.SampleRate
 				trackInfo.Config, _ = aac.ASC(aac.Config{AudioObjectType: header.Profile, SampleRate: header.SampleRate, FrequencyIndex: header.FrequencyIndex, ChannelConfig: header.ChannelConfig})
 			}
-			packetPTS := pts * int64(header.SampleRate) / 90000
+			packetPTS := pts*int64(header.SampleRate)/90000 + sampleOffset
 			packets = append(packets, InputPacket{Track: track, Data: append([]byte(nil), payload[header.HeaderLength:header.FrameLength]...), PTS: packetPTS, DTS: packetPTS, Duration: int64(header.Samples), Keyframe: true, Offset: pes.offset})
-			pts += int64(header.Samples) * 90000 / int64(header.SampleRate)
+			sampleOffset += int64(header.Samples)
 			payload = payload[header.FrameLength:]
 		}
 		return packets, trackInfo, nil
 	case core.CodecMP3:
 		var packets []InputPacket
+		var sampleOffset int64
 		for len(payload) > 0 {
 			header, err := mp3.ParseHeader(payload)
 			if err != nil || header.FrameLength > len(payload) {
@@ -375,9 +399,9 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 			if trackInfo.SampleRate == 0 {
 				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.Channels, header.SampleRate
 			}
-			packetPTS := pts * int64(header.SampleRate) / 90000
+			packetPTS := pts*int64(header.SampleRate)/90000 + sampleOffset
 			packets = append(packets, InputPacket{Track: track, Data: append([]byte(nil), payload[:header.FrameLength]...), PTS: packetPTS, DTS: packetPTS, Duration: int64(header.Samples), Keyframe: true, Offset: pes.offset})
-			pts += int64(header.Samples) * 90000 / int64(header.SampleRate)
+			sampleOffset += int64(header.Samples)
 			payload = payload[header.FrameLength:]
 		}
 		return packets, trackInfo, nil
@@ -389,8 +413,8 @@ func parsePES(pes *pesBuffer, track int, codec core.CodecType) ([]InputPacket, I
 	}
 }
 
-func decodeTimestamp(data []byte) (int64, error) {
-	if len(data) < 5 || data[0]&1 == 0 || data[2]&1 == 0 || data[4]&1 == 0 {
+func decodeTimestamp(data []byte, prefix byte) (int64, error) {
+	if len(data) < 5 || data[0]>>4 != prefix || data[0]&1 == 0 || data[2]&1 == 0 || data[4]&1 == 0 {
 		return 0, errors.New("mpegts: malformed PES timestamp markers")
 	}
 	value := int64(data[0]>>1&7)<<30 | int64(binary.BigEndian.Uint16(data[1:3])>>1)<<15 | int64(binary.BigEndian.Uint16(data[3:5])>>1)
