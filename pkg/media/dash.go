@@ -40,6 +40,7 @@ type dashDemuxer struct {
 	client           *http.Client
 	header           http.Header
 	opts             DASHOptions
+	manifestURL      string
 	representation   manifest.DASHRepresentation
 	manifestDuration time.Duration
 	dynamic          bool
@@ -86,7 +87,7 @@ func OpenDASH(ctx context.Context, rawURL string, opts DASHOptions) (Demuxer, er
 		header = make(http.Header)
 	}
 	root, cancel := context.WithCancel(context.Background())
-	d := &dashDemuxer{client: client, header: header, opts: opts, root: root, cancel: cancel}
+	d := &dashDemuxer{client: client, header: header, opts: opts, manifestURL: rawURL, root: root, cancel: cancel}
 	body, err := d.fetch(ctx, rawURL, manifest.ByteRange{}, opts.MaxManifestBytes)
 	if err != nil {
 		cancel()
@@ -207,12 +208,69 @@ func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 		_ = d.current.Close()
 		d.next++
 		if d.next >= len(d.representation.Segments) {
-			return nil, io.EOF
+			if !d.dynamic {
+				return nil, io.EOF
+			}
+			if err := d.refresh(ctx); err != nil {
+				return nil, err
+			}
 		}
 		if err := d.openSegment(ctx, d.next); err != nil {
 			return nil, err
 		}
 	}
+}
+
+func (d *dashDemuxer) refresh(ctx context.Context) error {
+	body, err := d.fetch(ctx, d.manifestURL, manifest.ByteRange{}, d.opts.MaxManifestBytes)
+	if err != nil {
+		return err
+	}
+	base, err := url.Parse(d.manifestURL)
+	if err != nil {
+		return err
+	}
+	mpd, err := manifest.ParseDASH(base, body, d.opts.MaxRepresentations, d.opts.MaxSegments)
+	if err != nil {
+		return err
+	}
+	index := -1
+	for i := range mpd.Representations {
+		if mpd.Representations[i].ID == d.representation.ID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		index = selectDASHRepresentation(mpd.Representations, d.opts.SelectRepresentation)
+	}
+	if index < 0 || index >= len(mpd.Representations) {
+		return errors.New("dash: refreshed representation is unavailable")
+	}
+	updated := mpd.Representations[index]
+	last := d.representation.Segments[len(d.representation.Segments)-1]
+	segments := updated.Segments[:0]
+	for _, segment := range updated.Segments {
+		if segment.Number > last.Number || segment.Start > last.Start {
+			segments = append(segments, segment)
+		}
+	}
+	if len(segments) == 0 {
+		return ErrNoNewSegments
+	}
+	updated.Segments = segments
+	newInit := d.init
+	if updated.Initialization != nil && !updated.SingleFile {
+		old := d.representation.Initialization
+		if old == nil || old.URI != updated.Initialization.URI || old.Range != updated.Initialization.Range {
+			newInit, err = d.fetch(ctx, updated.Initialization.URI, updated.Initialization.Range, d.opts.MaxSegmentBytes)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	d.representation, d.manifestDuration, d.dynamic, d.init, d.next = updated, mpd.Duration, mpd.Dynamic, newInit, 0
+	return nil
 }
 
 func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {

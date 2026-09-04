@@ -89,3 +89,43 @@ func TestOpenDASHLimitsAndCancellation(t *testing.T) {
 		t.Fatal("canceled open succeeded")
 	}
 }
+
+func TestDASHDynamicManifestRefresh(t *testing.T) {
+	config := aac.Config{AudioObjectType: 2, SampleRate: 48000, FrequencyIndex: 3, ChannelConfig: 2}
+	first, _ := aac.WrapADTS(config, []byte{1})
+	second, _ := aac.WrapADTS(config, []byte{2})
+	var manifestRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live.mpd":
+			count := manifestRequests.Add(1)
+			repeat := 0
+			if count > 1 {
+				repeat = 1
+			}
+			fmt.Fprintf(w, `<MPD type="dynamic"><Period><AdaptationSet contentType="audio" mimeType="audio/aac"><Representation id="audio" bandwidth="128"><SegmentTemplate timescale="1" media="$Number$.aac" startNumber="1"><SegmentTimeline><S t="0" d="1" r="%d"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>`, repeat)
+		case "/1.aac":
+			_, _ = w.Write(first)
+		case "/2.aac":
+			_, _ = w.Write(second)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	demuxer, err := OpenDASH(context.Background(), server.URL+"/live.mpd", DASHOptions{Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer demuxer.Close()
+	p, err := demuxer.ReadPacket(context.Background())
+	if err != nil || !bytes.Equal(p.Data, []byte{1}) || p.PTS.Value != 0 {
+		t.Fatalf("first packet = %+v, %v", p, err)
+	}
+	p.Release()
+	p, err = demuxer.ReadPacket(context.Background())
+	if err != nil || !bytes.Equal(p.Data, []byte{2}) || p.PTS.Value != 48000 || manifestRequests.Load() != 2 {
+		t.Fatalf("refreshed packet = %+v, requests=%d, %v", p, manifestRequests.Load(), err)
+	}
+	p.Release()
+}
