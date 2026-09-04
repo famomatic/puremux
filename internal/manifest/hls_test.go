@@ -44,6 +44,10 @@ func TestParseHLSBoundaries(t *testing.T) {
 		"#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"key\"\n#EXTINF:1,\na.ts\n",
 		"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\",IV=0xzz\n#EXTINF:1,\na.ts\n",
 		"#EXTM3U\n#EXT-X-MAP:URI=\"x\",BYTERANGE=\"0@0\"\n#EXTINF:1,\nx\n",
+		"#EXTM3U\na.ts\n",
+		"#EXTM3U\n#EXTINF:NaN,\na.ts\n",
+		"#EXTM3U\n#EXTINF:+Inf,\na.ts\n",
+		"#EXTM3U\n#EXTINF:0,\na.ts\n",
 	}
 	for i, input := range cases {
 		if _, err := ParseHLS(base, []byte(input), 2); err == nil {
@@ -53,5 +57,21 @@ func TestParseHLSBoundaries(t *testing.T) {
 	tooMany := "#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n"
 	if _, err := ParseHLS(base, []byte(tooMany), 1); err == nil {
 		t.Fatal("entry limit was not enforced")
+	}
+	tooManyRenditions := "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"one\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"two\"\n"
+	if _, err := ParseHLS(base, []byte(tooManyRenditions), 1); err == nil {
+		t.Fatal("rendition limit was not enforced")
+	}
+}
+
+func TestHLSMapCapturesDeclarationKey(t *testing.T) {
+	base, _ := url.Parse("https://example.test/root.m3u8")
+	input := "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"map-key\",IV=0x01\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:1,\nsegment.m4s\n"
+	p, err := ParseHLS(base, []byte(input), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Segments[0].Map == nil || p.Segments[0].Map.Key == nil || p.Segments[0].Map.Key.URI != "https://example.test/map-key" || p.Segments[0].Key != nil {
+		t.Fatalf("map key state was not preserved: %+v", p.Segments[0])
 	}
 }

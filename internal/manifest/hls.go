@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ type HLSKey struct {
 type HLSMap struct {
 	URI   string
 	Range ByteRange
+	Key   *HLSKey
 }
 
 type HLSSegment struct {
@@ -120,6 +122,9 @@ func ParseHLS(base *url.URL, data []byte, maxEntries int) (HLSPlaylist, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "#EXT-X-MEDIA:") {
+			if len(playlist.Renditions) >= maxEntries {
+				return HLSPlaylist{}, errors.New("hls: too many renditions")
+			}
 			attrs, err := parseAttributes(strings.TrimPrefix(line, "#EXT-X-MEDIA:"))
 			if err != nil {
 				return HLSPlaylist{}, err
@@ -144,8 +149,8 @@ func ParseHLS(base *url.URL, data []byte, maxEntries int) (HLSPlaylist, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "#EXT-X-TARGETDURATION:") {
-			seconds, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-TARGETDURATION:")), 10, 32)
-			if err != nil {
+			seconds, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "#EXT-X-TARGETDURATION:")), 10, 64)
+			if err != nil || seconds == 0 || seconds > uint64(math.MaxInt64/int64(time.Second)) {
 				return HLSPlaylist{}, errors.New("hls: invalid target duration")
 			}
 			playlist.TargetDuration = time.Duration(seconds) * time.Second
@@ -154,7 +159,7 @@ func ParseHLS(base *url.URL, data []byte, maxEntries int) (HLSPlaylist, error) {
 		if strings.HasPrefix(line, "#EXTINF:") {
 			parts := strings.SplitN(strings.TrimPrefix(line, "#EXTINF:"), ",", 2)
 			seconds, err := strconv.ParseFloat(parts[0], 64)
-			if err != nil || seconds < 0 {
+			if err != nil || seconds <= 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds > float64(math.MaxInt64)/float64(time.Second) {
 				return HLSPlaylist{}, errors.New("hls: invalid segment duration")
 			}
 			pendingDuration = time.Duration(seconds * float64(time.Second))
@@ -183,6 +188,10 @@ func ParseHLS(base *url.URL, data []byte, maxEntries int) (HLSPlaylist, error) {
 				return HLSPlaylist{}, err
 			}
 			mapping := &HLSMap{URI: uri}
+			if currentKey != nil {
+				copyKey := *currentKey
+				mapping.Key = &copyKey
+			}
 			if attrs["BYTERANGE"] != "" {
 				mapping.Range, err = parseByteRange(attrs["BYTERANGE"], 0)
 				if err != nil {
@@ -255,8 +264,14 @@ func ParseHLS(base *url.URL, data []byte, maxEntries int) (HLSPlaylist, error) {
 		if len(playlist.Segments) >= maxEntries {
 			return HLSPlaylist{}, errors.New("hls: too many segments")
 		}
+		if pendingDuration <= 0 {
+			return HLSPlaylist{}, errors.New("hls: media segment is missing EXTINF")
+		}
 		if pendingRange.Valid && pendingRangeImplicit && (previousRangeURI == "" || previousRangeURI != uri) {
 			return HLSPlaylist{}, errors.New("hls: implicit byte range has no preceding range on the same resource")
+		}
+		if uint64(len(playlist.Segments)) > math.MaxUint64-playlist.MediaSequence {
+			return HLSPlaylist{}, errors.New("hls: media sequence overflow")
 		}
 		segment := HLSSegment{Sequence: playlist.MediaSequence + uint64(len(playlist.Segments)), URI: uri, Duration: pendingDuration, Title: pendingTitle, Range: pendingRange, Discontinuity: discontinuity}
 		if currentMap != nil {

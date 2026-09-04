@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -189,10 +190,20 @@ func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 				d.adjust[p.StreamIndex] = shift
 			}
 			if p.PTS.Valid {
-				p.PTS.Value += shift
+				adjusted, addOK := checkedAddInt64(p.PTS.Value, shift)
+				if !addOK {
+					p.Release()
+					return nil, ErrInvalidData
+				}
+				p.PTS.Value = adjusted
 			}
 			if p.DTS.Valid {
-				p.DTS.Value += shift
+				adjusted, addOK := checkedAddInt64(p.DTS.Value, shift)
+				if !addOK {
+					p.Release()
+					return nil, ErrInvalidData
+				}
+				p.DTS.Value = adjusted
 			}
 			return p, nil
 		}
@@ -241,7 +252,11 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	}
 	index := len(d.representation.Segments) - 1
 	for i, segment := range d.representation.Segments {
-		if targetNS < int64(segment.Start+segment.Duration) {
+		end, ok := checkedAddInt64(int64(segment.Start), int64(segment.Duration))
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
+		if targetNS < end {
 			index = i
 			break
 		}
@@ -354,6 +369,9 @@ func (d *dashDemuxer) fetch(ctx context.Context, rawURL string, byteRange manife
 	}
 	if limit <= 0 {
 		return nil, errors.New("dash: invalid resource limit")
+	}
+	if limit == math.MaxInt64 {
+		return nil, errors.New("dash: resource limit is too large")
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {

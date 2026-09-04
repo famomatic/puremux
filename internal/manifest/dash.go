@@ -236,7 +236,7 @@ func buildListSegments(rep *DASHRepresentation, base *url.URL, list *dashSegment
 	if timescale == 0 {
 		timescale = 1
 	}
-	if timescale < 0 || list.Duration < 0 || len(list.SegmentURLs) > maxSegments {
+	if timescale < 0 || list.Duration <= 0 || len(list.SegmentURLs) > maxSegments {
 		return errors.New("invalid SegmentList bounds")
 	}
 	if list.Initialization != nil {
@@ -509,7 +509,10 @@ func expandDASHTemplate(value string, rep *DASHRepresentation, number uint64, ti
 			raw = strconv.FormatInt(timestamp, 10)
 		}
 		if match[3] != "" && match[1] != "RepresentationID" {
-			width, _ := strconv.Atoi(match[3])
+			width, err := strconv.Atoi(match[3])
+			if err != nil || width > 64 {
+				return "\x00INVALID_WIDTH\x00"
+			}
 			if len(raw) < width {
 				raw = strings.Repeat("0", width-len(raw)) + raw
 			}
@@ -517,6 +520,9 @@ func expandDASHTemplate(value string, rep *DASHRepresentation, number uint64, ti
 		return raw
 	})
 	value = strings.ReplaceAll(value, sentinel, "$")
+	if strings.Contains(value, "\x00INVALID_WIDTH\x00") {
+		return "", errors.New("template format width exceeds 64 digits")
+	}
 	if strings.Contains(value, "$") {
 		return "", errors.New("unsupported or malformed template token")
 	}

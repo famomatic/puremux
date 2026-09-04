@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -8,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/famomatic/puremux/internal/manifest"
 )
@@ -114,6 +117,9 @@ func (d *hlsDemuxer) Info() Info {
 	info := Info{Format: FormatHLS, FormatName: "hls"}
 	if d.playlist.EndList {
 		for _, segment := range d.segments {
+			if segment.Duration > 0 && info.Duration > time.Duration(math.MaxInt64)-segment.Duration {
+				return info
+			}
 			info.Duration += segment.Duration
 		}
 		info.DurationKnown = true
@@ -154,10 +160,20 @@ func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 				d.adjust[p.StreamIndex] = shift
 			}
 			if p.PTS.Valid {
-				p.PTS.Value += shift
+				adjusted, addOK := checkedAddInt64(p.PTS.Value, shift)
+				if !addOK {
+					p.Release()
+					return nil, ErrInvalidData
+				}
+				p.PTS.Value = adjusted
 			}
 			if p.DTS.Valid {
-				p.DTS.Value += shift
+				adjusted, addOK := checkedAddInt64(p.DTS.Value, shift)
+				if !addOK {
+					p.Release()
+					return nil, ErrInvalidData
+				}
+				p.DTS.Value = adjusted
 			}
 			if d.firstPacket && d.currentSeg.Discontinuity {
 				p.Flags |= PacketDiscontinuity
@@ -169,7 +185,11 @@ func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 			return nil, err
 		}
 		_ = d.current.Close()
-		d.baseNS += int64(d.currentSeg.Duration)
+		var ok bool
+		d.baseNS, ok = checkedAddInt64(d.baseNS, int64(d.currentSeg.Duration))
+		if !ok {
+			return nil, ErrInvalidData
+		}
 		d.next++
 		if d.next >= len(d.segments) {
 			if d.playlist.EndList {
@@ -216,7 +236,10 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	}
 	index, start := 0, int64(0)
 	for i, segment := range d.segments {
-		end := start + int64(segment.Duration)
+		end, ok := checkedAddInt64(start, int64(segment.Duration))
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
 		if targetNS < end || i == len(d.segments)-1 {
 			index = i
 			break
@@ -324,7 +347,7 @@ func (d *hlsDemuxer) openSegment(ctx context.Context, index int) error {
 		return err
 	}
 	if segment.Key != nil {
-		data, err = d.decrypt(ctx, data, segment)
+		data, err = d.decrypt(ctx, data, segment.Key, segment.Sequence)
 		if err != nil {
 			return err
 		}
@@ -332,17 +355,20 @@ func (d *hlsDemuxer) openSegment(ctx context.Context, index int) error {
 	var demuxer Demuxer
 	if segment.Map != nil {
 		cacheKey := segment.Map.URI + ":" + strconv.FormatInt(segment.Map.Range.Offset, 10) + ":" + strconv.FormatInt(segment.Map.Range.Length, 10)
+		if segment.Map.Key != nil {
+			cacheKey += ":" + segment.Map.Key.URI + ":" + fmt.Sprintf("%x", segment.Map.Key.IV)
+		}
 		init := d.initCache[cacheKey]
 		if init == nil {
 			init, err = d.fetch(ctx, segment.Map.URI, segment.Map.Range, d.opts.MaxSegmentBytes)
 			if err != nil {
 				return err
 			}
-			if segment.Key != nil {
-				if !segment.Key.HasIV {
+			if segment.Map.Key != nil {
+				if !segment.Map.Key.HasIV {
 					return errors.New("hls: encrypted EXT-X-MAP requires an explicit IV")
 				}
-				init, err = d.decrypt(ctx, init, segment)
+				init, err = d.decrypt(ctx, init, segment.Map.Key, segment.Sequence)
 				if err != nil {
 					return err
 				}
@@ -391,25 +417,20 @@ func (d *hlsDemuxer) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (d *hlsDemuxer) decrypt(ctx context.Context, encrypted []byte, segment manifest.HLSSegment) ([]byte, error) {
-	key := d.keyCache[segment.Key.URI]
-	if key == nil {
-		var err error
-		key, err = d.fetch(ctx, segment.Key.URI, manifest.ByteRange{}, 16)
-		if err != nil {
-			return nil, err
-		}
-		if len(key) != 16 {
-			return nil, errors.New("hls: AES-128 key is not 16 bytes")
-		}
-		d.keyCache[segment.Key.URI] = append([]byte(nil), key...)
+func (d *hlsDemuxer) decrypt(ctx context.Context, encrypted []byte, keySpec *manifest.HLSKey, sequence uint64) ([]byte, error) {
+	key, err := d.fetch(ctx, keySpec.URI, manifest.ByteRange{}, 16)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 16 {
+		return nil, errors.New("hls: AES-128 key is not 16 bytes")
 	}
 	if len(encrypted) == 0 || len(encrypted)%aes.BlockSize != 0 {
 		return nil, errors.New("hls: AES-128 ciphertext is not block aligned")
 	}
-	iv := segment.Key.IV
-	if !segment.Key.HasIV {
-		binary.BigEndian.PutUint64(iv[8:], segment.Sequence)
+	iv := keySpec.IV
+	if !keySpec.HasIV {
+		binary.BigEndian.PutUint64(iv[8:], sequence)
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -464,6 +485,9 @@ func (d *hlsDemuxer) fetch(ctx context.Context, rawURL string, byteRange manifes
 	if limit <= 0 {
 		return nil, errors.New("hls: invalid resource limit")
 	}
+	if limit == math.MaxInt64 {
+		return nil, errors.New("hls: resource limit is too large")
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, err
@@ -506,11 +530,18 @@ func compatibleStreams(a, b []Stream) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].Type != b[i].Type || a[i].Codec != b[i].Codec || a[i].TimeBase != b[i].TimeBase || a[i].SampleRate != b[i].SampleRate || a[i].Channels != b[i].Channels {
+		if a[i].Type != b[i].Type || a[i].Codec != b[i].Codec || a[i].TimeBase != b[i].TimeBase || a[i].SampleRate != b[i].SampleRate || a[i].Channels != b[i].Channels || a[i].Width != b[i].Width || a[i].Height != b[i].Height || a[i].Config.Format != b[i].Config.Format || !bytes.Equal(a[i].Config.Data, b[i].Config.Data) {
 			return false
 		}
 	}
 	return true
+}
+
+func checkedAddInt64(a, b int64) (int64, bool) {
+	if (b > 0 && a > math.MaxInt64-b) || (b < 0 && a < math.MinInt64-b) {
+		return 0, false
+	}
+	return a + b, true
 }
 
 var _ Demuxer = (*hlsDemuxer)(nil)

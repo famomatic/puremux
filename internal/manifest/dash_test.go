@@ -64,6 +64,8 @@ func TestParseDASHBoundaries(t *testing.T) {
 		`<MPD type="dynamic"><Period><AdaptationSet><SegmentTemplate timescale="1" media="$Time$.m4s"><SegmentTimeline><S d="1" r="-1"/></SegmentTimeline></SegmentTemplate><Representation id="x"/></AdaptationSet></Period></MPD>`,
 		`<MPD><Period><AdaptationSet><SegmentTemplate timescale="1" media="$Time$.m4s"><SegmentTimeline><S d="0"/></SegmentTimeline></SegmentTemplate><Representation id="x"/></AdaptationSet></Period></MPD>`,
 		`<MPD mediaPresentationDuration="PT1S"><Period><AdaptationSet><SegmentTemplate timescale="9223372036854775807" presentationTimeOffset="9223372036854775807" media="$Time$.m4s"><SegmentTimeline><S d="1" r="-1"/></SegmentTimeline></SegmentTemplate><Representation id="x"/></AdaptationSet></Period></MPD>`,
+		`<MPD><Period><AdaptationSet><Representation id="x"><SegmentList timescale="1" duration="0"><SegmentURL media="a.m4s"/></SegmentList></Representation></AdaptationSet></Period></MPD>`,
+		`<MPD mediaPresentationDuration="PT1S"><Period><AdaptationSet><SegmentTemplate timescale="1" duration="1" media="$Number%0999999999d$.m4s"/><Representation id="x"/></AdaptationSet></Period></MPD>`,
 	}
 	for i, input := range cases {
 		if _, err := ParseDASH(base, []byte(input), 2, 2); err == nil {
