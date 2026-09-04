@@ -18,6 +18,8 @@ FFmpeg/ffprobe, decode pixels or PCM, or depend on a native codec library.
 
 - `Source`, `Open`, `Demuxer`, `Stream`, and `Packet` for input;
 - `MuxOptions`, `NewMuxer`, and `Muxer` for output;
+- `LiveIngestOptions` and `LiveMuxer` for generic, explicitly normalized live
+  packet ingestion ahead of any muxer;
 - `RemuxInput`, `Remux`, and `RemuxFiles` for exact packet copying;
 - HLS/DASH readers and caller-controlled HTTP sources.
 
@@ -61,6 +63,12 @@ by `media.Muxer` or `media.Remux`; callers of the public mux API must provide
 pristine, decode-ordered streams. The muxers never reorder, interpolate, or
 otherwise repair timestamps.
 
+`media.LiveMuxer` is the sole public opt-in coordinator for the internal
+preprocessors. It stays above `Muxer`, owns and bounds every buffered packet,
+and emits normalized exact-tick packets through the ordinary mux interface.
+This preserves the separation that preprocessors never serialize bytes and
+muxers never repair timing.
+
 ## Muxing contract
 
 Streams are registered before the first packet. `WritePacket` is synchronous
@@ -82,6 +90,39 @@ No muxer converts elementary-stream framing. H.264/HEVC MP4 samples are
 length-prefixed and require avcC/hvcC. MPEG-TS H.264/HEVC packets are Annex-B,
 and AAC packets are complete ADTS frames. `Remux` rejects source/output pairs
 whose demuxed packet framing cannot satisfy MPEG-TS output.
+
+## Opt-in live ingestion
+
+`LiveMuxer` implements the ordinary `Muxer` interface. `WritePacket` accepts
+any compressed packet admitted by the wrapped muxer and preserves its flags,
+position, discard padding, payload, and supplied duration. It copies input
+bytes, uses a per-stream bounded jitter enforcer, holds video until its first
+keyframe, aligns audio to the first registered video stream at packet
+granularity, completes missing durations with one-packet lookahead, and merges
+streams by DTS before forwarding them.
+
+Two optional ingestion helpers handle sources that do not yet satisfy the
+generic packet contract. `WriteVideo` accepts one decode-clock Annex-B
+H.264/HEVC access unit and derives B-frame presentation time from picture-order
+headers. `WriteADTS` accepts one or more AAC ADTS frames; header sample count
+and sample rate determine exact split-frame duration and timestamps. A stream
+uses exactly one of generic packets, decode-clock video, or ADTS chunks so no
+stateful parser observes a partial sequence.
+
+The facade performs only bounded compressed-header inspection; it never
+decodes slice payloads or AAC samples. It derives positive packet durations
+with one-packet lookahead, performs a bounded cross-stream DTS merge, exposes
+drop/gap metrics, and flushes all stages before closing the wrapped muxer.
+Callers should set `MinMonotonicStep` to a value that survives the destination
+clock's quantization; 1 ms is a conservative live-output value. The facade
+automatically raises the step to at least one stream-time-base tick and rejects
+time bases whose individual tick is zero or overflows in its nanosecond
+preprocessing domain.
+
+The generic path does not change elementary-stream framing and therefore works
+with any compatible muxer. The convenience helpers retain their input framing:
+Annex-B video and ADTS AAC are directly compatible with MPEG-TS, not with the
+length-prefixed video or raw AAC framing required by MP4.
 
 ## MP4 output
 

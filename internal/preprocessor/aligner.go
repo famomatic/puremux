@@ -59,9 +59,18 @@ const maxCfgPending = 8
 // until SetVideoSyncStart arrives rather than being emitted before the video
 // sync point.
 func NewAlignerForSession(detector core.CodecKeyframeDetector, isVideo, expectsVideoSync bool) *Aligner {
+	return NewAlignerForSessionWithLimit(detector, isVideo, expectsVideoSync, 64)
+}
+
+// NewAlignerForSessionWithLimit is NewAlignerForSession with a caller-owned
+// bound for audio packets held before the first video sync point.
+func NewAlignerForSessionWithLimit(detector core.CodecKeyframeDetector, isVideo, expectsVideoSync bool, maxPending int) *Aligner {
 	a := NewAligner(detector, isVideo)
 	a.expectsVideoSync = expectsVideoSync
-	a.maxPending = 64
+	if maxPending < 1 {
+		maxPending = 1
+	}
+	a.maxPending = maxPending
 	return a
 }
 

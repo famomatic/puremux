@@ -88,9 +88,15 @@ type Packet struct {
 	Data       []byte
 	PTS        time.Duration
 	DTS        time.Duration
+	Duration   time.Duration
 	IsKeyframe bool
 	Codec      CodecType
 	TrackID    int
+	Flags      uint16
+	Pos        int64
+	// DiscardPadding retains container-level compressed-packet padding. It is
+	// metadata only; preprocessors never inspect or alter packet payloads.
+	DiscardPadding time.Duration
 }
 
 // Reset clears the packet for reuse without releasing the Data backing array.
@@ -99,7 +105,11 @@ func (p *Packet) Reset() {
 	p.Data = p.Data[:0]
 	p.PTS = 0
 	p.DTS = 0
+	p.Duration = 0
 	p.IsKeyframe = false
 	p.Codec = CodecUnknown
 	p.TrackID = 0
+	p.Flags = 0
+	p.Pos = 0
+	p.DiscardPadding = 0
 }

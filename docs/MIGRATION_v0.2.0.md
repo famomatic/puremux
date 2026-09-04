@@ -81,6 +81,78 @@ packet data may be reused. `Close` is idempotent and does not close the output.
 to any other `io.Writer`. Set `FragmentDuration` and `MaxFragmentBytes` to
 bound fMP4 buffering; zero selects defaults.
 
+## Live MPEG-TS ingestion (v0.2.1)
+
+v0.2.1 provides an explicit replacement for the removed live `Session`
+helpers without weakening the ordinary muxer's exact-timestamp contract:
+
+```go
+muxer, err := media.NewMuxer(output, media.MuxOptions{Format: media.FormatMPEGTS})
+if err != nil {
+    return err
+}
+opts := media.DefaultLiveIngestOptions()
+opts.MinMonotonicStep = time.Millisecond
+live, err := media.NewLiveMuxer(muxer, opts)
+if err != nil {
+    return err
+}
+
+video, err := live.AddStream(media.Stream{
+    Type: media.MediaVideo, Codec: media.CodecH264,
+    TimeBase: media.Rational{Num: 1, Den: 1000},
+    DefaultPacket: time.Second / 60,
+})
+if err != nil {
+    return err
+}
+audio, err := live.AddStream(media.Stream{
+    Type: media.MediaAudio, Codec: media.CodecAAC,
+    TimeBase: media.Rational{Num: 1, Den: 1000},
+    SampleRate: 48000, Channels: 2,
+})
+if err != nil {
+    return err
+}
+
+if err := live.WriteVideo(ctx, video, annexBAccessUnit, decodeMilliseconds); err != nil {
+    return err
+}
+if err := live.WriteADTS(ctx, audio, oneOrMoreADTSFrames, firstFrameMilliseconds); err != nil {
+    return err
+}
+return live.Close()
+```
+
+`WriteVideo` derives keyframe and H.264/HEVC presentation order from bounded
+NAL headers. `WriteADTS` splits concatenated frames and advances their times
+from the header sample count. Both copy payloads before returning. Register all
+tracks before the first write, feed from one goroutine, and always call
+`Close` to drain the startup probe and jitter windows. The facade accepts
+Annex-B/ADTS framing and is intended for a compatible sink such as MPEG-TS;
+it does not convert framing for MP4. One stream time-base tick must fit in a
+positive `time.Duration`; duplicate repair is automatically raised to that
+granularity, while `MinMonotonicStep` should be set higher when the destination
+clock is coarser.
+
+For callers that already have ordinary compressed packets with exact PTS/DTS,
+use the same object through its generic `Muxer` method:
+
+```go
+err = live.WritePacket(ctx, &media.Packet{
+    StreamIndex: video,
+    Data: packetData,
+    PTS: media.KnownTimestamp(pts),
+    DTS: media.KnownTimestamp(dts),
+    Duration: media.KnownTimestamp(duration), // optional on LiveMuxer
+    Flags: flags,
+})
+```
+
+This generic path works with every codec/container combination accepted by the
+wrapped muxer and preserves packet flags, position, and discard padding. Do not
+mix generic `WritePacket`, `WriteVideo`, and `WriteADTS` calls on one stream.
+
 ## Probing
 
 Replace legacy `Probe` with `OpenFile` plus `Open`:

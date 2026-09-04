@@ -26,15 +26,20 @@ func TestCodecTypeString(t *testing.T) {
 
 func TestPacketReset(t *testing.T) {
 	p := &Packet{
-		Data:       []byte{1, 2, 3},
-		PTS:        42,
-		DTS:        41,
-		IsKeyframe: true,
-		Codec:      CodecVP9,
-		TrackID:    7,
+		Data:           []byte{1, 2, 3},
+		PTS:            42,
+		DTS:            41,
+		Duration:       1,
+		IsKeyframe:     true,
+		Codec:          CodecVP9,
+		TrackID:        7,
+		Flags:          3,
+		Pos:            9,
+		DiscardPadding: -2,
 	}
 	p.Reset()
-	if p.PTS != 0 || p.DTS != 0 || p.IsKeyframe || p.Codec != CodecUnknown || p.TrackID != 0 {
+	if p.PTS != 0 || p.DTS != 0 || p.Duration != 0 || p.IsKeyframe || p.Codec != CodecUnknown ||
+		p.TrackID != 0 || p.Flags != 0 || p.Pos != 0 || p.DiscardPadding != 0 {
 		t.Fatalf("Reset left state: %+v", p)
 	}
 	if cap(p.Data) == 0 {

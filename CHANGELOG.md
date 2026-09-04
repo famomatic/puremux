@@ -3,6 +3,39 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## v0.2.1 — 2026-09-05
+
+### Added
+
+- Added the opt-in `media.LiveMuxer`, a generic `Muxer` wrapper for compressed
+  live packets. Its ordinary `WritePacket` path provides bounded 400 ms
+  startup-jitter ordering, duplicate-DTS monotonic repair, keyframe-first A/V
+  alignment, missing-duration completion, cross-stream ordering, and complete
+  packet metadata preservation for any codec accepted by the wrapped muxer.
+- Added optional helpers for decode-clock Annex-B H.264/HEVC with POC-based
+  B-frame presentation timestamps and for exact per-frame ADTS AAC timing.
+- Added live degradation metrics and configurable packet/interleave bounds.
+
+### Compatibility
+
+- `media.Muxer` remains an exact-timestamp serializer and still never repairs
+  or synthesizes timestamps. Existing v0.2.0 callers are unchanged; live
+  normalization is selected explicitly with `media.NewLiveMuxer`.
+- Live input payloads are copied before return, so network receive buffers may
+  be reused immediately. Stream timestamps remain expressed in their declared
+  exact `Rational` time base at the public boundary.
+- Duplicate repair is automatically clamped to at least one representable
+  stream tick; callers can select a larger step for a coarser destination
+  clock. Live stream time bases must have a positive `time.Duration` tick.
+
+### Verification
+
+- Public integration tests use specification-derived, MSB-first H.264
+  SPS/PPS/slice headers and an exact AAC-LC 48 kHz stereo ADTS header. They
+  cover B-frame PTS synthesis, jitter and duplicate DTS, first-IDR A/V
+  alignment, multi-frame ADTS chunks, caller-buffer reuse, metadata mismatch,
+  truncation, invalid options, and close/error boundaries.
+
 ## v0.2.0 — 2026-09-05
 
 ### Breaking

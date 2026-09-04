@@ -123,9 +123,13 @@ progressive fast-start relocation are outside v0.2.0.
 | 38 | Perform final v0.2.0 pre-version verification | Done | 2026-09-05 | Codex `/root` | Verification-only audit; no production code changed. In MSYS2 UCRT64 with caches under `F:/cache`, uncached `CGO_ENABLED=0` tests pass at 73.5% total statement coverage; shuffled x10 and Windows/386 tests, the complete race suite, focused mp4ff/round-trip/remux tests, vet, tidy diff, module verification, gofmt, six Linux/Darwin/Windows amd64+arm64 non-CGO builds, govulncheck v1.7.0, banned-dependency/legacy-import/conflict-marker/TODO scans, and whitespace checks all pass. All 13 fuzz targets completed 14,248,178 executions without panic. Code gates are clear, but release tagging remains procedurally blocked because `HEAD` is still tagged `v0.1.1` and the complete v0.2.0 tree is uncommitted (`v0.1.1-dirty`). |
 | 39 | Align v0.2.0 release metadata for publication | Done | 2026-09-05 | Codex `/root` | Updated the changelog release date to 2026-09-05 after the complete task-38 release matrix passed. Fetched `origin` and confirmed `main` is synchronized (0 ahead/0 behind before the release commit) and `v0.2.0` is absent both locally and remotely. The repository is ready for the authorized release commit, annotated tag, and push. |
 | 40 | Correct the release designation to v0.2.0 | Done | 2026-09-05 | Codex `/root` | Discarded the superseded local release commit with a soft reset to `v0.1.1`, preserving the complete verified implementation, and removed its local annotated tag. Replaced every release reference with v0.2.0, renamed the migration guide to `MIGRATION_v0.2.0.md`, and confirmed a repository-wide stale-version scan is empty. Product code is unchanged from the task-38 verification; the corrected release commit and atomic remote ref replacement are authorized. |
+| 41 | Add a generic opt-in live normalization layer | Done | 2026-09-05 | Codex `/root` | `media.LiveMuxer` provides bounded generic packet normalization plus optional Annex-B POC and ADTS helpers. Spec-derived H.264/ADTS and boundary tests cover fractional clocks, discontinuities, A/V bounds, ownership, and malformed input. The final MSYS2 UCRT64 release matrix passes at 74.0% coverage, and `$code-review` reports no remaining findings. |
 
 ## Work log
 
+- 2026-09-05 - Codex `/root` - Completed task 41: added and documented the
+  generic `LiveMuxer`, fixed every review finding, passed the full 74.0%-coverage
+  release matrix, and completed `$code-review` with no remaining findings.
 - 2026-09-05 - Codex `/root` - Completed task 40: corrected the intended
   release designation to v0.2.0 throughout the changelog, architecture,
   implementation ledger, and migration guide; discarded the superseded local
