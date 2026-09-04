@@ -267,7 +267,6 @@ func (rd *Reader) NextSample() (*Sample, error) {
 			return nil, io.EOF
 		}
 		s := rd.fragments[rd.fragmentCursor]
-		rd.fragmentCursor++
 		if _, err := rd.rs.Seek(s.off, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -275,6 +274,7 @@ func (rd *Reader) NextSample() (*Sample, error) {
 		if _, err := io.ReadFull(rd.rs, data); err != nil {
 			return nil, err
 		}
+		rd.fragmentCursor++
 		absMs := uint64(0)
 		if s.pts > 0 {
 			absMs = timescaleToMs(uint64(s.pts), s.track.timescale)
@@ -311,10 +311,6 @@ func (rd *Reader) NextSample() (*Sample, error) {
 	}
 	t := rd.tracks[pick]
 	s := t.peek
-	// Advance the cursor past the peeked sample so the next peek is fresh.
-	t.hasPeek = false
-	t.consumed++
-	t.advancePast(s)
 	if _, err := rd.rs.Seek(s.off, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -322,6 +318,10 @@ func (rd *Reader) NextSample() (*Sample, error) {
 	if _, err := io.ReadFull(rd.rs, buf); err != nil {
 		return nil, err
 	}
+	// Commit cursor state only after the sample bytes were read successfully.
+	t.hasPeek = false
+	t.consumed++
+	t.advancePast(s)
 	return &Sample{
 		TrackNum:  t.info.Number,
 		AbsMs:     s.absMs,

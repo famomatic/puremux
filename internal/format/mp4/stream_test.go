@@ -3,9 +3,26 @@ package mp4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"testing"
 )
+
+type armedReadSeeker struct {
+	*bytes.Reader
+	armed bool
+}
+
+func (r *armedReadSeeker) Read(p []byte) (int, error) {
+	if r.armed {
+		r.armed = false
+		return 0, errors.New("transient read failure")
+	}
+	return r.Reader.Read(p)
+}
+
+var _ io.ReadSeeker = (*armedReadSeeker)(nil)
 
 // These tests exercise the streaming cursor paths that the original
 // resolveTrack also covered, but against multi-chunk / multi-stts inputs that
@@ -56,6 +73,30 @@ func TestStreamingMultiChunk(t *testing.T) {
 	}
 	if _, err := rd.NextSample(); err == nil {
 		t.Error("expected EOF after 3 samples")
+	}
+}
+
+func TestNextSampleDoesNotAdvanceAfterReadFailure(t *testing.T) {
+	sizes := []uint32{3}
+	trak := buildTrak("vp09", 1000, []sttsEntry{{count: 1, delta: 10}}, sizes, []stscEntry{{firstChunk: 1, samplesPerChunk: 1}}, []uint32{0}, []uint32{1})
+	data, off := buildMP4([][]byte{trak}, []byte{1, 2, 3})
+	trak = buildTrak("vp09", 1000, []sttsEntry{{count: 1, delta: 10}}, sizes, []stscEntry{{firstChunk: 1, samplesPerChunk: 1}}, []uint32{uint32(off)}, []uint32{1})
+	data, _ = buildMP4([][]byte{trak}, []byte{1, 2, 3})
+	rs := &armedReadSeeker{Reader: bytes.NewReader(data)}
+	rd, err := NewReader(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.armed = true
+	if _, err := rd.NextSample(); err == nil {
+		t.Fatal("expected transient read failure")
+	}
+	sample, err := rd.NextSample()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sample.Data, []byte{1, 2, 3}) {
+		t.Fatalf("retry skipped sample: %v", sample.Data)
 	}
 }
 

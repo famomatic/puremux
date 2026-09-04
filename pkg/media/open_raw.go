@@ -40,6 +40,9 @@ func openADTS(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 	if err != nil {
 		return nil, err
 	}
+	if size == 0 {
+		return nil, ErrInvalidData
+	}
 	var frames []audioFrameIndex
 	var header [7]byte
 	var pts int64
@@ -56,17 +59,20 @@ func openADTS(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 		if !ok || frame.SampleRate == 0 || frame.Channels == 0 || int64(frame.Length) > size-offset {
 			return nil, ErrInvalidData
 		}
-		parsed, err := aac.ParseADTS(append(header[:], make([]byte, frame.Length-7)...))
-		if err != nil {
-			return nil, err
+		headerLength := 7
+		if header[1]&1 == 0 {
+			headerLength = 9
+		}
+		if frame.Length < headerLength {
+			return nil, ErrInvalidData
 		}
 		if sampleRate == 0 {
 			sampleRate, channels = frame.SampleRate, frame.Channels
-			config = aac.Config{AudioObjectType: parsed.Profile, SampleRate: parsed.SampleRate, FrequencyIndex: parsed.FrequencyIndex, ChannelConfig: parsed.ChannelConfig}
+			config = aac.Config{AudioObjectType: int(header[2]>>6) + 1, SampleRate: frame.SampleRate, FrequencyIndex: int(header[2]>>2) & 0xf, ChannelConfig: frame.Channels}
 		} else if sampleRate != frame.SampleRate || channels != frame.Channels {
 			return nil, errors.New("media: ADTS configuration changed")
 		}
-		frames = append(frames, audioFrameIndex{offset: offset + int64(parsed.HeaderLength), size: frame.Length - parsed.HeaderLength, pts: pts, duration: int64(frame.Samples)})
+		frames = append(frames, audioFrameIndex{offset: offset + int64(headerLength), size: frame.Length - headerLength, pts: pts, duration: int64(frame.Samples)})
 		pts += int64(frame.Samples)
 		offset += int64(frame.Length)
 	}
@@ -78,6 +84,9 @@ func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demux
 	size, err := sourceSize(rs)
 	if err != nil {
 		return nil, err
+	}
+	if size == 0 {
+		return nil, ErrInvalidData
 	}
 	offset, metadata, err := readID3v2(rs, size)
 	if err != nil {
@@ -106,6 +115,9 @@ func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demux
 		frames = append(frames, audioFrameIndex{offset: offset, size: header.FrameLength, pts: pts, duration: int64(header.Samples)})
 		pts += int64(header.Samples)
 		offset += int64(header.FrameLength)
+	}
+	if len(frames) == 0 {
+		return nil, ErrInvalidData
 	}
 	return newIndexedAudio(src, rs, FormatMP3, CodecMP3, sampleRate, channels, nil, CodecConfigUnknown, frames, metadata, contextual), nil
 }
@@ -206,7 +218,6 @@ func (d *indexedAudioDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 		return nil, io.EOF
 	}
 	frame := d.frames[d.next]
-	d.next++
 	if _, err := d.rs.Seek(frame.offset, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -214,6 +225,7 @@ func (d *indexedAudioDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	if _, err := io.ReadFull(d.rs, data); err != nil {
 		return nil, err
 	}
+	d.next++
 	return &Packet{StreamIndex: 0, Data: data, PTS: KnownTimestamp(frame.pts), DTS: KnownTimestamp(frame.pts), Duration: KnownTimestamp(frame.duration), Flags: PacketKeyframe, Pos: frame.offset}, nil
 }
 func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
@@ -221,6 +233,12 @@ func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekRe
 	defer d.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return SeekResult{}, err
+	}
+	d.stateMu.Lock()
+	closed := d.closed
+	d.stateMu.Unlock()
+	if closed {
+		return SeekResult{}, ErrClosed
 	}
 	if req.StreamIndex != -1 && req.StreamIndex != 0 {
 		return SeekResult{}, errors.New("media: raw audio stream index out of range")
@@ -238,6 +256,9 @@ func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekRe
 		if !ok {
 			return SeekResult{}, ErrInvalidData
 		}
+	}
+	if len(d.frames) == 0 {
+		return SeekResult{}, ErrInvalidData
 	}
 	d.next = len(d.frames) - 1
 	if req.Flags&SeekBackward != 0 {

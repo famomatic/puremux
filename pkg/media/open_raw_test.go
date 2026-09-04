@@ -12,6 +12,22 @@ import (
 	flacbits "github.com/famomatic/puremux/pkg/bitstream/flac"
 )
 
+type flakyRawSource struct {
+	*bytes.Reader
+	fail bool
+}
+
+func (s *flakyRawSource) Read(p []byte) (int, error) {
+	if s.fail {
+		s.fail = false
+		return 0, errors.New("transient read failure")
+	}
+	return s.Reader.Read(p)
+}
+
+func (s *flakyRawSource) Close() error { return nil }
+func (s *flakyRawSource) Name() string { return "flaky.aac" }
+
 func TestOpenADTSRawPacketsAndSeek(t *testing.T) {
 	config := aac.Config{AudioObjectType: 2, SampleRate: 44100, FrequencyIndex: 4, ChannelConfig: 2}
 	first, _ := aac.WrapADTS(config, []byte{1, 2, 3})
@@ -135,6 +151,51 @@ func TestOpenRawMalformedBoundaries(t *testing.T) {
 				t.Fatal("malformed stream accepted")
 			}
 		})
+	}
+}
+
+func TestOpenRawRejectsEmptyHintedInputs(t *testing.T) {
+	for _, format := range []Format{FormatADTS, FormatMP3} {
+		if _, err := Open(context.Background(), MemorySource("empty", nil), OpenOptions{FormatHint: format}); !errors.Is(err, ErrInvalidData) {
+			t.Fatalf("format %v: error = %v, want ErrInvalidData", format, err)
+		}
+	}
+}
+
+func TestRawSeekAfterClose(t *testing.T) {
+	config := aac.Config{AudioObjectType: 2, SampleRate: 44100, FrequencyIndex: 4, ChannelConfig: 2}
+	frame, _ := aac.WrapADTS(config, []byte{1})
+	d, err := Open(context.Background(), MemorySource("closed.aac", frame), OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Seek(context.Background(), SeekRequest{StreamIndex: 0}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("seek after close = %v", err)
+	}
+}
+
+func TestRawReadFailureDoesNotAdvancePacket(t *testing.T) {
+	config := aac.Config{AudioObjectType: 2, SampleRate: 44100, FrequencyIndex: 4, ChannelConfig: 2}
+	frame, _ := aac.WrapADTS(config, []byte{1, 2, 3})
+	src := &flakyRawSource{Reader: bytes.NewReader(frame)}
+	d, err := Open(context.Background(), src, OpenOptions{FormatHint: FormatADTS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	src.fail = true
+	if _, err := d.ReadPacket(context.Background()); err == nil {
+		t.Fatal("expected transient read failure")
+	}
+	p, err := d.ReadPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(p.Data, []byte{1, 2, 3}) || p.PTS.Value != 0 {
+		t.Fatalf("retry skipped first packet: %+v", p)
 	}
 }
 
