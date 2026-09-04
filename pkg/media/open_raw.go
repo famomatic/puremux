@@ -293,10 +293,7 @@ func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekRe
 	if closed {
 		return SeekResult{}, ErrClosed
 	}
-	if req.StreamIndex != -1 && req.StreamIndex != 0 {
-		return SeekResult{}, errors.New("media: raw audio stream index out of range")
-	}
-	if err := validateSeekFlags(req.Flags); err != nil {
+	if err := validateSeekRequest(req, 1); err != nil {
 		return SeekResult{}, err
 	}
 	if d.contextual != nil {
@@ -335,7 +332,11 @@ func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekRe
 		actual = d.frames[d.next].pts
 	}
 	if req.StreamIndex == -1 {
-		actual, _ = d.stream.TimeBase.Rescale(actual, nanosecondTimeBase)
+		var ok bool
+		actual, ok = d.stream.TimeBase.Rescale(actual, nanosecondTimeBase)
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
 	}
 	return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 }

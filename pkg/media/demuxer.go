@@ -26,6 +26,16 @@ func validateSeekFlags(flags SeekFlags) error {
 	return nil
 }
 
+func validateSeekRequest(req SeekRequest, streamCount int) error {
+	if err := validateSeekFlags(req.Flags); err != nil {
+		return err
+	}
+	if req.StreamIndex < -1 || req.StreamIndex >= streamCount {
+		return errors.New("media: seek stream index out of range")
+	}
+	return nil
+}
+
 type SeekRequest struct {
 	// StreamIndex selects the time base for Target. -1 means the demuxer's
 	// global nanosecond time base (Rational{Num: 1, Den: 1e9}).

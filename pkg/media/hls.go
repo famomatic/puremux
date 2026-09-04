@@ -54,7 +54,8 @@ type hlsDemuxer struct {
 	current     Demuxer
 	currentSeg  manifest.HLSSegment
 	streams     []Stream
-	adjust      map[int]int64
+	shiftNS     int64
+	shiftSet    bool
 	baseNS      int64
 	firstPacket bool
 	initCache   map[string][]byte
@@ -139,41 +140,29 @@ func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	for {
 		p, err := d.current.ReadPacket(ctx)
 		if err == nil {
-			if d.adjust == nil {
-				d.adjust = make(map[int]int64)
-			}
 			stream := d.streams[p.StreamIndex]
-			shift, exists := d.adjust[p.StreamIndex]
-			if !exists {
-				baseTicks, ok := nanosecondTimeBase.Rescale(d.baseNS, stream.TimeBase)
-				if !ok {
-					p.Release()
-					return nil, ErrInvalidData
-				}
+			if !d.shiftSet {
 				anchor := int64(0)
 				if p.PTS.Valid {
 					anchor = p.PTS.Value
 				} else if p.DTS.Valid {
 					anchor = p.DTS.Value
 				}
-				shift = baseTicks - anchor
-				d.adjust[p.StreamIndex] = shift
-			}
-			if p.PTS.Valid {
-				adjusted, addOK := checkedAddInt64(p.PTS.Value, shift)
-				if !addOK {
+				anchorNS, ok := stream.TimeBase.Rescale(anchor, nanosecondTimeBase)
+				if !ok {
 					p.Release()
 					return nil, ErrInvalidData
 				}
-				p.PTS.Value = adjusted
-			}
-			if p.DTS.Valid {
-				adjusted, addOK := checkedAddInt64(p.DTS.Value, shift)
-				if !addOK {
+				d.shiftNS, ok = checkedSubInt64(d.baseNS, anchorNS)
+				if !ok {
 					p.Release()
 					return nil, ErrInvalidData
 				}
-				p.DTS.Value = adjusted
+				d.shiftSet = true
+			}
+			if err := shiftPacketTimestamps(p, stream.TimeBase, d.shiftNS); err != nil {
+				p.Release()
+				return nil, err
 			}
 			if d.firstPacket && d.currentSeg.Discontinuity {
 				p.Flags |= PacketDiscontinuity
@@ -214,17 +203,14 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if closed {
 		return SeekResult{}, ErrClosed
 	}
+	if err := validateSeekRequest(req, len(d.streams)); err != nil {
+		return SeekResult{}, err
+	}
 	if !d.playlist.EndList {
 		return SeekResult{}, ErrNotSeekable
 	}
-	if err := validateSeekFlags(req.Flags); err != nil {
-		return SeekResult{}, err
-	}
 	targetNS := req.Target
 	if req.StreamIndex >= 0 {
-		if req.StreamIndex >= len(d.streams) {
-			return SeekResult{}, errors.New("media: HLS stream index out of range")
-		}
 		var ok bool
 		targetNS, ok = d.streams[req.StreamIndex].TimeBase.Rescale(req.Target, nanosecondTimeBase)
 		if !ok {
@@ -256,9 +242,15 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if err != nil {
 		return SeekResult{}, err
 	}
-	actual := start + localResult.Timestamp
+	actual, ok := checkedAddInt64(start, localResult.Timestamp)
+	if !ok {
+		return SeekResult{}, ErrInvalidData
+	}
 	if req.StreamIndex >= 0 {
-		actual, _ = nanosecondTimeBase.Rescale(actual, d.streams[req.StreamIndex].TimeBase)
+		actual, ok = nanosecondTimeBase.Rescale(actual, d.streams[req.StreamIndex].TimeBase)
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
 	}
 	return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 }
@@ -389,7 +381,7 @@ func (d *hlsDemuxer) openSegment(ctx context.Context, index int) error {
 		_ = demuxer.Close()
 		return errors.New("hls: stream configuration changed without a supported transition")
 	}
-	d.current, d.currentSeg, d.adjust, d.firstPacket = demuxer, segment, nil, true
+	d.current, d.currentSeg, d.shiftNS, d.shiftSet, d.firstPacket = demuxer, segment, 0, false, true
 	return nil
 }
 
@@ -542,6 +534,38 @@ func checkedAddInt64(a, b int64) (int64, bool) {
 		return 0, false
 	}
 	return a + b, true
+}
+
+func checkedSubInt64(a, b int64) (int64, bool) {
+	if b == math.MinInt64 {
+		if a >= 0 {
+			return 0, false
+		}
+		return a - b, true
+	}
+	return checkedAddInt64(a, -b)
+}
+
+func shiftPacketTimestamps(packet *Packet, timeBase Rational, shiftNS int64) error {
+	shift, ok := nanosecondTimeBase.Rescale(shiftNS, timeBase)
+	if !ok {
+		return ErrInvalidData
+	}
+	if packet.PTS.Valid {
+		adjusted, ok := checkedAddInt64(packet.PTS.Value, shift)
+		if !ok {
+			return ErrInvalidData
+		}
+		packet.PTS.Value = adjusted
+	}
+	if packet.DTS.Valid {
+		adjusted, ok := checkedAddInt64(packet.DTS.Value, shift)
+		if !ok {
+			return ErrInvalidData
+		}
+		packet.DTS.Value = adjusted
+	}
+	return nil
 }
 
 var _ Demuxer = (*hlsDemuxer)(nil)

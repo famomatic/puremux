@@ -74,7 +74,7 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 	if err := ctx.Err(); err != nil {
 		return SeekResult{}, err
 	}
-	if err := validateSeekFlags(req.Flags); err != nil {
+	if err := validateSeekRequest(req, len(d.streams)); err != nil {
 		return SeekResult{}, err
 	}
 	index := req.StreamIndex
@@ -86,9 +86,6 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 				break
 			}
 		}
-	}
-	if index >= len(d.streams) {
-		return SeekResult{}, errors.New("media: MPEG-TS stream index out of range")
 	}
 	target := req.Target
 	if req.StreamIndex < 0 {
@@ -103,7 +100,11 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 		return SeekResult{}, err
 	}
 	if req.StreamIndex < 0 {
-		actual, _ = d.streams[index].TimeBase.Rescale(actual, nanosecondTimeBase)
+		var ok bool
+		actual, ok = d.streams[index].TimeBase.Rescale(actual, nanosecondTimeBase)
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
 	}
 	return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/famomatic/puremux/pkg/bitstream/aac"
+	puremuxfacade "github.com/famomatic/puremux/pkg/puremux"
 )
 
 func TestOpenHLSMasterAES128DiscontinuityAndSeek(t *testing.T) {
@@ -106,6 +107,63 @@ func TestHLSLivePlaylistRefresh(t *testing.T) {
 	second, err := d.ReadPacket(context.Background())
 	if err != nil || second.Data[0] != 1 || second.PTS.Value != 48000 || manifestRequests.Load() != 2 {
 		t.Fatalf("second=%+v requests=%d err=%v", second, manifestRequests.Load(), err)
+	}
+}
+
+func TestHLSPreservesCrossTrackTimestampOffset(t *testing.T) {
+	var segment bytes.Buffer
+	session, err := puremuxfacade.NewSession(&segment, puremuxfacade.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	video, err := session.AddTrack(puremuxfacade.Track{Codec: puremuxfacade.CodecVP9, IsVideo: true, Width: 16, Height: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	audio, err := session.AddTrack(puremuxfacade.Track{Codec: puremuxfacade.CodecOpus, Channels: 2, SampleRate: 48000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// VP9's uncompressed header is LSB-first: 0x82 is a shown profile-0
+	// key frame. The Opus payload is one RFC 6716 TOC-only 20 ms packet.
+	if err := session.WritePacket(&puremuxfacade.Packet{TrackID: video, PTS: 0, DTS: 0, Data: []byte{0x82}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WritePacket(&puremuxfacade.Packet{TrackID: audio, PTS: 20 * time.Millisecond, DTS: 20 * time.Millisecond, Data: []byte{0xf8}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.m3u8":
+			fmt.Fprint(w, "#EXTM3U\n#EXTINF:1,\nsegment.webm\n#EXT-X-ENDLIST\n")
+		case "/segment.webm":
+			_, _ = w.Write(segment.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	demuxer, err := OpenHLS(context.Background(), server.URL+"/index.m3u8", HLSOptions{Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer demuxer.Close()
+	first, err := demuxer.ReadPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	second, err := demuxer.ReadPacket(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if first.StreamIndex != 0 || first.PTS.Value != 0 || second.StreamIndex != 1 || second.PTS.Value != int64(20*time.Millisecond) {
+		t.Fatalf("shifted packets = stream/PTS %d/%d then %d/%d", first.StreamIndex, first.PTS.Value, second.StreamIndex, second.PTS.Value)
 	}
 }
 

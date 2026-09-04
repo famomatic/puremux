@@ -251,7 +251,7 @@ func (d *webMDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 		return SeekResult{}, ErrClosed
 	}
 	d.stateMu.Unlock()
-	if err := validateSeekFlags(req.Flags); err != nil {
+	if err := validateSeekRequest(req, len(d.streams)); err != nil {
 		return SeekResult{}, err
 	}
 	if d.contextual != nil {
@@ -260,9 +260,6 @@ func (d *webMDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	targetNS := req.Target
 	trackNumber := -1
 	if req.StreamIndex >= 0 {
-		if req.StreamIndex >= len(d.streams) {
-			return SeekResult{}, fmt.Errorf("media: stream index %d out of range", req.StreamIndex)
-		}
 		var ok bool
 		targetNS, ok = d.streams[req.StreamIndex].TimeBase.Rescale(req.Target, nanosecondTimeBase)
 		if !ok {
@@ -288,7 +285,11 @@ func (d *webMDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	actualNS := int64(actualTicks * metadata.TimestampScaleNS)
 	result := SeekResult{StreamIndex: req.StreamIndex, Timestamp: actualNS}
 	if req.StreamIndex >= 0 {
-		result.Timestamp, _ = nanosecondTimeBase.Rescale(actualNS, d.streams[req.StreamIndex].TimeBase)
+		var ok bool
+		result.Timestamp, ok = nanosecondTimeBase.Rescale(actualNS, d.streams[req.StreamIndex].TimeBase)
+		if !ok {
+			return SeekResult{}, errors.New("media: seek result overflow")
+		}
 	}
 	return result, nil
 }

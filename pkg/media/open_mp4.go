@@ -135,7 +135,7 @@ func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if err := d.ready(ctx); err != nil {
 		return SeekResult{}, err
 	}
-	if err := validateSeekFlags(req.Flags); err != nil {
+	if err := validateSeekRequest(req, len(d.streams)); err != nil {
 		return SeekResult{}, err
 	}
 	index := req.StreamIndex
@@ -147,9 +147,6 @@ func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 				break
 			}
 		}
-	}
-	if index >= len(d.streams) {
-		return SeekResult{}, errors.New("media: MP4 stream index out of range")
 	}
 	targetNS := req.Target
 	if req.StreamIndex >= 0 {
@@ -172,7 +169,11 @@ func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	}
 	result := SeekResult{StreamIndex: req.StreamIndex, Timestamp: actualNS}
 	if req.StreamIndex >= 0 {
-		result.Timestamp, _ = nanosecondTimeBase.Rescale(actualNS, d.streams[index].TimeBase)
+		var ok bool
+		result.Timestamp, ok = nanosecondTimeBase.Rescale(actualNS, d.streams[index].TimeBase)
+		if !ok {
+			return SeekResult{}, errors.New("media: MP4 seek result overflow")
+		}
 	}
 	return result, nil
 }

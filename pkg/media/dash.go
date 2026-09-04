@@ -46,7 +46,8 @@ type dashDemuxer struct {
 	next             int
 	current          Demuxer
 	streams          []Stream
-	adjust           map[int]int64
+	shiftNS          int64
+	shiftSet         bool
 	init             []byte
 	root             context.Context
 	cancel           context.CancelFunc
@@ -169,41 +170,34 @@ func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	for {
 		p, err := d.current.ReadPacket(ctx)
 		if err == nil {
-			if d.adjust == nil {
-				d.adjust = make(map[int]int64)
-			}
 			stream := d.streams[p.StreamIndex]
-			shift, exists := d.adjust[p.StreamIndex]
-			if !exists {
-				baseTicks, ok := nanosecondTimeBase.Rescale(int64(d.representation.Segments[d.next].Start), stream.TimeBase)
-				if !ok {
-					p.Release()
-					return nil, ErrInvalidData
-				}
+			if !d.shiftSet {
 				anchor := int64(0)
 				if p.PTS.Valid {
 					anchor = p.PTS.Value
 				} else if p.DTS.Valid {
 					anchor = p.DTS.Value
 				}
-				shift = baseTicks - anchor
-				d.adjust[p.StreamIndex] = shift
-			}
-			if p.PTS.Valid {
-				adjusted, addOK := checkedAddInt64(p.PTS.Value, shift)
-				if !addOK {
+				anchorNS, ok := stream.TimeBase.Rescale(anchor, nanosecondTimeBase)
+				if !ok {
 					p.Release()
 					return nil, ErrInvalidData
 				}
-				p.PTS.Value = adjusted
-			}
-			if p.DTS.Valid {
-				adjusted, addOK := checkedAddInt64(p.DTS.Value, shift)
-				if !addOK {
+				start := d.representation.Segments[d.next].Start
+				if start > math.MaxInt64 {
 					p.Release()
 					return nil, ErrInvalidData
 				}
-				p.DTS.Value = adjusted
+				d.shiftNS, ok = checkedSubInt64(int64(start), anchorNS)
+				if !ok {
+					p.Release()
+					return nil, ErrInvalidData
+				}
+				d.shiftSet = true
+			}
+			if err := shiftPacketTimestamps(p, stream.TimeBase, d.shiftNS); err != nil {
+				p.Release()
+				return nil, err
 			}
 			return p, nil
 		}
@@ -230,17 +224,14 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	if closed {
 		return SeekResult{}, ErrClosed
 	}
+	if err := validateSeekRequest(req, len(d.streams)); err != nil {
+		return SeekResult{}, err
+	}
 	if d.dynamic {
 		return SeekResult{}, ErrNotSeekable
 	}
-	if err := validateSeekFlags(req.Flags); err != nil {
-		return SeekResult{}, err
-	}
 	targetNS := req.Target
 	if req.StreamIndex >= 0 {
-		if req.StreamIndex >= len(d.streams) {
-			return SeekResult{}, errors.New("media: DASH stream index out of range")
-		}
 		var ok bool
 		targetNS, ok = d.streams[req.StreamIndex].TimeBase.Rescale(req.Target, nanosecondTimeBase)
 		if !ok {
@@ -271,9 +262,15 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	if err != nil {
 		return SeekResult{}, err
 	}
-	actual := start + localResult.Timestamp
+	actual, ok := checkedAddInt64(start, localResult.Timestamp)
+	if !ok {
+		return SeekResult{}, ErrInvalidData
+	}
 	if req.StreamIndex >= 0 {
-		actual, _ = nanosecondTimeBase.Rescale(actual, d.streams[req.StreamIndex].TimeBase)
+		actual, ok = nanosecondTimeBase.Rescale(actual, d.streams[req.StreamIndex].TimeBase)
+		if !ok {
+			return SeekResult{}, ErrInvalidData
+		}
 	}
 	return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 }
@@ -337,7 +334,7 @@ func (d *dashDemuxer) openSegment(ctx context.Context, index int) error {
 		_ = demuxer.Close()
 		return errors.New("dash: representation stream configuration changed")
 	}
-	d.current, d.adjust = demuxer, nil
+	d.current, d.shiftNS, d.shiftSet = demuxer, 0, false
 	return nil
 }
 

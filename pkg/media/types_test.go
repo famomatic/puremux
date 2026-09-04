@@ -165,3 +165,20 @@ func TestMemorySourceCapabilitiesAndClose(t *testing.T) {
 		t.Fatalf("read after Close error = %v, want ErrClosed", err)
 	}
 }
+
+func TestValidateSeekRequestBounds(t *testing.T) {
+	for _, req := range []SeekRequest{
+		{StreamIndex: -2},
+		{StreamIndex: 2},
+		{StreamIndex: -1, Flags: SeekFlags(0x80)},
+	} {
+		if err := validateSeekRequest(req, 2); err == nil {
+			t.Fatalf("accepted invalid seek request: %+v", req)
+		}
+	}
+	for _, index := range []int{-1, 0, 1} {
+		if err := validateSeekRequest(SeekRequest{StreamIndex: index}, 2); err != nil {
+			t.Fatalf("rejected stream index %d: %v", index, err)
+		}
+	}
+}

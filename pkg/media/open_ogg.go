@@ -98,10 +98,7 @@ func (d *oggDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 		return SeekResult{}, ErrClosed
 	}
 	d.stateMu.Unlock()
-	if req.StreamIndex != -1 && req.StreamIndex != 0 {
-		return SeekResult{}, errors.New("media: Ogg stream index out of range")
-	}
-	if err := validateSeekFlags(req.Flags); err != nil {
+	if err := validateSeekRequest(req, 1); err != nil {
 		return SeekResult{}, err
 	}
 	if d.contextual != nil {
@@ -121,7 +118,11 @@ func (d *oggDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	}
 	result := SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}
 	if req.StreamIndex == -1 {
-		result.Timestamp, _ = opusTimeBase.Rescale(actual, nanosecondTimeBase)
+		var ok bool
+		result.Timestamp, ok = opusTimeBase.Rescale(actual, nanosecondTimeBase)
+		if !ok {
+			return SeekResult{}, errors.New("media: Ogg seek result overflow")
+		}
 	}
 	return result, nil
 }
