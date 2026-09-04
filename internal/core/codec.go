@@ -1,5 +1,7 @@
 package core
 
+import "sync"
+
 // CodecKeyframeDetector inspects a compressed payload's packet header bytes
 // to report whether the packet holds a sync (key) frame.
 //
@@ -36,6 +38,7 @@ type CodecConfigOnlyDetector interface {
 // DetectorRegistry maps a CodecType to its keyframe detector. It is the only
 // sanctioned lookup path for codec-specific header inspection.
 type DetectorRegistry struct {
+	mu        sync.RWMutex
 	detectors map[CodecType]CodecKeyframeDetector
 }
 
@@ -58,6 +61,8 @@ func NewDetectorRegistry() *DetectorRegistry {
 // Register associates a codec with a detector. Calling with a nil detector
 // clears the mapping for that codec.
 func (r *DetectorRegistry) Register(c CodecType, d CodecKeyframeDetector) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if d == nil {
 		delete(r.detectors, c)
 		return
@@ -68,6 +73,8 @@ func (r *DetectorRegistry) Register(c CodecType, d CodecKeyframeDetector) {
 // Detector returns the detector for the codec, or a noopDetector if none is
 // registered. The returned detector is safe to call on empty/nil data.
 func (r *DetectorRegistry) Detector(c CodecType) CodecKeyframeDetector {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if d, ok := r.detectors[c]; ok {
 		return d
 	}

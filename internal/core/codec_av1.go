@@ -14,21 +14,22 @@ type av1Detector struct{}
 
 // OBU types (AV1 spec, obu_type).
 const (
-	obuSequenceHeader = 1
-	obuTemporalDelimiter = 2
-	obuFrameHeader = 3
-	obuTileGroup = 4
-	obuMetadata = 5
-	obuFrame = 6
+	obuSequenceHeader       = 1
+	obuTemporalDelimiter    = 2
+	obuFrameHeader          = 3
+	obuTileGroup            = 4
+	obuMetadata             = 5
+	obuFrame                = 6
 	obuRedundantFrameHeader = 7
 )
 
 func (av1Detector) IsKeyframe(data []byte) bool {
 	off := 0
+	reducedStillPicture := false
 	for off < len(data) {
 		h := data[off]
 		// obu_header: [7] forbidden (must be 0), [6:3] obu_type, [2] obu_extension_flag, [1] obu_has_size_field, [0] reserved.
-		if h&0x80 != 0 {
+		if h&0x81 != 0 {
 			// forbidden bit set: malformed OBU.
 			return false
 		}
@@ -38,10 +39,10 @@ func (av1Detector) IsKeyframe(data []byte) bool {
 
 		// optional extension byte
 		if (h>>2)&0x01 == 1 {
-			off++ // skip obu_extension_header
-			if off > len(data) {
+			if off >= len(data) || data[off]&0x07 != 0 {
 				return false
 			}
+			off++ // skip validated obu_extension_header
 		}
 
 		var payloadLen int
@@ -54,6 +55,9 @@ func (av1Detector) IsKeyframe(data []byte) bool {
 				return false
 			}
 			off += n
+			if size > uint64(len(data)-off) {
+				return false
+			}
 			payloadLen = int(size)
 		} else {
 			payloadLen = len(data) - off
@@ -64,7 +68,16 @@ func (av1Detector) IsKeyframe(data []byte) bool {
 		}
 
 		switch obuType {
+		case obuSequenceHeader:
+			if payloadLen < 1 {
+				return false
+			}
+			// seq_profile(3), still_picture(1), reduced_still_picture_header(1).
+			reducedStillPicture = data[off]&0x08 != 0
 		case obuFrameHeader, obuFrame, obuRedundantFrameHeader:
+			if reducedStillPicture {
+				return payloadLen > 0
+			}
 			return isAV1FrameHeaderKeyframe(data[off : off+payloadLen])
 		}
 

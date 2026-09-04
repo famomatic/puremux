@@ -7,9 +7,8 @@ package core
 type vp8Detector struct{}
 
 func (vp8Detector) IsKeyframe(data []byte) bool {
-	if len(data) < 1 {
+	if len(data) < 3 || data[0]&0x01 != 0 {
 		return false
 	}
-	// frame_type occupies bit 0 of the first tag byte; 0 => keyframe.
-	return data[0]&0x01 == 0
+	return len(data) >= 10 && data[3] == 0x9d && data[4] == 0x01 && data[5] == 0x2a
 }

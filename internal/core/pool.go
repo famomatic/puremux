@@ -2,6 +2,8 @@ package core
 
 import "sync"
 
+const maxPooledPacketCapacity = 1 << 20
+
 // packetPool reuses *Packet values to keep allocation off the hot path
 // (ARCHITECTURE.md section 5.A). The Data backing array is retained across
 // reuses via Reset; callers MUST NOT hold references to a returned packet.
@@ -21,6 +23,9 @@ func AcquirePacket() *Packet {
 func ReleasePacket(p *Packet) {
 	if p == nil {
 		return
+	}
+	if cap(p.Data) > maxPooledPacketCapacity {
+		p.Data = nil
 	}
 	packetPool.Put(p)
 }

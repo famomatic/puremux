@@ -26,6 +26,17 @@ func TestReleaseNilSafe(t *testing.T) {
 	ReleasePacket(nil)
 }
 
+func TestReleaseDropsOversizedBackingArray(t *testing.T) {
+	p := AcquirePacket()
+	p.Data = make([]byte, 1, maxPooledPacketCapacity+1)
+	ReleasePacket(p)
+	q := AcquirePacket()
+	if cap(q.Data) > maxPooledPacketCapacity {
+		t.Fatalf("oversized capacity retained: %d", cap(q.Data))
+	}
+	ReleasePacket(q)
+}
+
 func TestTrackClassification(t *testing.T) {
 	v := Track{Kind: TrackVideo, Codec: CodecVP9}
 	a := Track{Kind: TrackAudio, Codec: CodecOpus}

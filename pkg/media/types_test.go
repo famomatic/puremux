@@ -7,6 +7,8 @@ import (
 	"math"
 	"math/big"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -111,6 +113,23 @@ func TestPacketReleaseIsIdempotent(t *testing.T) {
 	p.Release()
 	if called != 1 || p.Data != nil {
 		t.Fatalf("called=%d data=%v", called, p.Data)
+	}
+}
+
+func TestPacketReleaseIsConcurrentSafe(t *testing.T) {
+	var called atomic.Int32
+	p := &Packet{Data: []byte{1}, release: func([]byte) { called.Add(1) }}
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.Release()
+		}()
+	}
+	wg.Wait()
+	if called.Load() != 1 {
+		t.Fatalf("release callback called %d times", called.Load())
 	}
 }
 

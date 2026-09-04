@@ -45,14 +45,18 @@ func TestPacketReset(t *testing.T) {
 func TestVP8Detector(t *testing.T) {
 	d := vp8Detector{}
 	// RFC 6386 9.1: bit0 of frame tag = frame_type, 0 = keyframe.
-	if !d.IsKeyframe([]byte{0x00, 0x00, 0x00}) {
-		t.Error("0x00 should be VP8 keyframe")
+	key := []byte{0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00}
+	if !d.IsKeyframe(key) {
+		t.Error("spec-shaped VP8 key frame was not detected")
 	}
 	if d.IsKeyframe([]byte{0x01, 0x00, 0x00}) {
 		t.Error("0x01 should be VP8 interframe")
 	}
 	if d.IsKeyframe(nil) {
 		t.Error("nil should not be keyframe")
+	}
+	if d.IsKeyframe([]byte{0x00}) || d.IsKeyframe([]byte{0x00, 0x00, 0x00, 0, 0, 0}) {
+		t.Error("truncated or bad-sync VP8 data must not be a keyframe")
 	}
 }
 
@@ -95,6 +99,9 @@ func TestVP9DetectorProfile3(t *testing.T) {
 	// show_existing_frame references a prior frame, not a sync frame.
 	if d.IsKeyframe([]byte{0xB4}) {
 		t.Error("profile 3 show_existing_frame (0xB4) should not be keyframe")
+	}
+	if d.IsKeyframe([]byte{0xB8}) {
+		t.Error("profile 3 reserved_zero=1 must be rejected")
 	}
 }
 
@@ -174,6 +181,30 @@ func TestAV1DetectorSequenceHeaderOnly(t *testing.T) {
 	pkt := []byte{obuHeader(obuSequenceHeader), 0x01, 0x00}
 	if d.IsKeyframe(pkt) {
 		t.Error("AV1 packet without frame header should not report keyframe")
+	}
+}
+
+func TestAV1DetectorReducedStillPictureHeader(t *testing.T) {
+	d := av1Detector{}
+	// Sequence header first byte: seq_profile=000, still_picture=0,
+	// reduced_still_picture_header=1 (bit 3), MSB-first.
+	pkt := []byte{
+		obuHeader(obuSequenceHeader), 0x01, 0x08,
+		obuHeader(obuFrameHeader), 0x01, 0x00,
+	}
+	if !d.IsKeyframe(pkt) {
+		t.Fatal("reduced still picture is an implied key frame")
+	}
+}
+
+func TestAV1DetectorRejectsReservedBits(t *testing.T) {
+	d := av1Detector{}
+	if d.IsKeyframe([]byte{obuHeader(obuFrameHeader) | 1, 1, 0}) {
+		t.Fatal("OBU reserved bit accepted")
+	}
+	// Extension header low three bits are reserved_zero_3bits.
+	if d.IsKeyframe([]byte{obuHeader(obuFrameHeader) | 0x04, 0x01, 1, 0}) {
+		t.Fatal("OBU extension reserved bits accepted")
 	}
 }
 

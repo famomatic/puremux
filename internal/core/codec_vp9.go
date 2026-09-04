@@ -8,6 +8,7 @@ package core
 //   - bits[7:5] == 0b110  (marker)
 //   - bits[4:0] = number of frames - 1 (1..8 frames)
 //   - bytes[1 .. 1+sz]   = frame sizes, where sz = 1 << (byte & 0x03)
+//
 // When present, the actual frame headers start at offset 0 and the index
 // describes the sub-frame sizes. The keyframe flag lives in the first frame
 // tag at byte offset 0, bit 0: 0 = keyframe.
@@ -46,7 +47,8 @@ func (vp9Detector) IsKeyframe(data []byte) bool {
 	// profile == 3 carries one extra reserved_zero bit before
 	// show_existing_frame (VP9 spec section 9.2 "frame_header()").
 	if profile == 3 {
-		if _, _, ok := readBitsMSB(data, bitOff, 1); !ok {
+		reserved, _, ok := readBitsMSB(data, bitOff, 1)
+		if !ok || reserved != 0 {
 			return false
 		}
 		bitOff += 1

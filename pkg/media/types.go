@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"math/bits"
+	"sync/atomic"
 	"time"
 )
 
@@ -275,16 +276,15 @@ type Packet struct {
 	DiscardPadding time.Duration
 
 	release  func([]byte)
-	released bool
+	released atomic.Bool
 }
 
 func (p *Packet) Keyframe() bool { return p != nil && p.Flags&PacketKeyframe != 0 }
 
 func (p *Packet) Release() {
-	if p == nil || p.released {
+	if p == nil || !p.released.CompareAndSwap(false, true) {
 		return
 	}
-	p.released = true
 	data := p.Data
 	p.Data = nil
 	if p.release != nil {
