@@ -1,6 +1,7 @@
 package preprocessor
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -212,5 +213,65 @@ func TestEnforcerStableOrderForEqualDTS(t *testing.T) {
 	}
 	for _, p := range got {
 		core.ReleasePacket(p)
+	}
+}
+
+func TestEnforcerZeroDurationDisablesTimeFlush(t *testing.T) {
+	e := NewEnforcer(Config{MaxBufferSize: 4, MaxBufferDuration: 0})
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+	for _, dts := range []time.Duration{0, time.Second} {
+		p := core.AcquirePacket()
+		p.DTS = dts
+		p.PTS = dts
+		if err := e.Process(p, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(got) != 0 {
+		t.Fatalf("duration-disabled buffer emitted %d packets before Flush", len(got))
+	}
+	e.Flush(emit)
+	if len(got) != 2 {
+		t.Fatalf("Flush emitted %d packets, want 2", len(got))
+	}
+	for _, p := range got {
+		core.ReleasePacket(p)
+	}
+}
+
+func TestEnforcerTimestampSaturationDoesNotWrap(t *testing.T) {
+	e := NewEnforcer(Config{
+		MaxBufferSize:     4,
+		MaxBufferDuration: 1,
+		MinMonotonicStep:  math.MaxUint64,
+	})
+	var got []*core.Packet
+	emit := func(p *core.Packet) { got = append(got, p) }
+	for i := 0; i < 3; i++ {
+		p := core.AcquirePacket()
+		p.DTS = time.Duration(math.MaxInt64 - 1)
+		p.PTS = p.DTS
+		if err := e.Process(p, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.Flush(emit)
+	defer func() {
+		for _, p := range got {
+			core.ReleasePacket(p)
+		}
+	}()
+	if len(got) != 2 {
+		t.Fatalf("emitted %d packets, want 2 (unrepresentable third timestamp dropped)", len(got))
+	}
+	if got[0].DTS != time.Duration(math.MaxInt64-1) || got[1].DTS != time.Duration(math.MaxInt64) {
+		t.Fatalf("DTS values = [%v, %v], want MaxInt64-1 then MaxInt64", got[0].DTS, got[1].DTS)
+	}
+	if got[1].PTS != time.Duration(math.MaxInt64) {
+		t.Fatalf("saturated PTS = %v, want MaxInt64", got[1].PTS)
+	}
+	if e.Metrics().DroppedOutOfOrder != 1 {
+		t.Fatalf("DroppedOutOfOrder = %d, want 1", e.Metrics().DroppedOutOfOrder)
 	}
 }

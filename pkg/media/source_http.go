@@ -110,6 +110,15 @@ func (s *HTTPSource) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (s *HTTPSource) ReadAtContext(ctx context.Context, p []byte, off int64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.stateMu.Lock()
+	closed := s.closed
+	s.stateMu.Unlock()
+	if closed {
+		return 0, ErrClosed
+	}
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -231,8 +240,8 @@ func (s *HTTPSource) fetch(ctx context.Context, dst []byte, start, end int64) (i
 	if resp.StatusCode != http.StatusPartialContent {
 		return 0, fmt.Errorf("media: HTTP range read: %s", resp.Status)
 	}
-	if (s.etag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != s.etag) ||
-		(s.etag == "" && s.modified != "" && resp.Header.Get("Last-Modified") != "" && resp.Header.Get("Last-Modified") != s.modified) {
+	if (s.etag != "" && resp.Header.Get("ETag") != s.etag) ||
+		(s.etag == "" && s.modified != "" && resp.Header.Get("Last-Modified") != s.modified) {
 		return 0, ErrSourceChanged
 	}
 	gotStart, gotEnd, total, ok := parseContentRange(resp.Header.Get("Content-Range"))

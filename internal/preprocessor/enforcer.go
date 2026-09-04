@@ -1,6 +1,7 @@
 package preprocessor
 
 import (
+	"math"
 	"sort"
 	"time"
 
@@ -24,8 +25,11 @@ func NewEnforcer(cfg Config) *Enforcer {
 	if cfg.MaxBufferSize < 1 {
 		cfg.MaxBufferSize = 1
 	}
-	if cfg.MaxBufferDuration == 0 {
-		cfg.MaxBufferDuration = DefaultConfig().MaxBufferDuration
+	if cfg.MaxBufferDuration > math.MaxInt64 {
+		cfg.MaxBufferDuration = math.MaxInt64
+	}
+	if cfg.MinMonotonicStep > math.MaxInt64 {
+		cfg.MinMonotonicStep = math.MaxInt64
 	}
 	return &Enforcer{cfg: cfg}
 }
@@ -97,7 +101,10 @@ func (e *Enforcer) flushReady(emit func(*core.Packet)) {
 	i := 0
 	for i < len(e.buf)-1 { // never flush the newest via this path
 		p := e.buf[i]
-		if p.DTS+window > newest {
+		if window == 0 {
+			break
+		}
+		if p.DTS > time.Duration(math.MaxInt64)-window || p.DTS+window > newest {
 			break // still within the reorder window, hold
 		}
 		e.emitOne(p, emit)
@@ -141,13 +148,30 @@ func (e *Enforcer) emitOne(p *core.Packet, emit func(*core.Packet)) {
 		// timestamps after quantization. PTS is shifted by the same amount to
 		// preserve the packet's PTS-DTS offset (B-frame reorder delay).
 		if p.DTS <= e.lastDTS {
+			if e.lastDTS == time.Duration(math.MaxInt64) {
+				// There is no representable timestamp greater than MaxInt64.
+				// Dropping is safer than wrapping negative or emitting a duplicate.
+				e.metrics.DroppedOutOfOrder++
+				core.ReleasePacket(p)
+				return
+			}
 			step := time.Duration(e.cfg.MinMonotonicStep)
 			if step <= 0 {
 				step = 1
 			}
-			shift := e.lastDTS + step - p.DTS
-			p.DTS += shift
-			p.PTS += shift
+			target := e.lastDTS
+			if target <= time.Duration(math.MaxInt64)-step {
+				target += step
+			} else {
+				target = time.Duration(math.MaxInt64)
+			}
+			shift := target - p.DTS
+			p.DTS = target
+			if shift > 0 && p.PTS > time.Duration(math.MaxInt64)-shift {
+				p.PTS = time.Duration(math.MaxInt64)
+			} else {
+				p.PTS += shift
+			}
 		}
 	}
 	e.lastDTS = p.DTS

@@ -144,6 +144,9 @@ func TestHTTPSourceRetryCancellationChangeAndClose(t *testing.T) {
 	if _, err := source.ReadAt(make([]byte, 1), 0); !errors.Is(err, ErrClosed) {
 		t.Fatalf("read after close = %v", err)
 	}
+	if _, err := source.ReadAt(nil, 0); !errors.Is(err, ErrClosed) {
+		t.Fatalf("zero-length read after close = %v", err)
+	}
 
 	blocked := make(chan struct{})
 	cancelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -162,6 +165,11 @@ func TestHTTPSourceRetryCancellationChangeAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	readCtx, cancel := context.WithCancel(context.Background())
+	zeroCtx, cancelZero := context.WithCancel(context.Background())
+	cancelZero()
+	if _, err := cancelSource.ReadAtContext(zeroCtx, nil, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("zero-length canceled read = %v", err)
+	}
 	done := make(chan error, 1)
 	go func() {
 		_, err := cancelSource.ReadAtContext(readCtx, make([]byte, 1), 1)
@@ -182,6 +190,35 @@ func TestHTTPSourceRetryCancellationChangeAndClose(t *testing.T) {
 		t.Fatal("canceled read did not unblock")
 	}
 	_ = cancelSource.Close()
+}
+
+func TestHTTPSourceRejectsMissingValidatorAfterProbe(t *testing.T) {
+	data := []byte("ab")
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, ok := testRange(r.Header.Get("Range"))
+		if !ok {
+			t.Errorf("missing or invalid Range: %q", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if calls.Add(1) == 1 {
+			w.Header().Set("ETag", `"v1"`)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[start : end+1])
+	}))
+	defer server.Close()
+
+	source, err := OpenHTTP(context.Background(), server.URL, HTTPSourceOptions{Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if _, err := source.ReadAt(make([]byte, 1), 1); !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("read without probed ETag = %v, want ErrSourceChanged", err)
+	}
 }
 
 func testRange(value string) (int64, int64, bool) {
