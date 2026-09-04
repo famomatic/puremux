@@ -10,16 +10,16 @@ func TestVINTWidth(t *testing.T) {
 		b    byte
 		want int
 	}{
-		{0x80, 1},  // 1xxxxxxx
-		{0x40, 2},  // 01xxxxxx
-		{0x20, 3},  // 001xxxxx
-		{0x10, 4},  // 0001xxxx
+		{0x80, 1}, // 1xxxxxxx
+		{0x40, 2}, // 01xxxxxx
+		{0x20, 3}, // 001xxxxx
+		{0x10, 4}, // 0001xxxx
 		{0x08, 5},
 		{0x04, 6},
 		{0x02, 7},
-		{0x01, 8},  // 00000001 (marker occupies whole first byte)
-		{0x00, 0},  // invalid: no marker
-		{0xFF, 1},  // 1xxxxxxx (width 1, all data set)
+		{0x01, 8}, // 00000001 (marker occupies whole first byte)
+		{0x00, 0}, // invalid: no marker
+		{0xFF, 1}, // 1xxxxxxx (width 1, all data set)
 	}
 	for _, tc := range cases {
 		if got := VINTWidth(tc.b); got != tc.want {
@@ -147,6 +147,12 @@ func TestEncodeVINTOverflow(t *testing.T) {
 	if err != ErrVINTOverflow {
 		t.Errorf("width1 256 should overflow, got %v", err)
 	}
+	for width := 1; width <= MaxVINTWidth; width++ {
+		unknownValue := (uint64(1) << vintDataBits(width)) - 1
+		if _, err := EncodeVINTWidth(unknownValue, width); err != ErrVINTOverflow {
+			t.Fatalf("width %d all-ones value encoded as a known size: %v", width, err)
+		}
+	}
 }
 
 func TestEncodeVINTUnknownSize(t *testing.T) {
@@ -154,9 +160,9 @@ func TestEncodeVINTUnknownSize(t *testing.T) {
 		width int
 		want  []byte
 	}{
-		{1, []byte{0xFF}},                     // 1 + 1111111
-		{2, []byte{0x7F, 0xFF}},                // 01 + 111111 11111111
-		{4, []byte{0x1F, 0xFF, 0xFF, 0xFF}},    // 0001 + 1111 ...
+		{1, []byte{0xFF}},                   // 1 + 1111111
+		{2, []byte{0x7F, 0xFF}},             // 01 + 111111 11111111
+		{4, []byte{0x1F, 0xFF, 0xFF, 0xFF}}, // 0001 + 1111 ...
 		{8, []byte{0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
 	}
 	for _, tc := range cases {
@@ -178,8 +184,8 @@ func TestDecodeVINTInvalid(t *testing.T) {
 	cases := [][]byte{
 		nil,
 		{},
-		{0x00},            // no marker
-		{0x40},           // width 2 but truncated
+		{0x00},             // no marker
+		{0x40},             // width 2 but truncated
 		{0x10, 0x00, 0x00}, // width 4 truncated
 	}
 	for i, c := range cases {

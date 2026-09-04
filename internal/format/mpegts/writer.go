@@ -65,6 +65,8 @@ var ErrTrackAfterStart = errors.New("mpegts: AddTrack after first WritePacket")
 // ErrUnknownTrack is returned when a packet references an unregistered track.
 var ErrUnknownTrack = errors.New("mpegts: unknown track")
 
+const maxPMTTracks = 33
+
 type trackState struct {
 	track      core.Track
 	pid        uint16
@@ -101,6 +103,9 @@ func New(w io.Writer) *Muxer {
 func (m *Muxer) AddTrack(t core.Track) (int, error) {
 	if m.started {
 		return 0, ErrTrackAfterStart
+	}
+	if len(m.tracks) >= maxPMTTracks {
+		return 0, errors.New("mpegts: too many tracks for a single-packet PMT (max 33)")
 	}
 	var st byte
 	switch t.Codec {
@@ -240,8 +245,7 @@ func (m *Muxer) writeSection(pid uint16, cc *byte, sec []byte) error {
 	for len(pkt) < pktLen {
 		pkt = append(pkt, 0xFF)
 	}
-	_, err := m.w.Write(pkt[:pktLen])
-	return err
+	return writeFull(m.w, pkt[:pktLen])
 }
 
 // writePES packetizes one PES packet across TS packets. The first TS packet
@@ -304,12 +308,20 @@ func (m *Muxer) writePES(ts *trackState, pts, dts uint64, withPCR bool, payload 
 		for len(pkt) < pktLen {
 			pkt = append(pkt, 0xFF)
 		}
-		if _, err := m.w.Write(pkt[:pktLen]); err != nil {
+		if err := writeFull(m.w, pkt[:pktLen]); err != nil {
 			return err
 		}
 		first = false
 	}
 	return nil
+}
+
+func writeFull(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err == nil && n != len(p) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 // pesHeader builds a PES packet header. When pts != dts both are written

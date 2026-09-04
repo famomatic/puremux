@@ -2,6 +2,8 @@ package mpegts
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -375,5 +377,35 @@ func TestMuxerEmptyPayload(t *testing.T) {
 	_, es := collectPES(t, pkts, 0x100)
 	if len(es) != 0 {
 		t.Fatalf("empty AU produced %d ES bytes", len(es))
+	}
+}
+
+type tsShortWriter struct{}
+
+func (tsShortWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
+
+func TestMuxerSurfacesShortWrite(t *testing.T) {
+	m := New(tsShortWriter{})
+	vid, err := m.AddTrack(core.Track{ID: 1, Kind: core.TrackVideo, Codec: core.CodecH264})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.WritePacket(&core.Packet{TrackID: vid, Data: []byte{1}}); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short write = %v", err)
+	}
+}
+
+func TestMuxerBoundsPMTTrackCount(t *testing.T) {
+	m := New(io.Discard)
+	if _, err := m.AddTrack(core.Track{ID: 1, Kind: core.TrackVideo, Codec: core.CodecH264}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 32; i++ {
+		if _, err := m.AddTrack(core.Track{ID: i + 2, Kind: core.TrackAudio, Codec: core.CodecAAC}); err != nil {
+			t.Fatalf("track %d: %v", i+2, err)
+		}
+	}
+	if _, err := m.AddTrack(core.Track{ID: 34, Kind: core.TrackVideo, Codec: core.CodecH264}); err == nil {
+		t.Fatal("34th track exceeded single-packet PMT capacity")
 	}
 }

@@ -78,6 +78,7 @@ func WriteEBMLHeaderFor(w io.Writer, doctype string) error {
 	}
 	return writeElement(w, idEBML, buf.Bytes())
 }
+
 // WriteEBMLHeader writes the EBML header element (id 0x1A45DFA3) wrapping
 // the WebM doctype declaration. The children are buffered so the master
 // element can be written with a known size up front.
@@ -157,7 +158,11 @@ func WriteInfo(ws writeSeeker, h *Header, timecodeScale uint64, now time.Time) e
 		h.HasDuration = true
 	}
 	// Record the Info element start (absolute) before writing its header.
-	h.InfoStart, _ = ws.Seek(0, io.SeekCurrent)
+	var err error
+	h.InfoStart, err = ws.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
 	// Write Info element: id + size + buf bytes.
 	if err := writeID(ws, idInfo); err != nil {
 		return err
@@ -167,7 +172,10 @@ func WriteInfo(ws writeSeeker, h *Header, timecodeScale uint64, now time.Time) e
 	}
 	// Record Duration payload offset if applicable.
 	if h.HasDuration {
-		cur, _ := ws.Seek(0, io.SeekCurrent)
+		cur, err := ws.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
 		// Duration payload is the last 8 bytes of buf; its absolute offset
 		// is cur + (buf.Len() - 8).
 		h.DurationPayloadOff = cur + int64(buf.Len()-8)

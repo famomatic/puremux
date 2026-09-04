@@ -12,9 +12,9 @@ import (
 // target duration.
 type ClusterWriter struct {
 	w         writeSeeker
-	startOff  int64 // offset of Cluster ID
-	sizeOff   int64 // offset of reserved size VINT
-	sizeWidth int   // width of reserved size VINT (0 if streaming/unknown)
+	startOff  int64  // offset of Cluster ID
+	sizeOff   int64  // offset of reserved size VINT
+	sizeWidth int    // width of reserved size VINT (0 if streaming/unknown)
 	tc        uint64 // cluster absolute timecode (ms)
 	open      bool
 	firstBlk  bool
@@ -33,11 +33,18 @@ func BeginCluster(ws writeSeeker, seekable bool, absTimecodeMs uint64) (*Cluster
 		firstBlk:  true,
 		streaming: !seekable,
 	}
-	cw.startOff, _ = ws.Seek(0, io.SeekCurrent)
+	var err error
+	cw.startOff, err = ws.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
 	if err := writeID(ws, idCluster); err != nil {
 		return nil, err
 	}
-	cw.sizeOff, _ = ws.Seek(0, io.SeekCurrent)
+	cw.sizeOff, err = ws.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
 	if seekable {
 		// reserve 4-byte size (clusters are bounded; 4 bytes = 28 data bits).
 		if err := writeSizeWidth(ws, 0, 4); err != nil {

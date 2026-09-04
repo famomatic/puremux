@@ -3,8 +3,18 @@ package ebml
 import (
 	"bytes"
 	"encoding/hex"
+	"math"
 	"testing"
 )
+
+func TestPatchSizeRejectsIntegerOverflowBounds(t *testing.T) {
+	if err := PatchSize(make([]byte, 8), math.MaxInt, 2, 1); err != ErrShortInput {
+		t.Fatalf("overflowing offset = %v", err)
+	}
+	if err := PatchSize(make([]byte, 8), 0, 0, 1); err != ErrShortInput {
+		t.Fatalf("zero width = %v", err)
+	}
+}
 
 func TestReadHeader(t *testing.T) {
 	// Cluster (0x1F43B675) + size VINT 0x85 (value 5) + 5 payload bytes.
@@ -46,10 +56,10 @@ func TestPatchSize(t *testing.T) {
 	// Reserve a 4-byte size VINT (0x10 00 00 00 = value 0), then patch to 0x1234567.
 	// Element: Cluster ID + reserved 4-byte size + payload.
 	dst := make([]byte, 0, 8)
-	dst = append(dst, 0x1F, 0x43, 0xB6, 0x75)        // Cluster ID
-	reserved, _ := EncodeVINTWidth(0, 4)              // 0x10 0x00 0x00 0x00
+	dst = append(dst, 0x1F, 0x43, 0xB6, 0x75) // Cluster ID
+	reserved, _ := EncodeVINTWidth(0, 4)      // 0x10 0x00 0x00 0x00
 	dst = append(dst, reserved...)
-	dst = append(dst, 0xAA, 0xBB, 0xCC, 0xDD)         // payload placeholder
+	dst = append(dst, 0xAA, 0xBB, 0xCC, 0xDD) // payload placeholder
 
 	// Patch the size at offset 4 (after the 4-byte ID), width 4, to 0x1234567.
 	if err := PatchSize(dst, 4, 4, 0x1234567); err != nil {
@@ -85,9 +95,9 @@ func TestPatchSizeBounds(t *testing.T) {
 
 func TestReadHeaderTruncated(t *testing.T) {
 	cases := [][]byte{
-		{},                         // no ID
-		{0x1F, 0x43, 0xB6},        // partial ID
-		{0x1F, 0x43, 0xB6, 0x75}, // ID but no size
+		{},                             // no ID
+		{0x1F, 0x43, 0xB6},             // partial ID
+		{0x1F, 0x43, 0xB6, 0x75},       // ID but no size
 		{0x1F, 0x43, 0xB6, 0x75, 0x85}, // size but no payload (ReadHeader stops before payload)
 	}
 	for i, c := range cases {

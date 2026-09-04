@@ -116,7 +116,7 @@ func EncodeVINTWidth(val uint64, width int) ([]byte, error) {
 		return nil, ErrVINTInvalid
 	}
 	dataBits := vintDataBits(width)
-	if val>>dataBits != 0 {
+	if val>>dataBits != 0 || val == (uint64(1)<<dataBits)-1 {
 		return nil, ErrVINTOverflow
 	}
 	out := make([]byte, width)
@@ -161,7 +161,7 @@ func DecodeVINT(src []byte) (val uint64, width int, err error) {
 	//   width 2 => 0xFF>>2 = 0x3F (6 bits)  correct
 	mask := byte(0xFF >> uint(w))
 	var v uint64
-	v |= uint64(src[0] & mask) << uint(8*(w-1))
+	v |= uint64(src[0]&mask) << uint(8*(w-1))
 	for i := 1; i < w; i++ {
 		v |= uint64(src[i]) << uint(8*(w-1-i))
 	}

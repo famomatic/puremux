@@ -55,8 +55,14 @@ func WriteTracks(w io.Writer, tracks []TrackSpec) (int64, error) {
 	}
 	// Record start offset if w is a seeker; otherwise 0.
 	start := int64(0)
-	if ws, ok := w.(interface{ Seek(int64, int) (int64, error) }); ok {
-		start, _ = ws.Seek(0, io.SeekCurrent)
+	if ws, ok := w.(interface {
+		Seek(int64, int) (int64, error)
+	}); ok {
+		var err error
+		start, err = ws.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if err := writeID(w, idTracks); err != nil {
 		return 0, err

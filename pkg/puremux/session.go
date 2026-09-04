@@ -186,6 +186,9 @@ func (s *Session) AddTrack(t Track) (int, error) {
 		return 0, errors.New("puremux: invalid track dimensions or audio parameters")
 	}
 	num := len(s.tracks) + 1
+	if num > 16383 {
+		return 0, errors.New("puremux: too many tracks for Matroska Block track number")
+	}
 	spec := webm.TrackSpec{
 		Number:       uint64(num),
 		UID:          uint64(num),

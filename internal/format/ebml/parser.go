@@ -75,7 +75,7 @@ func ReadHeader(r io.Reader) (Header, error) {
 // This is the core primitive for the muxer's graceful closer: reserve a
 // fixed-width size VINT up front, then patch it with the real size on Close.
 func PatchSize(dst []byte, offset, width int, newSize uint64) error {
-	if offset < 0 || offset+width > len(dst) {
+	if offset < 0 || width < 1 || width > len(dst) || offset > len(dst)-width {
 		return ErrShortInput
 	}
 	enc, err := EncodeVINTWidth(newSize, width)
