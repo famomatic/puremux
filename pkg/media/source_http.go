@@ -39,8 +39,10 @@ type HTTPSource struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
-	posMu sync.Mutex
-	pos   int64
+	posMu           sync.Mutex
+	pos             int64
+	readAhead       []byte
+	readAheadOffset int64
 }
 
 // OpenHTTP verifies byte-range support with a one-byte request. client is
@@ -100,9 +102,45 @@ func (s *HTTPSource) Read(p []byte) (int, error) {
 func (s *HTTPSource) ReadContext(ctx context.Context, p []byte) (int, error) {
 	s.posMu.Lock()
 	defer s.posMu.Unlock()
-	n, err := s.ReadAtContext(ctx, p, s.pos)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.stateMu.Lock()
+	closed := s.closed
+	s.stateMu.Unlock()
+	if closed {
+		return 0, ErrClosed
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	const readAheadSize = 32 << 10
+	if len(p) >= readAheadSize || s.pos >= s.size {
+		n, err := s.ReadAtContext(ctx, p, s.pos)
+		s.pos += int64(n)
+		return n, err
+	}
+	if s.pos < s.readAheadOffset || s.pos >= s.readAheadOffset+int64(len(s.readAhead)) {
+		size := min(int64(readAheadSize), s.size-s.pos)
+		if cap(s.readAhead) < int(size) {
+			s.readAhead = make([]byte, size)
+		} else {
+			s.readAhead = s.readAhead[:size]
+		}
+		n, err := s.ReadAtContext(ctx, s.readAhead, s.pos)
+		if err != nil {
+			s.readAhead = nil
+			return 0, err
+		}
+		s.readAhead = s.readAhead[:n]
+		s.readAheadOffset = s.pos
+	}
+	n := copy(p, s.readAhead[s.pos-s.readAheadOffset:])
 	s.pos += int64(n)
-	return n, err
+	if n < len(p) && s.pos == s.size {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func (s *HTTPSource) ReadAt(p []byte, off int64) (int, error) {
@@ -175,6 +213,8 @@ func (s *HTTPSource) Seek(offset int64, whence int) (int64, error) {
 	if next < 0 {
 		return 0, errors.New("media: negative HTTP seek position")
 	}
+	// Explicit seeks revalidate the resource on the next read.
+	s.readAhead = s.readAhead[:0]
 	s.pos = next
 	return next, nil
 }

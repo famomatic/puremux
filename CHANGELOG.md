@@ -3,6 +3,64 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## v0.2.2 — 2026-09-05
+
+### Fixed
+
+- Recover HLS/DASH reads after missing segments or transient failures, keep
+  repeated EOF stable, propagate cancellation through nested reads, and
+  recognize live manifests that end without publishing another segment.
+- Resolve manifest relative URLs against the final redirect URL and preserve
+  nonzero segment origins when seeking.
+- Preserve MP4 edit-list offsets on both DTS and PTS, avoid timestamp overflow,
+  distinguish empty sync tables from absent tables, and return exact seek ticks.
+- Preserve Ogg Opus EOS packet start times and expose end trimming as
+  `Packet.DiscardPadding`.
+- Let saturated live jitter buffers emit packets instead of repeatedly dropping
+  valid input without making progress.
+- Preserve unknown MPEG-TS video duration and allow it for TS-to-TS remuxing;
+  reuse validated codec detectors for TS keyframe flags.
+- Convert MP4 Opus and FLAC initialization data for WebM/Matroska output.
+- Preserve MP4 language and EBML language, track title, and default disposition.
+- Report both install and rollback failures, including the retained backup path,
+  when replacing an output file fails.
+
+### Performance and resource bounds
+
+- Seek over MP4 media payload during Open, sort parsed fragments once, and
+  eliminate repeated progressive seek scans.
+- Add bounded HTTP read-ahead for sequential reads while retaining independent
+  ReaderAt requests and validator checks after seeks.
+- Track fMP4 duration incrementally, write buffered payload without additional
+  fragment-sized copies, cap fragment packet metadata, and avoid retaining
+  oversized pooled buffers.
+- Bound rotating HLS initialization caches, TS pending/indexed packets, and
+  continued Ogg packets; remove redundant TS and Ogg payload copies.
+
+### Compatibility
+
+- Unsupported stream/container metadata now returns an error instead of being
+  silently discarded. Set `MuxOptions.AllowMetadataLoss` explicitly to permit
+  dropping unsupported metadata. MP4 and TS reject nonzero discard padding;
+  that timing information cannot be dropped through this option.
+- Known zero or negative packet duration remains invalid. Only MPEG-TS output
+  accepts unknown duration, because PES does not serialize duration.
+- Seekable TS indexing is limited to 256 MiB of retained payload and 1,000,000
+  packets. Streaming pending data is limited to 64 MiB/4,096 packets, and an Ogg
+  continued packet to 16 MiB. Exceeding a bound returns an error.
+- fMP4 video cuts remain GOP-based. Byte and packet caps may force a cut at a
+  non-keyframe; `FragmentDuration` applies to audio-only output.
+- Existing unsupported codec/container features remain outside this release.
+  See [the audit fix matrix](docs/AUDIT_FIXES_2026-09-05.md) for exact scope.
+
+### Verification
+
+- All 15 original audit regression tests now pass, with additional tests for
+  resource bounds, malformed headers, metadata round trips, HTTP request count,
+  and rollback fault injection.
+- Full non-CGO tests/build, race tests, vet, and whitespace checks pass. Opus
+  configuration fuzzing completed 1,274,505 executions without failure.
+
 ## v0.2.1 — 2026-09-05
 
 ### Added

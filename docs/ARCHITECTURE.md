@@ -77,7 +77,7 @@ implementation has copied any bytes it needs to retain, so callers may then
 release or reuse the packet and payload. `Close` is idempotent and finalizes
 container metadata but does not close the destination.
 
-All muxers require known PTS, DTS, and positive duration. Container clock
+All muxers require known PTS and DTS. MP4 and EBML require positive known duration; MPEG-TS also accepts unknown duration because PES does not serialize it. Known zero/negative duration remains invalid. Container clock
 conversion is explicit:
 
 - MP4 preserves ticks directly and therefore requires an integral
@@ -146,7 +146,9 @@ entries. Payload buffers come from `sync.Pool` and are copied before
 `WritePacket` returns.
 
 Video fragments cut on GOP/keyframe boundaries; audio-only output uses the
-configured duration threshold. `MaxFragmentBytes` is a hard retention bound.
+configured duration threshold. `MaxFragmentBytes` bounds retained payload,
+while an internal packet cap bounds fragment metadata. Either cap can force a
+non-keyframe cut; they are not a process-wide memory bound.
 `MP4ModeAuto` selects progressive output for an `io.WriteSeeker` and fragmented
 output otherwise.
 

@@ -2,6 +2,7 @@ package mp4
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math"
@@ -14,6 +15,8 @@ import (
 const (
 	defaultFragmentDuration = 2 * time.Second
 	defaultMaxFragmentBytes = 32 << 20
+	maxFragmentPackets      = 65536
+	maxPooledFragmentBytes  = 1 << 20
 )
 
 var fragmentBufferPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
@@ -37,6 +40,8 @@ type FragmentedWriter struct {
 	tracks           []*fragmentedTrack
 	trackByID        map[int]*fragmentedTrack
 	pending          []bufferedFragmentSample
+	firstPending     OutputSample
+	lastPending      OutputSample
 	payload          *bytes.Buffer
 	fragmentDuration time.Duration
 	maxFragmentBytes int
@@ -137,7 +142,7 @@ func (w *FragmentedWriter) WriteSample(sample OutputSample) error {
 			return err
 		}
 	}
-	if w.payload.Len() > w.maxFragmentBytes-len(sample.Data) && len(w.pending) > 0 {
+	if len(w.pending) >= maxFragmentPackets || (w.payload.Len() > w.maxFragmentBytes-len(sample.Data) && len(w.pending) > 0) {
 		if err := w.flush(); err != nil {
 			return err
 		}
@@ -149,6 +154,16 @@ func (w *FragmentedWriter) WriteSample(sample OutputSample) error {
 	_, _ = w.payload.Write(sample.Data)
 	copySample := sample
 	copySample.Data = nil
+	if len(w.pending) == 0 {
+		w.firstPending, w.lastPending = copySample, copySample
+	} else {
+		if timestampLess(sample.DTS, t.spec.TimeScale, w.firstPending.DTS, w.trackByID[w.firstPending.TrackID].spec.TimeScale) {
+			w.firstPending = copySample
+		}
+		if timestampLess(w.lastPending.DTS+w.lastPending.Duration, w.trackByID[w.lastPending.TrackID].spec.TimeScale, end, t.spec.TimeScale) {
+			w.lastPending = copySample
+		}
+	}
 	w.pending = append(w.pending, bufferedFragmentSample{sample: copySample, offset: off, size: len(sample.Data)})
 	t.lastEnd = end
 	t.haveSample = true
@@ -183,28 +198,13 @@ func (w *FragmentedWriter) pendingDuration() time.Duration {
 	if len(w.pending) == 0 {
 		return 0
 	}
-	first, last := w.pending[0], w.pending[0]
-	for _, sample := range w.pending[1:] {
-		if timestampLess(sample.sample.DTS, w.trackByID[sample.sample.TrackID].spec.TimeScale,
-			first.sample.DTS, w.trackByID[first.sample.TrackID].spec.TimeScale) {
-			first = sample
-		}
-		leftEnd, leftOK := checkedAddInt64(sample.sample.DTS, sample.sample.Duration)
-		rightEnd, rightOK := checkedAddInt64(last.sample.DTS, last.sample.Duration)
-		if !leftOK || !rightOK {
-			return 0
-		}
-		if timestampLess(rightEnd, w.trackByID[last.sample.TrackID].spec.TimeScale,
-			leftEnd, w.trackByID[sample.sample.TrackID].spec.TimeScale) {
-			last = sample
-		}
-	}
-	firstNS, ok1 := rescaleSigned(first.sample.DTS, w.trackByID[first.sample.TrackID].spec.TimeScale, 1_000_000_000)
-	lastEnd, okEnd := checkedAddInt64(last.sample.DTS, last.sample.Duration)
+	first, last := w.firstPending, w.lastPending
+	firstNS, ok1 := rescaleSigned(first.DTS, w.trackByID[first.TrackID].spec.TimeScale, 1_000_000_000)
+	lastEnd, okEnd := checkedAddInt64(last.DTS, last.Duration)
 	if !okEnd {
 		return 0
 	}
-	lastNS, ok2 := rescaleSigned(lastEnd, w.trackByID[last.sample.TrackID].spec.TimeScale, 1_000_000_000)
+	lastNS, ok2 := rescaleSigned(lastEnd, w.trackByID[last.TrackID].spec.TimeScale, 1_000_000_000)
 	if !ok1 || !ok2 || lastNS <= firstNS {
 		return 0
 	}
@@ -223,15 +223,16 @@ func (w *FragmentedWriter) flush() error {
 		grouped[sample.sample.TrackID] = append(grouped[sample.sample.TrackID], sample)
 	}
 	trackOffsets := make(map[int]int, len(grouped))
-	mdatPayload := fragmentBufferPool.Get().(*bytes.Buffer)
-	mdatPayload.Reset()
-	defer func() { mdatPayload.Reset(); fragmentBufferPool.Put(mdatPayload) }()
 	data := w.payload.Bytes()
+	offset := 0
 	for _, track := range w.tracks {
-		trackOffsets[track.spec.ID] = mdatPayload.Len()
+		trackOffsets[track.spec.ID] = offset
 		for _, sample := range grouped[track.spec.ID] {
-			_, _ = mdatPayload.Write(data[sample.offset : sample.offset+sample.size])
+			offset += sample.size
 		}
+	}
+	if uint64(offset)+8 > math.MaxUint32 {
+		return ErrOutputTooLarge
 	}
 	moof, err := makeMOOF(w.sequence, w.tracks, grouped, trackOffsets, 0)
 	if err != nil {
@@ -244,12 +245,18 @@ func (w *FragmentedWriter) flush() error {
 	if err := writeFull(w.w, moof); err != nil {
 		return err
 	}
-	mdat, err := outputBox("mdat", mdatPayload.Bytes())
-	if err != nil {
+	var header [8]byte
+	binary.BigEndian.PutUint32(header[:4], uint32(offset+8))
+	copy(header[4:], "mdat")
+	if err := writeFull(w.w, header[:]); err != nil {
 		return err
 	}
-	if err := writeFull(w.w, mdat); err != nil {
-		return err
+	for _, track := range w.tracks {
+		for _, sample := range grouped[track.spec.ID] {
+			if err := writeFull(w.w, data[sample.offset:sample.offset+sample.size]); err != nil {
+				return err
+			}
+		}
 	}
 	w.sequence++
 	w.pending = w.pending[:0]
@@ -266,7 +273,9 @@ func (w *FragmentedWriter) Close() (retErr error) {
 		w.closeErr = retErr
 		if w.payload != nil {
 			w.payload.Reset()
-			fragmentBufferPool.Put(w.payload)
+			if w.payload.Cap() <= maxPooledFragmentBytes {
+				fragmentBufferPool.Put(w.payload)
+			}
 			w.payload = nil
 		}
 	}()
@@ -317,7 +326,7 @@ func makeFragmentedTrak(t OutputTrack) ([]byte, error) {
 	}
 	p.Write(tkhd)
 	var mdiaP bytes.Buffer
-	mdhd, err := makeMDHD(t.TimeScale, 0)
+	mdhd, err := makeMDHDLanguage(t.TimeScale, 0, t.Language)
 	if err != nil {
 		return nil, err
 	}

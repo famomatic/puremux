@@ -17,11 +17,12 @@ type mpegtsPacketWriter interface {
 }
 
 type mpegtsMuxer struct {
-	w        mpegtsPacketWriter
-	streams  []Stream
-	closed   bool
-	started  bool
-	closeErr error
+	allowMetadataLoss bool
+	w                 mpegtsPacketWriter
+	streams           []Stream
+	closed            bool
+	started           bool
+	closeErr          error
 }
 
 func newMPEGTSMuxer(w io.Writer) Muxer {
@@ -34,6 +35,11 @@ func (m *mpegtsMuxer) AddStream(stream Stream) (int, error) {
 	}
 	if !stream.TimeBase.Valid() || stream.TimeBase.Num <= 0 {
 		return 0, fmt.Errorf("%w: invalid time base", ErrInvalidData)
+	}
+	if !m.allowMetadataLoss {
+		if err := validateOutputMetadata(stream, FormatMPEGTS); err != nil {
+			return 0, err
+		}
 	}
 	codec := coreCodec(stream.Codec)
 	if codec != core.CodecH264 && codec != core.CodecHEVC && codec != core.CodecAAC {
@@ -73,8 +79,11 @@ func (m *mpegtsMuxer) WritePacket(ctx context.Context, packet *Packet) error {
 		return nil
 	}
 	if packet.StreamIndex < 0 || packet.StreamIndex >= len(m.streams) ||
-		!packet.PTS.Valid || !packet.DTS.Valid || !packet.Duration.Valid || packet.Duration.Value <= 0 {
+		!packet.PTS.Valid || !packet.DTS.Valid || (packet.Duration.Valid && packet.Duration.Value <= 0) {
 		return ErrInvalidData
+	}
+	if packet.DiscardPadding != 0 {
+		return fmt.Errorf("%w: MPEG-TS discard padding", ErrUnsupportedFormat)
 	}
 	stream := m.streams[packet.StreamIndex]
 	pts, ok := stream.TimeBase.Duration(packet.PTS.Value)

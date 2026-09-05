@@ -81,7 +81,11 @@ func (d *mpegTSDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	if p.Keyframe {
 		flags |= PacketKeyframe
 	}
-	return &Packet{StreamIndex: p.Track, Data: p.Data, PTS: KnownTimestamp(p.PTS), DTS: KnownTimestamp(p.DTS), Duration: KnownTimestamp(p.Duration), Flags: flags, Pos: p.Offset}, nil
+	duration := Timestamp{}
+	if p.Duration > 0 {
+		duration = KnownTimestamp(p.Duration)
+	}
+	return &Packet{StreamIndex: p.Track, Data: p.Data, PTS: KnownTimestamp(p.PTS), DTS: KnownTimestamp(p.DTS), Duration: duration, Flags: flags, Pos: p.Offset}, nil
 }
 
 func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {

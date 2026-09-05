@@ -77,15 +77,16 @@ func (d *oggDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 		return nil, err
 	}
 	flags := PacketKeyframe
-	data := append([]byte(nil), p.Data...)
+	data := p.Data
 	return &Packet{
-		StreamIndex: 0,
-		Data:        data,
-		PTS:         KnownTimestamp(p.PTS),
-		DTS:         KnownTimestamp(p.PTS),
-		Duration:    KnownTimestamp(p.Duration),
-		Flags:       flags,
-		Pos:         p.Position,
+		StreamIndex:    0,
+		Data:           data,
+		PTS:            KnownTimestamp(p.PTS),
+		DTS:            KnownTimestamp(p.PTS),
+		Duration:       KnownTimestamp(p.Duration),
+		DiscardPadding: samplesDuration(p.DiscardSamples),
+		Flags:          flags,
+		Pos:            p.Position,
 	}, nil
 }
 

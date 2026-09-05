@@ -129,3 +129,48 @@ func TestFragmentedWriterBoundaries(t *testing.T) {
 		t.Fatalf("second close = %v", err)
 	}
 }
+
+func TestFragmentedWriterBoundsTinyPacketMetadata(t *testing.T) {
+	var out bytes.Buffer
+	w, err := NewFragmentedWriter(&out, time.Hour, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ISO ASC: MSB-first AAC-LC=2, sample-rate index=3 (48kHz), channel config=2.
+	_, err = w.AddTrack(OutputTrack{ID: 1, Codec: core.CodecAAC, TimeScale: 48000, Channels: 2, SampleRate: 48000, ConfigType: "asc", Config: []byte{0x11, 0x90}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxFragmentPackets+1; i++ {
+		if err := w.WriteSample(OutputSample{TrackID: 1, DTS: int64(i), PTS: int64(i), Duration: 1, Data: []byte{1}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(w.pending) != 1 {
+		t.Fatalf("unbounded metadata: %d", len(w.pending))
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReader(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for {
+		sample, err := r.NextSample()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sample.DTS != int64(count) || !bytes.Equal(sample.Data, []byte{1}) {
+			t.Fatalf("sample %d: %+v", count, sample)
+		}
+		count++
+	}
+	if count != maxFragmentPackets+1 {
+		t.Fatal(count)
+	}
+}

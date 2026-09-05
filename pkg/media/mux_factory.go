@@ -16,9 +16,15 @@ func NewMuxer(w io.Writer, opts MuxOptions) (Muxer, error) {
 	case FormatMP4:
 		return newMP4Muxer(w, opts)
 	case FormatWebM, FormatMatroska:
-		return newEBMLMuxer(w, opts.Format)
+		m, err := newEBMLMuxer(w, opts.Format)
+		if err == nil {
+			m.(*ebmlMuxer).allowMetadataLoss = opts.AllowMetadataLoss
+		}
+		return m, err
 	case FormatMPEGTS:
-		return newMPEGTSMuxer(w), nil
+		m := newMPEGTSMuxer(w)
+		m.(*mpegtsMuxer).allowMetadataLoss = opts.AllowMetadataLoss
+		return m, nil
 	default:
 		return nil, fmt.Errorf("%w: %s output", ErrUnsupportedFormat, opts.Format)
 	}

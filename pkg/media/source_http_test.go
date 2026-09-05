@@ -233,3 +233,52 @@ func testRange(value string) (int64, int64, bool) {
 	end, errEnd := strconv.ParseInt(parts[1], 10, 64)
 	return start, end, errStart == nil && errEnd == nil
 }
+
+func TestHTTPSourceReadAheadAndSeekRevalidation(t *testing.T) {
+	var requests atomic.Int32
+	var changed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		start, end, ok := testRange(r.Header.Get("Range"))
+		if !ok {
+			t.Error("missing range")
+			return
+		}
+		etag := `"v1"`
+		if changed.Load() {
+			etag = `"v2"`
+		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 65536))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, end-start+1))
+	}))
+	defer server.Close()
+	source, err := OpenHTTP(context.Background(), server.URL, HTTPSourceOptions{Client: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	var one [1]byte
+	for i := 0; i < 1000; i++ {
+		if _, err := source.Read(one[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests=%d, want probe + one read", requests.Load())
+	}
+	changed.Store(true)
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Read(one[:]); !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("revalidation: %v", err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Read(one[:]); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+}

@@ -3,7 +3,6 @@ package media
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -148,14 +147,6 @@ func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 			}
 		}
 	}
-	targetNS := req.Target
-	if req.StreamIndex >= 0 {
-		var ok bool
-		targetNS, ok = d.streams[index].TimeBase.Rescale(req.Target, nanosecondTimeBase)
-		if !ok {
-			return SeekResult{}, errors.New("media: MP4 seek timestamp overflow")
-		}
-	}
 	trackNumber := 0
 	for number, mapped := range d.trackIndex {
 		if mapped == index {
@@ -163,18 +154,17 @@ func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 			break
 		}
 	}
-	actualNS, err := d.rd.SeekNSWithFlags(trackNumber, targetNS, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
+	var actual int64
+	var err error
+	if req.StreamIndex >= 0 {
+		actual, err = d.rd.SeekTicksWithFlags(trackNumber, req.Target, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
+	} else {
+		actual, err = d.rd.SeekNSWithFlags(trackNumber, req.Target, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
+	}
 	if err != nil {
 		return SeekResult{}, err
 	}
-	result := SeekResult{StreamIndex: req.StreamIndex, Timestamp: actualNS}
-	if req.StreamIndex >= 0 {
-		var ok bool
-		result.Timestamp, ok = nanosecondTimeBase.Rescale(actualNS, d.streams[index].TimeBase)
-		if !ok {
-			return SeekResult{}, errors.New("media: MP4 seek result overflow")
-		}
-	}
+	result := SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}
 	return result, nil
 }
 

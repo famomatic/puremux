@@ -30,6 +30,7 @@ type OutputTrack struct {
 	SampleRate int
 	ConfigType string
 	Config     []byte
+	Language   string
 }
 
 // OutputSample is one MP4 sample. All timing fields use the owning track's
@@ -122,6 +123,16 @@ func checkedSubInt64(a, b int64) (int64, bool) {
 }
 
 func validateOutputTrack(t OutputTrack) error {
+	if t.Language != "" {
+		if len(t.Language) != 3 {
+			return ErrInvalidOutputTrack
+		}
+		for _, c := range t.Language {
+			if c < 'a' || c > 'z' {
+				return ErrInvalidOutputTrack
+			}
+		}
+	}
 	if t.ID <= 0 || t.TimeScale == 0 || len(t.Config) == 0 {
 		return ErrInvalidOutputTrack
 	}

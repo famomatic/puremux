@@ -129,6 +129,8 @@ func (d *hlsDemuxer) Info() Info {
 }
 
 func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
+	ctx, cleanup := manifestOperationContext(ctx, d.root)
+	defer cleanup()
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
@@ -138,6 +140,19 @@ func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 		return nil, ErrClosed
 	}
 	for {
+		if d.current == nil {
+			if d.next >= len(d.segments) {
+				if d.playlist.EndList {
+					return nil, io.EOF
+				}
+				if err := d.refresh(ctx); err != nil {
+					return nil, err
+				}
+			}
+			if err := d.openSegment(ctx, d.next); err != nil {
+				return nil, err
+			}
+		}
 		p, err := d.current.ReadPacket(ctx)
 		if err == nil {
 			if p.StreamIndex < 0 || p.StreamIndex >= len(d.streams) {
@@ -168,27 +183,19 @@ func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 			return nil, err
 		}
 		_ = d.current.Close()
+		d.current = nil
 		var ok bool
 		d.baseNS, ok = checkedAddInt64(d.baseNS, int64(d.currentSeg.Duration))
 		if !ok {
 			return nil, ErrInvalidData
 		}
 		d.next++
-		if d.next >= len(d.segments) {
-			if d.playlist.EndList {
-				return nil, io.EOF
-			}
-			if err := d.refresh(ctx); err != nil {
-				return nil, err
-			}
-		}
-		if err := d.openSegment(ctx, d.next); err != nil {
-			return nil, err
-		}
 	}
 }
 
 func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
+	ctx, cleanup := manifestOperationContext(ctx, d.root)
+	defer cleanup()
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
@@ -226,7 +233,10 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 		}
 		start = end
 	}
-	_ = d.current.Close()
+	if d.current != nil {
+		_ = d.current.Close()
+		d.current = nil
+	}
 	d.baseNS, d.next = start, index
 	if err := d.openSegment(ctx, index); err != nil {
 		return SeekResult{}, err
@@ -234,11 +244,15 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if err := d.primeSegmentShift(ctx); err != nil {
 		return SeekResult{}, err
 	}
-	localRequest := SeekRequest{StreamIndex: -1, Target: targetNS - start, Flags: req.Flags}
+	localTarget, ok := checkedSubInt64(targetNS, d.shiftNS)
+	if !ok {
+		return SeekResult{}, ErrInvalidData
+	}
+	localRequest := SeekRequest{StreamIndex: -1, Target: localTarget, Flags: req.Flags}
 	segmentStartTicks := int64(0)
 	if req.StreamIndex >= 0 {
 		var ok bool
-		segmentStartTicks, ok = nanosecondTimeBase.Rescale(start, d.streams[req.StreamIndex].TimeBase)
+		segmentStartTicks, ok = nanosecondTimeBase.Rescale(d.shiftNS, d.streams[req.StreamIndex].TimeBase)
 		if !ok {
 			return SeekResult{}, ErrInvalidData
 		}
@@ -259,7 +273,7 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 		}
 		return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 	}
-	actual, ok := checkedAddInt64(start, localResult.Timestamp)
+	actual, ok := checkedAddInt64(d.shiftNS, localResult.Timestamp)
 	if !ok {
 		return SeekResult{}, ErrInvalidData
 	}
@@ -307,10 +321,11 @@ func (d *hlsDemuxer) resolvePlaylist(ctx context.Context, rawURL string) (string
 			return "", manifest.HLSPlaylist{}, errors.New("hls: playlist cycle")
 		}
 		seen[rawURL] = true
-		body, err := d.fetch(ctx, rawURL, manifest.ByteRange{}, d.opts.MaxManifestBytes)
+		body, finalURL, err := d.fetchManifest(ctx, rawURL, d.opts.MaxManifestBytes)
 		if err != nil {
 			return "", manifest.HLSPlaylist{}, err
 		}
+		rawURL = finalURL
 		base, _ := url.Parse(rawURL)
 		playlist, err := manifest.ParseHLS(base, body, d.opts.MaxEntries)
 		if err != nil {
@@ -392,7 +407,9 @@ func (d *hlsDemuxer) openSegment(ctx context.Context, index int) error {
 					return err
 				}
 			}
-			d.initCache[cacheKey] = append([]byte(nil), init...)
+			// Keep only the active initialization; rotating maps cannot grow the cache.
+			clear(d.initCache)
+			d.initCache[cacheKey] = init
 		}
 		demuxer, err = OpenMP4WithInit(ctx, init, MemorySource(segment.URI, data))
 	} else {
@@ -413,11 +430,12 @@ func (d *hlsDemuxer) openSegment(ctx context.Context, index int) error {
 }
 
 func (d *hlsDemuxer) refresh(ctx context.Context) error {
-	body, err := d.fetch(ctx, d.playlistURL, manifest.ByteRange{}, d.opts.MaxManifestBytes)
+	body, finalURL, err := d.fetchManifest(ctx, d.playlistURL, d.opts.MaxManifestBytes)
 	if err != nil {
 		return err
 	}
-	base, _ := url.Parse(d.playlistURL)
+	d.playlistURL = finalURL
+	base, _ := url.Parse(finalURL)
 	playlist, err := manifest.ParseHLS(base, body, d.opts.MaxEntries)
 	if err != nil {
 		return err
@@ -430,6 +448,10 @@ func (d *hlsDemuxer) refresh(ctx context.Context) error {
 		}
 	}
 	if len(newSegments) == 0 {
+		d.playlist = playlist
+		if playlist.EndList {
+			return io.EOF
+		}
 		return ErrNoNewSegments
 	}
 	d.playlist, d.segments, d.next = playlist, newSegments, 0
@@ -470,54 +492,12 @@ func (d *hlsDemuxer) decrypt(ctx context.Context, encrypted []byte, keySpec *man
 }
 
 func (d *hlsDemuxer) fetch(ctx context.Context, rawURL string, byteRange manifest.ByteRange, limit int64) ([]byte, error) {
-	operation, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(d.root, cancel)
-	defer func() { stop(); cancel() }()
-	req, err := http.NewRequestWithContext(operation, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header = d.header.Clone()
-	req.Header.Set("Accept-Encoding", "identity")
-	if byteRange.Valid {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Offset, byteRange.Offset+byteRange.Length-1))
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if byteRange.Valid {
-		if resp.StatusCode != http.StatusPartialContent {
-			return nil, fmt.Errorf("hls: range request returned %s", resp.Status)
-		}
-		if !validHLSContentRange(resp.Header.Get("Content-Range"), byteRange.Offset, byteRange.Offset+byteRange.Length-1) {
-			return nil, errors.New("hls: invalid Content-Range")
-		}
-		if length := resp.ContentLength; length >= 0 && length != byteRange.Length {
-			return nil, errors.New("hls: byte-range length mismatch")
-		}
-		limit = min(limit, byteRange.Length)
-	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hls: HTTP request returned %s", resp.Status)
-	}
-	if limit <= 0 {
-		return nil, errors.New("hls: invalid resource limit")
-	}
-	if limit == math.MaxInt64 {
-		return nil, errors.New("hls: resource limit is too large")
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
-		return nil, errors.New("hls: resource exceeds configured limit")
-	}
-	if byteRange.Valid && int64(len(data)) != byteRange.Length {
-		return nil, errors.New("hls: truncated byte range")
-	}
-	return data, nil
+	data, _, err := fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, byteRange, limit)
+	return data, err
+}
+
+func (d *hlsDemuxer) fetchManifest(ctx context.Context, rawURL string, limit int64) ([]byte, string, error) {
+	return fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, manifest.ByteRange{}, limit)
 }
 
 func validHLSContentRange(value string, wantStart, wantEnd int64) bool {

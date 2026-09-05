@@ -44,6 +44,8 @@ type trackState struct {
 	ctts              []cttsEntry
 	stsc              []stscEntry
 	stco              []uint64 // chunk offsets (stco 32-bit or co64 64-bit)
+	hasSTSS           bool
+	cursorErr         error
 	stss              []uint32 // sync sample numbers (1-based); nil = unknown
 
 	// --- Streaming cursors (O(1) memory, independent of sample count) ---

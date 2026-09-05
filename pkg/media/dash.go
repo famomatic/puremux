@@ -3,7 +3,6 @@ package media
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -88,12 +87,13 @@ func OpenDASH(ctx context.Context, rawURL string, opts DASHOptions) (Demuxer, er
 	}
 	root, cancel := context.WithCancel(context.Background())
 	d := &dashDemuxer{client: client, header: header, opts: opts, manifestURL: rawURL, root: root, cancel: cancel}
-	body, err := d.fetch(ctx, rawURL, manifest.ByteRange{}, opts.MaxManifestBytes)
+	body, finalURL, err := d.fetchManifest(ctx, rawURL, opts.MaxManifestBytes)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	base, _ := url.Parse(rawURL)
+	d.manifestURL = finalURL
+	base, _ := url.Parse(finalURL)
 	mpd, err := manifest.ParseDASH(base, body, opts.MaxRepresentations, opts.MaxSegments)
 	if err != nil {
 		cancel()
@@ -162,6 +162,8 @@ func (d *dashDemuxer) Info() Info {
 }
 
 func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
+	ctx, cleanup := manifestOperationContext(ctx, d.root)
+	defer cleanup()
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
@@ -171,6 +173,19 @@ func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 		return nil, ErrClosed
 	}
 	for {
+		if d.current == nil {
+			if d.next >= len(d.representation.Segments) {
+				if !d.dynamic {
+					return nil, io.EOF
+				}
+				if err := d.refresh(ctx); err != nil {
+					return nil, err
+				}
+			}
+			if err := d.openSegment(ctx, d.next); err != nil {
+				return nil, err
+			}
+		}
 		p, err := d.current.ReadPacket(ctx)
 		if err == nil {
 			if p.StreamIndex < 0 || p.StreamIndex >= len(d.streams) {
@@ -202,27 +217,18 @@ func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 			return nil, err
 		}
 		_ = d.current.Close()
+		d.current = nil
 		d.next++
-		if d.next >= len(d.representation.Segments) {
-			if !d.dynamic {
-				return nil, io.EOF
-			}
-			if err := d.refresh(ctx); err != nil {
-				return nil, err
-			}
-		}
-		if err := d.openSegment(ctx, d.next); err != nil {
-			return nil, err
-		}
 	}
 }
 
 func (d *dashDemuxer) refresh(ctx context.Context) error {
-	body, err := d.fetch(ctx, d.manifestURL, manifest.ByteRange{}, d.opts.MaxManifestBytes)
+	body, finalURL, err := d.fetchManifest(ctx, d.manifestURL, d.opts.MaxManifestBytes)
 	if err != nil {
 		return err
 	}
-	base, err := url.Parse(d.manifestURL)
+	d.manifestURL = finalURL
+	base, err := url.Parse(finalURL)
 	if err != nil {
 		return err
 	}
@@ -252,6 +258,10 @@ func (d *dashDemuxer) refresh(ctx context.Context) error {
 		}
 	}
 	if len(segments) == 0 {
+		d.dynamic = mpd.Dynamic
+		if !d.dynamic {
+			return io.EOF
+		}
 		return ErrNoNewSegments
 	}
 	updated.Segments = segments
@@ -270,6 +280,8 @@ func (d *dashDemuxer) refresh(ctx context.Context) error {
 }
 
 func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
+	ctx, cleanup := manifestOperationContext(ctx, d.root)
+	defer cleanup()
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
@@ -306,7 +318,10 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 			break
 		}
 	}
-	_ = d.current.Close()
+	if d.current != nil {
+		_ = d.current.Close()
+		d.current = nil
+	}
 	d.next = index
 	if err := d.openSegment(ctx, index); err != nil {
 		return SeekResult{}, err
@@ -315,11 +330,15 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	if err := d.primeSegmentShift(ctx, start); err != nil {
 		return SeekResult{}, err
 	}
-	localRequest := SeekRequest{StreamIndex: -1, Target: targetNS - start, Flags: req.Flags}
+	localTarget, ok := checkedSubInt64(targetNS, d.shiftNS)
+	if !ok {
+		return SeekResult{}, ErrInvalidData
+	}
+	localRequest := SeekRequest{StreamIndex: -1, Target: localTarget, Flags: req.Flags}
 	segmentStartTicks := int64(0)
 	if req.StreamIndex >= 0 {
 		var ok bool
-		segmentStartTicks, ok = nanosecondTimeBase.Rescale(start, d.streams[req.StreamIndex].TimeBase)
+		segmentStartTicks, ok = nanosecondTimeBase.Rescale(d.shiftNS, d.streams[req.StreamIndex].TimeBase)
 		if !ok {
 			return SeekResult{}, ErrInvalidData
 		}
@@ -340,7 +359,7 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 		}
 		return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 	}
-	actual, ok := checkedAddInt64(start, localResult.Timestamp)
+	actual, ok := checkedAddInt64(d.shiftNS, localResult.Timestamp)
 	if !ok {
 		return SeekResult{}, ErrInvalidData
 	}
@@ -427,48 +446,12 @@ func (d *dashDemuxer) openSegment(ctx context.Context, index int) error {
 }
 
 func (d *dashDemuxer) fetch(ctx context.Context, rawURL string, byteRange manifest.ByteRange, limit int64) ([]byte, error) {
-	operation, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(d.root, cancel)
-	defer func() { stop(); cancel() }()
-	req, err := http.NewRequestWithContext(operation, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header = d.header.Clone()
-	req.Header.Set("Accept-Encoding", "identity")
-	if byteRange.Valid {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Offset, byteRange.Offset+byteRange.Length-1))
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if byteRange.Valid {
-		if resp.StatusCode != http.StatusPartialContent || !validHLSContentRange(resp.Header.Get("Content-Range"), byteRange.Offset, byteRange.Offset+byteRange.Length-1) {
-			return nil, errors.New("dash: invalid byte-range response")
-		}
-		limit = min(limit, byteRange.Length)
-	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("dash: HTTP request returned %s", resp.Status)
-	}
-	if limit <= 0 {
-		return nil, errors.New("dash: invalid resource limit")
-	}
-	if limit == math.MaxInt64 {
-		return nil, errors.New("dash: resource limit is too large")
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
-		return nil, errors.New("dash: resource exceeds configured limit")
-	}
-	if byteRange.Valid && int64(len(data)) != byteRange.Length {
-		return nil, errors.New("dash: truncated byte range")
-	}
-	return data, nil
+	data, _, err := fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, byteRange, limit)
+	return data, err
+}
+
+func (d *dashDemuxer) fetchManifest(ctx context.Context, rawURL string, limit int64) ([]byte, string, error) {
+	return fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, manifest.ByteRange{}, limit)
 }
 
 var _ Demuxer = (*dashDemuxer)(nil)

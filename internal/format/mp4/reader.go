@@ -78,99 +78,121 @@ func (rd *Reader) SeekNS(trackNumber int, targetNS int64) (int64, error) {
 // trackNumber. With backward false it selects the earliest sample at or after
 // targetNS; any permits non-sync video samples.
 func (rd *Reader) SeekNSWithFlags(trackNumber int, targetNS int64, backward, any bool) (int64, error) {
-	if targetNS < 0 {
-		targetNS = 0
+	actual, scale, err := rd.seekScaled(trackNumber, targetNS, 1_000_000_000, backward, any)
+	return scaleToNS(actual, scale), err
+}
+
+// SeekTicksWithFlags preserves the selected track's exact integer clock.
+func (rd *Reader) SeekTicksWithFlags(trackNumber int, target int64, backward, any bool) (int64, error) {
+	for _, track := range rd.tracks {
+		if track.info.Number == trackNumber {
+			actual, _, err := rd.seekScaled(trackNumber, target, track.timescale, backward, any)
+			return actual, err
+		}
+	}
+	return 0, ErrCorrupt
+}
+
+func (rd *Reader) seekScaled(trackNumber int, target int64, targetScale uint32, backward, any bool) (int64, uint32, error) {
+	if target < 0 {
+		target = 0
 	}
 	if len(rd.fragments) > 0 {
 		chosen := -1
-		var chosenNS int64
-		for i, sample := range rd.fragments {
-			if sample.track.info.Number != trackNumber || (!any && sample.track.info.IsVideo && !sample.keyframe) {
-				continue
-			}
-			ns := scaleToNS(sample.pts, sample.track.timescale)
-			eligible := ns <= targetNS
-			if !backward {
-				eligible = ns >= targetNS
-			}
-			if eligible && (chosen < 0 || (backward && ns > chosenNS) || (!backward && ns < chosenNS)) {
-				chosen, chosenNS = i, ns
-			}
-		}
-		if chosen < 0 {
+		for pass := 0; pass < 2 && chosen < 0; pass++ {
 			for i, sample := range rd.fragments {
 				if sample.track.info.Number != trackNumber || (!any && sample.track.info.IsVideo && !sample.keyframe) {
 					continue
 				}
-				ns := scaleToNS(sample.pts, sample.track.timescale)
-				if chosen < 0 || (backward && ns < chosenNS) || (!backward && ns > chosenNS) {
-					chosen, chosenNS = i, ns
+				before := timestampLess(sample.pts, sample.track.timescale, target, targetScale)
+				after := timestampLess(target, targetScale, sample.pts, sample.track.timescale)
+				if pass == 0 && ((backward && after) || (!backward && before)) {
+					continue
+				}
+				if chosen < 0 {
+					chosen = i
+					continue
+				}
+				wantLater := backward != (pass == 1)
+				if (wantLater && sample.pts > rd.fragments[chosen].pts) || (!wantLater && sample.pts < rd.fragments[chosen].pts) {
+					chosen = i
 				}
 			}
 		}
 		if chosen < 0 {
-			return 0, errors.New("mp4: seek track not found")
+			return 0, 0, errors.New("mp4: no eligible seek sample")
 		}
-		actualNS := scaleToNS(rd.fragments[chosen].pts, rd.fragments[chosen].track.timescale)
+		selected := rd.fragments[chosen]
 		rd.fragmentCursor = chosen
 		for rd.fragmentCursor > 0 {
 			previous := rd.fragments[rd.fragmentCursor-1]
-			if scaleToNS(previous.dts, previous.track.timescale) < actualNS {
+			if timestampLess(previous.dts, previous.track.timescale, selected.dts, selected.track.timescale) {
 				break
 			}
 			rd.fragmentCursor--
 		}
-		return actualNS, nil
+		return selected.pts, selected.track.timescale, nil
 	}
-	selected := -1
-	for i, track := range rd.tracks {
+	var selected *trackState
+	for _, track := range rd.tracks {
 		if track.info.Number == trackNumber {
-			selected = i
+			selected = track
 			break
 		}
 	}
-	if selected < 0 {
-		return 0, errors.New("mp4: seek track not found")
+	if selected == nil {
+		return 0, 0, ErrCorrupt
 	}
-	index, actualUnits, err := rd.tracks[selected].findSeekIndex(targetNS, rd.tracks[selected].info.IsVideo && !any, backward)
+	index, actual, err := selected.findSeekIndexScaled(target, targetScale, selected.info.IsVideo && !any, backward)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	_ = index
-	actualNS := scaleToNS(actualUnits, rd.tracks[selected].timescale)
 	for _, track := range rd.tracks {
-		trackIndex, _, err := track.findSeekIndex(actualNS, track.info.IsVideo && !any, true)
-		if err != nil {
-			return 0, err
+		trackIndex := index
+		if track != selected {
+			trackIndex, _, err = track.findSeekIndexScaled(actual, selected.timescale, track.info.IsVideo && !any, true)
+			if err != nil {
+				return 0, 0, err
+			}
 		}
 		if err := track.setSampleIndex(trackIndex); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
 	rd.inited = true
-	return actualNS, nil
+	return actual, selected.timescale, nil
 }
 
 func (t *trackState) findSeekIndex(targetNS int64, keyOnly, backward bool) (uint32, int64, error) {
+	return t.findSeekIndexScaled(targetNS, 1_000_000_000, keyOnly, backward)
+}
+
+func (t *trackState) findSeekIndexScaled(target int64, targetScale uint32, keyOnly, backward bool) (uint32, int64, error) {
 	if err := t.initCursor(); err != nil {
 		return 0, 0, err
 	}
-	var chosen uint32
-	var chosenPTS int64
-	found := false
+	var chosenState, fallbackState trackState
+	found, haveFallback := false, false
 	for t.consumed < t.totalSamples {
 		if !t.peekNext() {
+			if t.cursorErr != nil {
+				return 0, 0, t.cursorErr
+			}
 			break
 		}
-		ptsNS := scaleToNS(t.peek.pts, t.timescale)
 		if !keyOnly || t.peek.keyframe {
-			eligible := ptsNS <= targetNS
+			pts := t.peek.pts
+			eligible := !timestampLess(target, targetScale, pts, t.timescale)
 			if !backward {
-				eligible = ptsNS >= targetNS
+				eligible = !timestampLess(pts, t.timescale, target, targetScale)
 			}
-			chosenNS := scaleToNS(chosenPTS, t.timescale)
-			if eligible && (!found || (backward && ptsNS > chosenNS) || (!backward && ptsNS < chosenNS)) {
-				chosen, chosenPTS, found = t.consumed, t.peek.pts, true
+			if eligible && (!found || (backward && pts > chosenState.peek.pts) || (!backward && pts < chosenState.peek.pts)) {
+				chosenState = *t
+				found = true
+			}
+			if !haveFallback || (backward && pts < fallbackState.peek.pts) || (!backward && pts > fallbackState.peek.pts) {
+				fallbackState = *t
+				haveFallback = true
 			}
 		}
 		t.hasPeek = false
@@ -178,32 +200,20 @@ func (t *trackState) findSeekIndex(targetNS int64, keyOnly, backward bool) (uint
 		t.advancePast(t.peek)
 	}
 	if !found {
-		if err := t.initCursor(); err != nil {
-			return 0, 0, err
+		if !haveFallback {
+			return 0, 0, errors.New("mp4: no eligible seek sample")
 		}
-		for t.consumed < t.totalSamples {
-			if !t.peekNext() {
-				break
-			}
-			if !keyOnly || t.peek.keyframe {
-				ptsNS := scaleToNS(t.peek.pts, t.timescale)
-				chosenNS := scaleToNS(chosenPTS, t.timescale)
-				if !found || (backward && ptsNS < chosenNS) || (!backward && ptsNS > chosenNS) {
-					chosen, chosenPTS, found = t.consumed, t.peek.pts, true
-				}
-			}
-			t.hasPeek = false
-			t.consumed++
-			t.advancePast(t.peek)
-		}
+		chosenState = fallbackState
 	}
-	if !found {
-		return 0, 0, errors.New("mp4: no eligible seek sample")
-	}
-	return chosen, chosenPTS, nil
+	*t = chosenState
+	t.hasPeek = true
+	return t.consumed, t.peek.pts, nil
 }
 
 func (t *trackState) setSampleIndex(index uint32) error {
+	if t.hasPeek && t.consumed == index {
+		return nil
+	}
 	if err := t.initCursor(); err != nil {
 		return err
 	}
@@ -296,6 +306,9 @@ func (rd *Reader) NextSample() (*Sample, error) {
 		// Lazily compute the peek for this track if missing.
 		if !t.hasPeek {
 			if !t.peekNext() {
+				if t.cursorErr != nil {
+					return nil, t.cursorErr
+				}
 				continue // track exhausted
 			}
 			t.hasPeek = true
@@ -337,14 +350,44 @@ func (rd *Reader) NextSample() (*Sample, error) {
 
 // parse walks the top-level boxes (ftyp, moov, mdat).
 func (rd *Reader) parse() error {
+	start, err := rd.rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	end, err := rd.rs.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if _, err := rd.rs.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
 	for {
-		off, _ := rd.rs.Seek(0, io.SeekCurrent)
+		off, err := rd.rs.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		if off == end {
+			break
+		}
+		if off > end {
+			return ErrCorrupt
+		}
 		b, err := readBox(rd.rs)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
+			return io.ErrUnexpectedEOF
 		}
 		if err != nil {
 			return err
+		}
+		if b.size == 0 {
+			b.size = end - off
+			b.payload = b.size - int64(b.hdrSize)
+		}
+		if b.size > end-off {
+			return io.ErrUnexpectedEOF
+		}
+		if b.size < int64(b.hdrSize) {
+			return ErrCorrupt
 		}
 		switch b.typ {
 		case "ftyp", "styp", "free", "skip":
@@ -356,9 +399,7 @@ func (rd *Reader) parse() error {
 				return err
 			}
 		case "mdat":
-			// Sample offsets are absolute file offsets (stco points into mdat
-			// payload), so we only need to skip past mdat here.
-			if err := skipBox(rd.rs, b); err != nil {
+			if _, err := rd.rs.Seek(off+b.size, io.SeekStart); err != nil {
 				return err
 			}
 		case "moof":
@@ -375,6 +416,7 @@ func (rd *Reader) parse() error {
 	if len(rd.tracks) == 0 {
 		return ErrCorrupt
 	}
+	rd.sortFragments()
 	return nil
 }
 
@@ -469,7 +511,15 @@ func (rd *Reader) parseTrak(r io.Reader, b box) error {
 		t.presentationShift = -t.editMediaTime
 	}
 	if rd.movieTimescale > 0 && t.editLeadMovie > 0 {
-		t.presentationShift += int64(t.editLeadMovie * uint64(t.timescale) / uint64(rd.movieTimescale))
+		lead, ok := rescaleUnsigned(t.editLeadMovie, rd.movieTimescale, t.timescale)
+		if !ok || lead > math.MaxInt64 {
+			return ErrCorrupt
+		}
+		shift, ok := checkedAddInt64(t.presentationShift, int64(lead))
+		if !ok {
+			return ErrCorrupt
+		}
+		t.presentationShift = shift
 	}
 	rd.tracks = append(rd.tracks, t)
 	return nil
@@ -914,6 +964,7 @@ func (rd *Reader) parseStco(r io.Reader, b box, t *trackState, co64 bool) error 
 }
 
 func (rd *Reader) parseStss(r io.Reader, b box, t *trackState) error {
+	t.hasSTSS = true
 	hdr := make([]byte, 8)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return err

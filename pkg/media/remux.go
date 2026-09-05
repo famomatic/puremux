@@ -51,6 +51,15 @@ func Remux(ctx context.Context, inputs []RemuxInput, dst io.Writer, opts MuxOpti
 		}
 		demuxers = append(demuxers, demuxer)
 	}
+	if !opts.AllowMetadataLoss {
+		for i, d := range demuxers {
+			for key, value := range d.Info().Metadata {
+				if value != "" && key != "muxing_app" && key != "writing_app" {
+					return fmt.Errorf("%w: input %d container metadata %q; set AllowMetadataLoss to discard", ErrUnsupportedFormat, i, key)
+				}
+			}
+		}
+	}
 	muxer, err := NewMuxer(dst, opts)
 	if err != nil {
 		return err
@@ -67,11 +76,12 @@ func closeRemuxSources(inputs []RemuxInput) {
 }
 
 type remuxCursor struct {
-	demuxer Demuxer
-	streams []Stream
-	mapping []int
-	next    *Packet
-	done    bool
+	demuxer          Demuxer
+	streams          []Stream
+	mapping          []int
+	next             *Packet
+	done             bool
+	durationOptional bool
 }
 
 func remuxDemuxers(ctx context.Context, demuxers []Demuxer, muxer Muxer, output Format) (retErr error) {
@@ -100,7 +110,7 @@ func remuxDemuxers(ctx context.Context, demuxers []Demuxer, muxer Muxer, output 
 		if len(streams) == 0 {
 			return fmt.Errorf("%w: input %d has no streams", ErrInvalidData, i)
 		}
-		cursor := remuxCursor{demuxer: demuxer, streams: streams, mapping: make([]int, len(streams))}
+		cursor := remuxCursor{durationOptional: output == FormatMPEGTS, demuxer: demuxer, streams: streams, mapping: make([]int, len(streams))}
 		for j, stream := range streams {
 			if !stream.TimeBase.Valid() || stream.TimeBase.Num <= 0 {
 				return fmt.Errorf("%w: input %d stream %d time base", ErrInvalidData, i, j)
@@ -176,7 +186,7 @@ func readRemuxPacket(ctx context.Context, cursor *remuxCursor) error {
 		return err
 	}
 	if packet == nil || packet.StreamIndex < 0 || packet.StreamIndex >= len(cursor.streams) ||
-		!packet.DTS.Valid || !packet.PTS.Valid || !packet.Duration.Valid {
+		!packet.DTS.Valid || !packet.PTS.Valid || (!packet.Duration.Valid && !cursor.durationOptional) {
 		if packet != nil {
 			packet.Release()
 		}
@@ -323,7 +333,11 @@ func rejectRemuxAlias(inputs []string, output string) error {
 }
 
 func installRemuxOutput(temporaryPath, outputPath string) error {
-	if err := os.Rename(temporaryPath, outputPath); err == nil {
+	return installRemuxOutputWithRename(temporaryPath, outputPath, os.Rename)
+}
+
+func installRemuxOutputWithRename(temporaryPath, outputPath string, rename func(string, string) error) error {
+	if err := rename(temporaryPath, outputPath); err == nil {
 		return nil
 	}
 	if _, err := os.Stat(outputPath); err != nil {
@@ -341,11 +355,13 @@ func installRemuxOutput(temporaryPath, outputPath string) error {
 	if err := os.Remove(backupPath); err != nil {
 		return err
 	}
-	if err := os.Rename(outputPath, backupPath); err != nil {
+	if err := rename(outputPath, backupPath); err != nil {
 		return err
 	}
-	if err := os.Rename(temporaryPath, outputPath); err != nil {
-		_ = os.Rename(backupPath, outputPath)
+	if err := rename(temporaryPath, outputPath); err != nil {
+		if restoreErr := rename(backupPath, outputPath); restoreErr != nil {
+			return errors.Join(err, fmt.Errorf("restore failed; original output retained at %s: %w", backupPath, restoreErr))
+		}
 		return err
 	}
 	return os.Remove(backupPath)

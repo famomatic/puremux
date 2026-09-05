@@ -19,12 +19,13 @@ type mp4SampleWriter interface {
 }
 
 type mp4Muxer struct {
-	w             mp4SampleWriter
-	streams       []Stream
-	trackByStream []int
-	started       bool
-	closed        bool
-	closeErr      error
+	allowMetadataLoss bool
+	w                 mp4SampleWriter
+	streams           []Stream
+	trackByStream     []int
+	started           bool
+	closed            bool
+	closeErr          error
 }
 
 func newMP4Muxer(dst io.Writer, opts MuxOptions) (Muxer, error) {
@@ -46,7 +47,7 @@ func newMP4Muxer(dst io.Writer, opts MuxOptions) (Muxer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &mp4Muxer{w: writer}, nil
+	return &mp4Muxer{w: writer, allowMetadataLoss: opts.AllowMetadataLoss}, nil
 }
 
 func (m *mp4Muxer) AddStream(stream Stream) (int, error) {
@@ -55,6 +56,11 @@ func (m *mp4Muxer) AddStream(stream Stream) (int, error) {
 	}
 	if !stream.TimeBase.Valid() || stream.TimeBase.Num <= 0 || stream.TimeBase.Den%stream.TimeBase.Num != 0 {
 		return 0, fmt.Errorf("%w: MP4 requires an integral ticks-per-second time base", ErrInvalidData)
+	}
+	if !m.allowMetadataLoss {
+		if err := validateOutputMetadata(stream, FormatMP4); err != nil {
+			return 0, err
+		}
 	}
 	codec := coreCodec(stream.Codec)
 	if codec == core.CodecUnknown ||
@@ -73,7 +79,7 @@ func (m *mp4Muxer) AddStream(stream Stream) (int, error) {
 	id := len(m.streams) + 1
 	track := formatmp4.OutputTrack{ID: id, Codec: codec, TimeScale: uint32(scale),
 		Width: stream.Width, Height: stream.Height, Channels: stream.Channels,
-		SampleRate: stream.SampleRate, ConfigType: configType, Config: config}
+		SampleRate: stream.SampleRate, ConfigType: configType, Config: config, Language: stream.Language}
 	if _, err := m.w.AddTrack(track); err != nil {
 		return 0, err
 	}
@@ -165,6 +171,9 @@ func (m *mp4Muxer) WritePacket(ctx context.Context, packet *Packet) error {
 	if packet.StreamIndex < 0 || packet.StreamIndex >= len(m.streams) ||
 		!packet.DTS.Valid || !packet.PTS.Valid || !packet.Duration.Valid {
 		return ErrInvalidData
+	}
+	if packet.DiscardPadding != 0 {
+		return fmt.Errorf("%w: MP4 discard padding is not representable by this writer", ErrUnsupportedFormat)
 	}
 	m.started = true
 	return m.w.WriteSample(formatmp4.OutputSample{TrackID: m.trackByStream[packet.StreamIndex],

@@ -31,11 +31,12 @@ type OpusHead struct {
 }
 
 type Packet struct {
-	Data     []byte
-	PTS      int64
-	Duration int64
-	Position int64
-	EOS      bool
+	Data           []byte
+	PTS            int64
+	Duration       int64
+	Position       int64
+	EOS            bool
+	DiscardSamples int64
 }
 
 type pageIndex struct {
@@ -77,6 +78,8 @@ type Reader struct {
 	partialPos    int64
 	pending       []Packet
 	closed        bool
+	audioEnd      int64
+	haveAudio     bool
 }
 
 func NewReader(rs io.ReadSeeker) (*Reader, error) {
@@ -184,14 +187,31 @@ func (r *Reader) NextPacket(ctx context.Context) (*Packet, error) {
 			end = int64(p.granule)
 		}
 		start := end - total
+		if p.flags&0x04 != 0 {
+			if r.haveAudio {
+				start = r.audioEnd
+			} else if start < 0 {
+				start = 0
+			}
+			if end < start || end-start > total || (!r.haveAudio && end < int64(r.head.PreSkip)) {
+				return nil, errors.New("ogg: invalid EOS granule")
+			}
+		} else if start < 0 {
+			return nil, errors.New("ogg: invalid initial granule")
+		}
+		if start > math.MaxInt64-total {
+			return nil, errors.New("ogg: audio clock overflow")
+		}
+		r.audioEnd, r.haveAudio = start+total, true
 		for i, packet := range packets {
 			pts := start - int64(r.head.PreSkip)
 			r.pending = append(r.pending, Packet{
-				Data:     packet.data,
-				PTS:      pts,
-				Duration: durations[i],
-				Position: packet.position,
-				EOS:      p.flags&0x04 != 0 && i == len(packets)-1,
+				Data:           packet.data,
+				PTS:            pts,
+				Duration:       durations[i],
+				Position:       packet.position,
+				EOS:            p.flags&0x04 != 0 && i == len(packets)-1,
+				DiscardSamples: min(durations[i], max(int64(0), start+durations[i]-end)),
 			})
 			start += durations[i]
 		}
@@ -273,6 +293,13 @@ func (r *Reader) SeekSamplesWithDirection(ctx context.Context, target int64, bac
 	r.partial = nil
 	r.pending = nil
 	r.headerPackets = r.pages[choice].headersBefore
+	r.audioEnd, r.haveAudio = 0, false
+	for i := choice - 1; i >= 0; i-- {
+		if r.pages[i].headersBefore >= 2 && r.pages[i].granule != math.MaxUint64 && r.pages[i].granule <= math.MaxInt64 {
+			r.audioEnd, r.haveAudio = int64(r.pages[i].granule), true
+			break
+		}
+	}
 	return pageStart(choice), nil
 }
 
@@ -398,6 +425,9 @@ func splitPagePackets(p page, partial []byte, partialPos int64) ([]queuedPacket,
 		}
 		if current == nil {
 			position = p.offset + 27 + int64(len(p.lacing)) + int64(bodyOffset)
+		}
+		if len(current) > (16<<20)-length {
+			return nil, nil, 0, errors.New("ogg: continued packet exceeds size limit")
 		}
 		current = append(current, p.body[bodyOffset:bodyOffset+length]...)
 		bodyOffset += length

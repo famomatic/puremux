@@ -17,13 +17,16 @@ const (
 )
 
 // MuxOptions configure a compressed-packet muxer. Format is mandatory.
-// FragmentDuration and MaxFragmentBytes bound fMP4 buffering; zero selects
-// conservative defaults.
+// FragmentDuration cuts audio-only fMP4; video cuts at GOP boundaries.
+// MaxFragmentBytes and the internal packet cap can force non-keyframe cuts.
+// Zero selects conservative defaults.
 type MuxOptions struct {
 	Format           Format
 	MP4Mode          MP4Mode
 	FragmentDuration time.Duration
 	MaxFragmentBytes int
+	// AllowMetadataLoss explicitly permits dropping metadata unsupported by the output.
+	AllowMetadataLoss bool
 }
 
 // Muxer serializes already ordered compressed packets. It never repairs,

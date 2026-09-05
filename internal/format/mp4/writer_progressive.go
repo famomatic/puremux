@@ -422,7 +422,7 @@ func makeEDTS(delay, mediaDuration uint64) ([]byte, error) {
 
 func makeProgressiveMDIA(t *progressiveTrack, duration uint64) ([]byte, error) {
 	var p bytes.Buffer
-	mdhd, err := makeMDHD(t.spec.TimeScale, duration)
+	mdhd, err := makeMDHDLanguage(t.spec.TimeScale, duration, t.spec.Language)
 	if err != nil {
 		return nil, err
 	}
@@ -441,13 +441,28 @@ func makeProgressiveMDIA(t *progressiveTrack, duration uint64) ([]byte, error) {
 }
 
 func makeMDHD(scale uint32, duration uint64) ([]byte, error) {
+	return makeMDHDLanguage(scale, duration, "und")
+}
+
+func makeMDHDLanguage(scale uint32, duration uint64, language string) ([]byte, error) {
+	if language == "" {
+		language = "und"
+	}
+	if len(language) != 3 {
+		return nil, ErrInvalidOutputTrack
+	}
+	for _, c := range language {
+		if c < 'a' || c > 'z' {
+			return nil, ErrInvalidOutputTrack
+		}
+	}
 	var p bytes.Buffer
 	putU64(&p, 0)
 	putU64(&p, 0)
 	putU32(&p, scale)
 	putU64(&p, duration)
 	// ISO-639-2/T "und": 21,14,4 packed into 5-bit fields, MSB-first.
-	putU16(&p, uint16(21<<10|14<<5|4))
+	putU16(&p, uint16(language[0]-0x60)<<10|uint16(language[1]-0x60)<<5|uint16(language[2]-0x60))
 	putU16(&p, 0)
 	return outputFullBox("mdhd", 1, 0, p.Bytes())
 }

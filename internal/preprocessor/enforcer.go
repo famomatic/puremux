@@ -10,8 +10,8 @@ import (
 
 // Enforcer forces a packet stream into monotonically increasing DTS order
 // using a bounded jitter buffer. It NEVER writes to a file (ARCHITECTURE.md
-// section 5.B). On overflow it drops the oldest out-of-order packet and
-// records the drop in Metrics so callers can detect stream degradation.
+// section 5.B). Capacity pressure emits the oldest packet to ensure progress;
+// packets arriving behind the emitted watermark are counted and dropped.
 type Enforcer struct {
 	cfg     Config
 	metrics Metrics
@@ -37,8 +37,7 @@ func NewEnforcer(cfg Config) *Enforcer {
 // Process enqueues inbound and emits corrected packets via emit.
 //
 // The jitter buffer holds out-of-order packets until they can be flushed in
-// monotonic order. When the buffer is full the oldest packet that is farthest
-// behind the newest is dropped (overflow policy, §5.B). Emitted packets are
+// monotonic order. Capacity pressure releases the oldest packet. Emitted packets are
 // pool-acquired; the caller owns and must release them.
 func (e *Enforcer) Process(inbound *core.Packet, emit func(*core.Packet)) error {
 	if inbound == nil {
@@ -73,18 +72,6 @@ func (e *Enforcer) insertOrdered(p *core.Packet) {
 	copy(e.buf[idx+1:], e.buf[idx:])
 	e.buf[idx] = p
 
-	// Enforce size bound: if over capacity, drop the oldest (index 0).
-	if len(e.buf) > e.cfg.MaxBufferSize {
-		dropped := e.buf[0]
-		// Shift the remaining packets forward and clear the vacated tail so
-		// the dropped pointer does not linger in the backing array (the old
-		// e.buf = e.buf[1:] form left it referenced until a reallocation).
-		copy(e.buf, e.buf[1:])
-		e.buf[len(e.buf)-1] = nil
-		e.buf = e.buf[:len(e.buf)-1]
-		e.metrics.DroppedOverflow++
-		core.ReleasePacket(dropped)
-	}
 }
 
 // flushReady emits packets that can no longer be overtaken: any packet
@@ -99,12 +86,16 @@ func (e *Enforcer) flushReady(emit func(*core.Packet)) {
 	newest := e.buf[len(e.buf)-1].DTS
 	window := time.Duration(e.cfg.MaxBufferDuration)
 	i := 0
-	for i < len(e.buf)-1 { // never flush the newest via this path
-		p := e.buf[i]
-		if window == 0 {
+	for i < len(e.buf) {
+		full := len(e.buf)-i > e.cfg.MaxBufferSize
+		if !full && i == len(e.buf)-1 {
 			break
 		}
-		if p.DTS > time.Duration(math.MaxInt64)-window || p.DTS+window > newest {
+		p := e.buf[i]
+		if !full && window == 0 {
+			break
+		}
+		if !full && (p.DTS > time.Duration(math.MaxInt64)-window || p.DTS+window > newest) {
 			break // still within the reorder window, hold
 		}
 		e.emitOne(p, emit)

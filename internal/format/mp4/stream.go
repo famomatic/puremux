@@ -21,6 +21,7 @@ func (rd *Reader) initCursors() error {
 }
 
 func (t *trackState) initCursor() error {
+	t.cursorErr = nil
 	t.totalSamples = 0
 	t.consumed = 0
 	t.sttsIdx = 0
@@ -88,6 +89,7 @@ func (t *trackState) peekNext() bool {
 		}
 	}
 	if t.accumUnits > math.MaxInt64 {
+		t.cursorErr = ErrCorrupt
 		return false
 	}
 	dts := int64(t.accumUnits)
@@ -101,7 +103,17 @@ func (t *trackState) peekNext() bool {
 	if t.cttsIdx < len(t.ctts) {
 		compositionOffset = t.ctts[t.cttsIdx].offset
 	}
-	pts := dts + compositionOffset + t.presentationShift
+	var ok bool
+	dts, ok = checkedAddInt64(dts, t.presentationShift)
+	if !ok {
+		t.cursorErr = ErrCorrupt
+		return false
+	}
+	pts, ok := checkedAddInt64(dts, compositionOffset)
+	if !ok {
+		t.cursorErr = ErrCorrupt
+		return false
+	}
 	absMs := uint64(0)
 	if pts > 0 {
 		absMs = timescaleToMs(uint64(pts), t.timescale)
@@ -146,7 +158,7 @@ func (t *trackState) peekNext() bool {
 		// marking every audio SimpleBlock non-keyframe, which is semantically
 		// wrong and breaks seeking/indexing in strict players.
 		isKey = true
-	case len(t.stss) == 0:
+	case !t.hasSTSS && len(t.stss) == 0:
 		// No stss on a video track: every sample is a sync sample (all-intra).
 		isKey = true
 	default:

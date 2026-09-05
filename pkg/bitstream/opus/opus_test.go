@@ -18,6 +18,10 @@ func TestDOPSFromRFC7845OpusHead(t *testing.T) {
 	if !bytes.Equal(dops, want) {
 		t.Fatalf("dOps = %x, want %x", dops, want)
 	}
+	back, err := HeadFromDOPS(dops)
+	if err != nil || !bytes.Equal(back, head) {
+		t.Fatalf("inverse header = %x, %v", back, err)
+	}
 	c, err := ParseDOPS(dops)
 	if err != nil || c.PreSkip != 312 || c.InputSampleRate != 48000 || c.OutputGain != -2 {
 		t.Fatalf("config = %+v, error = %v", c, err)
@@ -36,6 +40,11 @@ func TestOpusConfigBoundaries(t *testing.T) {
 	}
 	if _, err := ParseDOPS([]byte{0, 2}); err == nil {
 		t.Fatal("truncated dOps passed")
+	}
+	for _, data := range [][]byte{nil, {0, 2}, {1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0}} {
+		if _, err := HeadFromDOPS(data); err == nil {
+			t.Fatalf("invalid inverse config accepted: %x", data)
+		}
 	}
 	// RFC 7845 mapping indices address the N+M decoded channels, not the
 	// output channel count C. With N=1 and M=0, index 1 is out of range.

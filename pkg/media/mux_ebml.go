@@ -59,18 +59,19 @@ func (w *positionWriter) Seek(offset int64, whence int) (int64, error) {
 }
 
 type ebmlMuxer struct {
-	w           *positionWriter
-	format      Format
-	streams     []Stream
-	tracks      []webm.TrackSpec
-	header      webm.Header
-	cluster     *webm.ClusterWriter
-	clusterTime int64
-	maxEndTime  int64
-	cues        []webm.CuePoint
-	started     bool
-	closed      bool
-	closeErr    error
+	allowMetadataLoss bool
+	w                 *positionWriter
+	format            Format
+	streams           []Stream
+	tracks            []webm.TrackSpec
+	header            webm.Header
+	cluster           *webm.ClusterWriter
+	clusterTime       int64
+	maxEndTime        int64
+	cues              []webm.CuePoint
+	started           bool
+	closed            bool
+	closeErr          error
 }
 
 func newEBMLMuxer(w io.Writer, format Format) (Muxer, error) {
@@ -83,6 +84,11 @@ func (m *ebmlMuxer) AddStream(stream Stream) (int, error) {
 	}
 	if !stream.TimeBase.Valid() || stream.TimeBase.Num <= 0 {
 		return 0, fmt.Errorf("%w: invalid time base", ErrInvalidData)
+	}
+	if !m.allowMetadataLoss {
+		if err := validateOutputMetadata(stream, m.format); err != nil {
+			return 0, err
+		}
 	}
 	codec := coreCodec(stream.Codec)
 	if codec == 0 || !m.codecAllowed(stream.Codec) {
@@ -111,6 +117,13 @@ func (m *ebmlMuxer) AddStream(stream Stream) (int, error) {
 	codecDelayNS := uint64(stream.CodecDelay)
 	seekPreRollNS := uint64(stream.SeekPreRoll)
 	if stream.Codec == CodecOpus {
+		if stream.Config.Format == CodecConfigDOPS {
+			head, err := opus.HeadFromDOPS(stream.Config.Data)
+			if err != nil {
+				return 0, fmt.Errorf("%w: invalid dOps: %v", ErrInvalidData, err)
+			}
+			stream.Config = CodecConfig{Format: CodecConfigOpusHead, Data: head}
+		}
 		if stream.Config.Format != CodecConfigOpusHead {
 			return 0, fmt.Errorf("%w: Opus requires OpusHead", ErrUnsupportedCodec)
 		}
@@ -136,7 +149,9 @@ func (m *ebmlMuxer) AddStream(stream Stream) (int, error) {
 	}
 	index := len(m.streams)
 	trackNumber := index + 1
+	isDefault := stream.Disposition&DispositionDefault != 0
 	m.tracks = append(m.tracks, webm.TrackSpec{
+		Language: stream.Language, Name: stream.Metadata["title"], Default: &isDefault,
 		Number:        uint64(trackNumber),
 		UID:           uint64(trackNumber),
 		Codec:         codec,
@@ -192,6 +207,13 @@ func normalizeEBMLCodecPrivate(stream Stream) ([]byte, error) {
 	case CodecFLAC:
 		if err := requireFormat(CodecConfigFLACStreamInfo, "FLAC STREAMINFO"); err != nil {
 			return nil, err
+		}
+		if len(data) == 42 && string(data[:4]) != "fLaC" {
+			var err error
+			data, err = flac.StreamInfoFromDFLA(data)
+			if err != nil {
+				return nil, invalid("FLAC")
+			}
 		}
 		private, info, err := flac.MatroskaCodecPrivate(data)
 		if err != nil || info.SampleRate != stream.SampleRate || info.Channels != stream.Channels {

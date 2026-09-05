@@ -81,26 +81,22 @@ func TestEnforcerDropsLatePackets(t *testing.T) {
 	}
 }
 
-func TestEnforcerOverflowDrops(t *testing.T) {
-	// With a large reorder window, packets are held (not flushed) so the
-	// buffer fills. Feeding 5 packets with increasing DTS, each within the
-	// window of the newest, all stay buffered. cap=3 so inserts 4 and 5
-	// overflow and drop the oldest.
+func TestEnforcerCapacityForcesProgress(t *testing.T) {
 	e := NewEnforcer(Config{MaxBufferSize: 3, MaxBufferDuration: uint64(10 * time.Second)})
 	var got []*core.Packet
 	emit := func(p *core.Packet) { got = append(got, p) }
-
 	for i := 0; i < 5; i++ {
 		p := core.AcquirePacket()
 		p.DTS = time.Duration(i) * time.Second
-		e.Process(p, emit) // no Flush: packets accumulate
+		e.Process(p, emit)
 	}
-
-	m := e.Metrics()
-	if m.DroppedOverflow == 0 {
-		t.Errorf("expected DroppedOverflow > 0, got %d (emitted=%d)", m.DroppedOverflow, len(got))
+	if len(got) != 2 || e.Metrics().DroppedOverflow != 0 {
+		t.Fatalf("emitted=%d metrics=%+v", len(got), e.Metrics())
 	}
-
+	e.Flush(emit)
+	if len(got) != 5 {
+		t.Fatalf("lost packets: %d", len(got))
+	}
 	for _, p := range got {
 		core.ReleasePacket(p)
 	}

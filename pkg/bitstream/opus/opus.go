@@ -91,6 +91,27 @@ func ParseDOPS(data []byte) (Config, error) {
 	return c, nil
 }
 
+// HeadFromDOPS converts the big-endian ISO BMFF record to the
+// little-endian RFC 7845 identification header without changing its fields.
+func HeadFromDOPS(data []byte) ([]byte, error) {
+	c, err := ParseDOPS(data)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 19, 21+c.Channels)
+	copy(out, "OpusHead")
+	out[8], out[9] = 1, byte(c.Channels)
+	binary.LittleEndian.PutUint16(out[10:12], c.PreSkip)
+	binary.LittleEndian.PutUint32(out[12:16], c.InputSampleRate)
+	binary.LittleEndian.PutUint16(out[16:18], uint16(c.OutputGain))
+	out[18] = c.ChannelMappingFamily
+	if c.ChannelMappingFamily != 0 {
+		out = append(out, c.StreamCount, c.CoupledCount)
+		out = append(out, c.ChannelMapping...)
+	}
+	return out, nil
+}
+
 func validateChannelMapping(c Config) error {
 	if c.StreamCount == 0 || c.CoupledCount > c.StreamCount {
 		return errors.New("opus: invalid channel mapping")

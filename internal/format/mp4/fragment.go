@@ -41,7 +41,6 @@ func NewFragmentReader(init io.Reader, media io.ReadSeeker) (*Reader, error) {
 	if err := rd.parse(); err != nil {
 		return nil, err
 	}
-	rd.sortFragments()
 	return rd, nil
 }
 
@@ -106,7 +105,6 @@ func (rd *Reader) parseMoof(b box, moofStart int64) error {
 			return err
 		}
 	}
-	rd.sortFragments()
 	return nil
 }
 
@@ -282,8 +280,15 @@ func (rd *Reader) parseTrun(data []byte, state *trafState) error {
 		if state.decodeTime > math.MaxInt64 || duration == 0 || size == 0 || state.dataCursor < 0 {
 			return ErrCorrupt
 		}
-		dts := int64(state.decodeTime)
-		rd.fragments = append(rd.fragments, fragmentSample{track: state.track, dts: dts, pts: dts + composition + state.track.presentationShift, duration: int64(duration), off: state.dataCursor, size: size, keyframe: sampleFlags&0x00010000 == 0})
+		dts, ok := checkedAddInt64(int64(state.decodeTime), state.track.presentationShift)
+		if !ok {
+			return ErrCorrupt
+		}
+		pts, ok := checkedAddInt64(dts, composition)
+		if !ok {
+			return ErrCorrupt
+		}
+		rd.fragments = append(rd.fragments, fragmentSample{track: state.track, dts: dts, pts: pts, duration: int64(duration), off: state.dataCursor, size: size, keyframe: sampleFlags&0x00010000 == 0})
 		if state.decodeTime > math.MaxUint64-uint64(duration) || state.dataCursor > math.MaxInt64-int64(size) {
 			return ErrCorrupt
 		}

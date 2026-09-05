@@ -8,6 +8,9 @@ import (
 
 // TrackSpec is the muxer's view of a track for Tracks-element serialization.
 type TrackSpec struct {
+	Language      string
+	Name          string
+	Default       *bool
 	Number        uint64 // TrackNumber (1-based)
 	UID           uint64 // TrackUID
 	Codec         core.CodecType
@@ -86,6 +89,25 @@ func writeTrackEntry(w io.Writer, t TrackSpec) error {
 	}
 	if err := writeUint(&inner, idTrackUID, t.UID); err != nil {
 		return err
+	}
+	if t.Language != "" {
+		if err := writeString(&inner, idLanguage, t.Language); err != nil {
+			return err
+		}
+	}
+	if t.Name != "" {
+		if err := writeString(&inner, idName, t.Name); err != nil {
+			return err
+		}
+	}
+	if t.Default != nil {
+		var value uint64
+		if *t.Default {
+			value = 1
+		}
+		if err := writeUint(&inner, idFlagDefault, value); err != nil {
+			return err
+		}
 	}
 	tt := trackTypeAudio
 	if t.IsVideo {
