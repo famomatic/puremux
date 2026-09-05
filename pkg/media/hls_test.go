@@ -23,8 +23,7 @@ func TestOpenHLSMasterAES128DiscontinuityAndSeek(t *testing.T) {
 	key := []byte("0123456789abcdef")
 	cipher7 := encryptHLSTestSegment(key, 7, plain7)
 	cipher8 := encryptHLSTestSegment(key, 8, plain8)
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Test") != "hls" {
 			http.Error(w, "missing caller header", http.StatusBadRequest)
 			return

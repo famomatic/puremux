@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // SeekFlags control the eligible indexed point and direction. With no flags,
@@ -61,8 +62,29 @@ type Demuxer interface {
 	Close() error
 }
 
+// OpenStats describes one Open attempt, including failed initialization.
+// Counts cover bytes returned by the Source, excluding its internal prefetch.
+type OpenStats struct {
+	Format    Format
+	Phase     string
+	BytesRead int64
+	ReadCalls int64
+	SeekCalls int64
+	Elapsed   time.Duration
+	Err       error
+}
+
 type OpenOptions struct {
-	// FormatHint bypasses probing. It is required for non-seekable Sources.
+	// MaxInitBytes caps all bytes read while Open initializes the demuxer,
+	// including probing and rereads. Zero is unlimited; it does not limit reads
+	// after Open returns. Use the context deadline to bound blocking I/O.
+	MaxInitBytes int64
+	// OnOpen is called synchronously once with initialization diagnostics.
+	OnOpen func(OpenStats)
+	// ProbeSequential permits consuming four prefix bytes to detect MPEG-TS
+	// on non-seekable sources. Other sequential formats remain unsupported.
+	ProbeSequential bool
+	// FormatHint bypasses probing. Sequential sources support MPEG-TS only.
 	FormatHint Format
 	// MaxProbeBytes caps bytes read during format detection. Zero uses the
 	// implementation default; positive values below four are invalid.

@@ -3,6 +3,49 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## v0.2.3 — 2026-09-06
+
+### Fixed
+
+- WebM/Matroska Open now stops at the first Cluster once Info and Tracks are
+  available, instead of indexing every Cluster before returning. It also avoids
+  SeekEnd, allowing seekable sequential-download spools to deliver the first
+  packet before the tail is available.
+- Collect cluster indexes and trailing Cues/Tags during playback. Explicit Seek
+  can complete the index and may still wait for the remaining download; failed
+  indexing preserves the playback cursor and pending laced packets.
+- Reflect late tags in Info and recheck Remux metadata-loss policy after copying.
+
+### Added
+
+- `HTTPSourceOptions.ReadAheadBytes`: use `-1` for exact-size, low-latency reads
+  from growing download spools; zero retains the 32 KiB default.
+- `OpenHTTPStream` for range-free and unknown-length HTTP responses, and
+  `OpenOptions.ProbeSequential` for explicit MPEG-TS detection on such inputs.
+- `OpenOptions.MaxInitBytes`, `ErrInitLimit`, and `OnOpen`/`OpenStats` for
+  initialization limits and format/phase/I/O diagnostics.
+- `LiveWaitError.RetryAfter` advertises HLS/DASH retry intervals while retaining
+  `errors.Is(err, ErrNoNewSegments)` compatibility.
+- Public Opus `PacketSamples` and `PacketDuration` with the RFC 6716 120 ms cap.
+
+### Changed
+
+- Fragmented MP4 initializes through its first movie fragment; later fragments
+  are parsed during playback. Ogg initializes from OpusHead/Tags and discovers
+  duration at EOS. Explicit seeks may still finish indexes with caller context.
+- Initialization errors retain their original error chain, including transport
+  failures, cancellation, and deadlines.
+- Remove the impossible DASH `time.Duration > math.MaxInt64` comparison and
+  other repository Staticcheck diagnostics.
+
+### Verification
+
+- Specification-derived VINT/block/lacing fixtures and an unchanged independent
+  libwebm golden file start while tail reads and SeekEnd are forbidden. Covered
+  known/unknown sizes, deferred cues/tags, seek retries, cancellation, truncation,
+  and the public ContextSource path. Full tests, race tests, vet, and non-CGO
+  build pass.
+
 ## v0.2.2 — 2026-09-05
 
 ### Fixed

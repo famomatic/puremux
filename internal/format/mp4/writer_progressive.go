@@ -440,10 +440,6 @@ func makeProgressiveMDIA(t *progressiveTrack, duration uint64) ([]byte, error) {
 	return outputBox("mdia", p.Bytes())
 }
 
-func makeMDHD(scale uint32, duration uint64) ([]byte, error) {
-	return makeMDHDLanguage(scale, duration, "und")
-}
-
 func makeMDHDLanguage(scale uint32, duration uint64, language string) ([]byte, error) {
 	if language == "" {
 		language = "und"

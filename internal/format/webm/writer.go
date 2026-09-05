@@ -110,23 +110,6 @@ func writeElement(w io.Writer, id uint32, payload []byte) error {
 	return nil
 }
 
-// reserveElement writes id + a reserved fixed-width size VINT (value 0),
-// returning the offset of the size VINT so it can be patched on Close.
-// The caller writes payload bytes afterward and patches the size.
-func reserveElement(w writeSeeker, id uint32, sizeWidth int) (sizeOffset int64, err error) {
-	if err := writeID(w, id); err != nil {
-		return 0, err
-	}
-	sizeOffset, err = w.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-	if err := writeSizeWidth(w, 0, sizeWidth); err != nil {
-		return 0, err
-	}
-	return sizeOffset, nil
-}
-
 // writeSeeker is the sink the WebM muxer targets. It mirrors muxer.Writer
 // but lives in the format package to avoid an import cycle.
 type writeSeeker interface {

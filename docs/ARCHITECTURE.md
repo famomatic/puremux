@@ -172,6 +172,58 @@ AV1 output includes the `av01` compatible brand; an AV1 sample entry whose
 registered profile/level/bit-depth/chroma combinations and requires its codec
 initialization data size to be zero.
 
+## WebM and Matroska input startup
+
+`Open` reads Info and Tracks, then returns at the first Cluster header. It
+neither traverses the full media index nor calls SeekEnd. A source exposing
+`Size()` must report the total resource length, not the currently downloaded
+prefix; when total length is unknown, the reader discovers EOF through reads.
+A sequential download spool can therefore start playback as soon as the
+initialization and first packet bytes are available. The source must still
+provide seeking within already downloaded bytes and propagate read cancellation.
+Files whose required Info/Tracks are stored after media may need more input
+before opening; this layout cannot guarantee prefix-only startup.
+
+Playback collects Cluster timestamps and encounters trailing Cues/Tags in
+stream order. `Info()` reflects tags discovered so far; Open no longer promises
+trailing metadata or validation of unread media. This follows the Matroska
+[streaming recommendations](https://www.matroska.org/technical/streaming.html)
+and [element ordering rules](https://www.matroska.org/technical/ordering.html).
+
+An explicit Seek can finish the index to preserve direction, track-specific
+cue selection, and unordered-cluster behavior. That operation may wait for the
+remaining download. Failed or canceled indexing restores the playback cursor
+and retains pending laced packets. Remux checks metadata both before and after
+packet copying so late tags cannot silently bypass AllowMetadataLoss; a late
+error can follow writes to a caller-owned output, while RemuxFiles discards its
+temporary output rather than installing it.
+
+## Playback initialization and source capabilities
+
+Public `Open` also defers later fMP4 movie fragments and Ogg media pages. Ogg
+validates pages in playback order and makes duration known at EOS; callers
+should query fresh `Info()`/`Streams()` rather than retain an initialization
+snapshot. Progressive MP4 with a trailing moov still needs access to that moov.
+Fragmented playback follows fragment order and sorts samples within each
+fragment; a full explicit index can inspect all fragments for seeking.
+
+`MaxProbeBytes` limits format detection only. `MaxInitBytes` separately limits
+all Source bytes read during Open, including rereads. `ErrInitLimit` remains
+recognizable through `errors.Is`. `OnOpen` receives one synchronous diagnostic
+snapshot on success or failure. Source-internal prefetch is excluded from these
+counters, and only a context deadline can bound time spent waiting for I/O.
+
+`OpenHTTP` advertises validated random access. `ReadAheadBytes: -1` lets a
+playback caller avoid the default 32 KiB read window on a growing spool.
+`OpenHTTPStream` instead owns one sequential response without requiring Range
+or Content-Length. Canceling its active read terminates that response. Use a
+format hint or `ProbeSequential` for MPEG-TS. Sequential WebM/Ogg still require
+an external rewind-capable spool; no false random-access capability is exposed.
+
+The consumer owns live retry intervals, audio-track choice, seek deadlines,
+preroll removal, RTP clocks and decoder selection. Opus TOC timing inspection is
+public and shared; it does not claim full compressed-payload validation.
+
 ## WebM and Matroska output
 
 Both formats share one EBML implementation and differ by DocType and codec
@@ -228,3 +280,11 @@ go vet ./...
 go mod tidy -diff
 git diff --check
 ```
+
+Live manifests return `LiveWaitError` with an advisory `RetryAfter` interval.
+HLS uses half the target duration after an unchanged reload, following
+[RFC 8216 section 6.3.4](https://www.rfc-editor.org/rfc/rfc8216#section-6.3.4).
+DASH honors an advertised nonzero minimumUpdatePeriod relative to the start
+of MPD retrieval, following the [DASH-IF snapshot validity model](https://dashif.org/Guidelines-TimingModel/#mpd-validity).
+Consumers still control scheduling and cancellation. Missing/zero hints retain
+a 250 ms compatibility fallback; no sleeping occurs inside the demuxer.

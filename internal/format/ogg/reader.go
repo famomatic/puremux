@@ -73,13 +73,18 @@ type Reader struct {
 	duration   int64
 	firstAudio int64
 
-	headerPackets int
-	partial       []byte
-	partialPos    int64
-	pending       []Packet
-	closed        bool
-	audioEnd      int64
-	haveAudio     bool
+	headerPackets    int
+	partial          []byte
+	partialPos       int64
+	pending          []Packet
+	closed           bool
+	indexComplete    bool
+	durationKnown    bool
+	expectedSequence uint32
+	sequenceSet      bool
+	indexed          map[int64]bool
+	audioEnd         int64
+	haveAudio        bool
 }
 
 func NewReader(rs io.ReadSeeker) (*Reader, error) {
@@ -87,7 +92,7 @@ func NewReader(rs io.ReadSeeker) (*Reader, error) {
 		return nil, errors.New("ogg: nil reader")
 	}
 	r := &Reader{rs: rs, tags: make(map[string]string), firstAudio: -1}
-	if err := r.scan(); err != nil {
+	if err := r.scan(context.Background(), false); err != nil {
 		return nil, err
 	}
 	if _, err := r.rs.Seek(0, io.SeekStart); err != nil {
@@ -95,6 +100,28 @@ func NewReader(rs io.ReadSeeker) (*Reader, error) {
 	}
 	r.headerPackets = 0
 	return r, nil
+}
+
+// NewPlaybackReader reads only the identification and comment headers. Later
+// pages are validated during playback; seeking can build the remaining index.
+func NewPlaybackReader(rs io.ReadSeeker) (*Reader, error) {
+	if rs == nil {
+		return nil, errors.New("ogg: nil reader")
+	}
+	r := &Reader{rs: rs, tags: make(map[string]string), firstAudio: -1, indexed: make(map[int64]bool)}
+	if err := r.scan(context.Background(), true); err != nil {
+		return nil, err
+	}
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *Reader) DurationKnown() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.durationKnown
 }
 
 func (r *Reader) Head() OpusHead {
@@ -158,10 +185,23 @@ func (r *Reader) NextPacket(ctx context.Context) (*Packet, error) {
 		}
 		p, err := readPage(r.rs, r.size)
 		if err != nil {
+			if errors.Is(err, io.EOF) && len(r.partial) != 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
 		if p.serial != r.serial {
 			continue
+		}
+		if !r.indexComplete {
+			if r.sequenceSet && p.sequence != r.expectedSequence {
+				return nil, errors.New("ogg: page sequence discontinuity")
+			}
+			r.expectedSequence, r.sequenceSet = p.sequence+1, true
+			if !r.indexed[p.offset] {
+				r.pages = append(r.pages, pageIndex{offset: p.offset, granule: p.granule, flags: p.flags, headersBefore: r.headerPackets})
+				r.indexed[p.offset] = true
+			}
 		}
 		packets, err := r.consumePage(p)
 		if err != nil {
@@ -202,6 +242,10 @@ func (r *Reader) NextPacket(ctx context.Context) (*Packet, error) {
 		if start > math.MaxInt64-total {
 			return nil, errors.New("ogg: audio clock overflow")
 		}
+		if p.flags&0x04 != 0 {
+			r.duration = max(int64(0), end-int64(r.head.PreSkip))
+			r.durationKnown = true
+		}
 		r.audioEnd, r.haveAudio = start+total, true
 		for i, packet := range packets {
 			pts := start - int64(r.head.PreSkip)
@@ -233,6 +277,24 @@ func (r *Reader) SeekSamplesWithDirection(ctx context.Context, target int64, bac
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
+	}
+	if !r.indexComplete {
+		// Scan into temporary state so cancellation retains pending playback packets.
+		pos, err := r.rs.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return 0, err
+		}
+		index := &Reader{rs: r.rs, tags: make(map[string]string), firstAudio: -1}
+		scanErr := index.scan(ctx, false)
+		_, restoreErr := r.rs.Seek(pos, io.SeekStart)
+		if err := errors.Join(scanErr, restoreErr); err != nil {
+			return 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		r.pages, r.size, r.firstAudio = index.pages, index.size, index.firstAudio
+		r.duration, r.durationKnown, r.indexComplete = index.duration, index.durationKnown, true
 	}
 	if target < 0 {
 		target = 0
@@ -303,14 +365,17 @@ func (r *Reader) SeekSamplesWithDirection(ctx context.Context, target int64, bac
 	return pageStart(choice), nil
 }
 
-func (r *Reader) scan() error {
+func (r *Reader) scan(ctx context.Context, headersOnly bool) error {
 	cur, err := r.rs.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
-	size, err := r.rs.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
+	size := int64(math.MaxInt64)
+	if !headersOnly {
+		size, err = r.rs.Seek(0, io.SeekEnd)
+		if err != nil {
+			return err
+		}
 	}
 	r.size = size
 	if _, err := r.rs.Seek(0, io.SeekStart); err != nil {
@@ -322,6 +387,9 @@ func (r *Reader) scan() error {
 	var partial []byte
 	lastGranule := uint64(math.MaxUint64)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		position, _ := r.rs.Seek(0, io.SeekCurrent)
 		if position >= size {
 			break
@@ -362,8 +430,11 @@ func (r *Reader) scan() error {
 		if p.granule != math.MaxUint64 {
 			lastGranule = p.granule
 		}
+		if headersOnly && len(headers) >= 2 {
+			break
+		}
 	}
-	if len(partial) != 0 {
+	if !headersOnly && len(partial) != 0 {
 		return io.ErrUnexpectedEOF
 	}
 	if len(headers) < 2 {
@@ -378,8 +449,15 @@ func (r *Reader) scan() error {
 		return err
 	}
 	r.head, r.tags = head, tags
-	if lastGranule != math.MaxUint64 && lastGranule >= uint64(r.head.PreSkip) && lastGranule-uint64(r.head.PreSkip) <= math.MaxInt64 {
+	if !headersOnly && lastGranule != math.MaxUint64 && lastGranule >= uint64(r.head.PreSkip) && lastGranule-uint64(r.head.PreSkip) <= math.MaxInt64 {
 		r.duration = int64(lastGranule - uint64(r.head.PreSkip))
+		r.durationKnown = true
+	}
+	r.indexComplete = !headersOnly
+	if headersOnly {
+		for _, p := range r.pages {
+			r.indexed[p.offset] = true
+		}
 	}
 	// firstAudio is the page after the tags page for the standard layout. If
 	// audio shared that page, rescan from BOS and skip the two header packets.

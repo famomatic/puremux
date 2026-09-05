@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -195,10 +194,6 @@ func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 			stream := d.streams[p.StreamIndex]
 			if !d.shiftSet {
 				start := d.representation.Segments[d.next].Start
-				if start > math.MaxInt64 {
-					p.Release()
-					return nil, ErrInvalidData
-				}
 				var err error
 				d.shiftNS, err = segmentTimestampShift(p, stream.TimeBase, int64(start))
 				if err != nil {
@@ -223,6 +218,7 @@ func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 }
 
 func (d *dashDemuxer) refresh(ctx context.Context) error {
+	started := time.Now()
 	body, finalURL, err := d.fetchManifest(ctx, d.manifestURL, d.opts.MaxManifestBytes)
 	if err != nil {
 		return err
@@ -262,7 +258,7 @@ func (d *dashDemuxer) refresh(ctx context.Context) error {
 		if !d.dynamic {
 			return io.EOF
 		}
-		return ErrNoNewSegments
+		return &LiveWaitError{Delay: max(250*time.Millisecond, mpd.MinimumUpdatePeriod-time.Since(started))}
 	}
 	updated.Segments = segments
 	newInit := d.init

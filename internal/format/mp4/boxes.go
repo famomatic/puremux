@@ -26,6 +26,9 @@ type Reader struct {
 	trex           map[uint32]trackDefaults
 	fragments      []fragmentSample
 	fragmentCursor int
+	playback       bool
+	indexComplete  bool
+	nextBox        int64
 	// inited is set once the streaming cursors below are primed.
 	inited bool
 }

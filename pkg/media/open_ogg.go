@@ -52,10 +52,19 @@ func newOggDemuxer(src Source, rd *ogg.Reader, contextual *contextReadSeeker) *o
 	return &oggDemuxer{src: src, rd: rd, stream: stream, info: info, contextual: contextual}
 }
 
-func (d *oggDemuxer) Streams() []Stream { return cloneStreams([]Stream{d.stream}) }
+func (d *oggDemuxer) Streams() []Stream {
+	stream := d.stream
+	if d.rd.DurationKnown() {
+		stream.Duration = KnownTimestamp(d.rd.DurationSamples())
+	}
+	return cloneStreams([]Stream{stream})
+}
 
 func (d *oggDemuxer) Info() Info {
 	info := d.info
+	if d.rd.DurationKnown() {
+		info.Duration, info.DurationKnown = samplesDuration(d.rd.DurationSamples()), true
+	}
 	info.Metadata = cloneMetadata(info.Metadata)
 	return info
 }

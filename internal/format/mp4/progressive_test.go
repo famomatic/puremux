@@ -36,9 +36,9 @@ func TestProgressiveExactTimingConfigMetadataAndSeek(t *testing.T) {
 	}
 	mdat := []byte{0x65, 1, 0x41, 2, 0x01, 3}
 	track := buildTrack(0)
-	data, offset := buildRichMP4(track, mdat, "Exact title")
+	_, offset := buildRichMP4(track, mdat, "Exact title")
 	track = buildTrack(uint32(offset))
-	data, _ = buildRichMP4(track, mdat, "Exact title")
+	data, _ := buildRichMP4(track, mdat, "Exact title")
 
 	r, err := NewReader(bytes.NewReader(data))
 	if err != nil {

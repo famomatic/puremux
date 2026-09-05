@@ -90,15 +90,6 @@ func appendBox(dst *bytes.Buffer, typ string, payload []byte) error {
 	return err
 }
 
-func appendFullBox(dst *bytes.Buffer, typ string, version byte, flags uint32, payload []byte) error {
-	b, err := outputFullBox(typ, version, flags, payload)
-	if err != nil {
-		return err
-	}
-	_, err = dst.Write(b)
-	return err
-}
-
 func putU16(b *bytes.Buffer, value uint16) { _ = binary.Write(b, binary.BigEndian, value) }
 func putU32(b *bytes.Buffer, value uint32) { _ = binary.Write(b, binary.BigEndian, value) }
 func putU64(b *bytes.Buffer, value uint64) { _ = binary.Write(b, binary.BigEndian, value) }

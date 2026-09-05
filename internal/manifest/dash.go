@@ -41,12 +41,14 @@ type DASHRepresentation struct {
 }
 
 type DASHManifest struct {
-	Dynamic         bool
-	Duration        time.Duration
-	Representations []DASHRepresentation
+	MinimumUpdatePeriod time.Duration
+	Dynamic             bool
+	Duration            time.Duration
+	Representations     []DASHRepresentation
 }
 
 type mpdXML struct {
+	MinimumUpdatePeriod       string          `xml:"minimumUpdatePeriod,attr"`
 	XMLName                   xml.Name        `xml:"MPD"`
 	Type                      string          `xml:"type,attr"`
 	MediaPresentationDuration string          `xml:"mediaPresentationDuration,attr"`
@@ -157,7 +159,11 @@ func ParseDASH(base *url.URL, data []byte, maxRepresentations, maxSegments int) 
 	if err != nil {
 		return DASHManifest{}, err
 	}
-	manifest := DASHManifest{Dynamic: strings.EqualFold(document.Type, "dynamic"), Duration: duration}
+	minimumUpdatePeriod, err := parseISODuration(document.MinimumUpdatePeriod)
+	if err != nil {
+		return DASHManifest{}, err
+	}
+	manifest := DASHManifest{MinimumUpdatePeriod: minimumUpdatePeriod, Dynamic: strings.EqualFold(document.Type, "dynamic"), Duration: duration}
 	for _, period := range document.Periods {
 		periodDuration := duration
 		if period.Duration != "" {

@@ -38,10 +38,10 @@ func TestStreamingMultiChunk(t *testing.T) {
 	// First build with 3 placeholder offsets so moov size matches the final
 	// build (stco entry count, not values, determines moov length).
 	trak := buildTrak("vp09", 1000, stts, sizes, stsc, []uint32{0, 0, 0}, stss)
-	data, off := buildMP4([][]byte{trak}, mdat)
+	_, off := buildMP4([][]byte{trak}, mdat)
 	stco := []uint32{uint32(off), uint32(off) + 3, uint32(off) + 6}
 	trak = buildTrak("vp09", 1000, stts, sizes, stsc, stco, stss)
-	data, _ = buildMP4([][]byte{trak}, mdat)
+	data, _ := buildMP4([][]byte{trak}, mdat)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -79,9 +79,9 @@ func TestStreamingMultiChunk(t *testing.T) {
 func TestNextSampleDoesNotAdvanceAfterReadFailure(t *testing.T) {
 	sizes := []uint32{3}
 	trak := buildTrak("vp09", 1000, []sttsEntry{{count: 1, delta: 10}}, sizes, []stscEntry{{firstChunk: 1, samplesPerChunk: 1}}, []uint32{0}, []uint32{1})
-	data, off := buildMP4([][]byte{trak}, []byte{1, 2, 3})
+	_, off := buildMP4([][]byte{trak}, []byte{1, 2, 3})
 	trak = buildTrak("vp09", 1000, []sttsEntry{{count: 1, delta: 10}}, sizes, []stscEntry{{firstChunk: 1, samplesPerChunk: 1}}, []uint32{uint32(off)}, []uint32{1})
-	data, _ = buildMP4([][]byte{trak}, []byte{1, 2, 3})
+	data, _ := buildMP4([][]byte{trak}, []byte{1, 2, 3})
 	rs := &armedReadSeeker{Reader: bytes.NewReader(data)}
 	rd, err := NewReader(rs)
 	if err != nil {
@@ -109,9 +109,9 @@ func TestStreamingMultiSTTSEntries(t *testing.T) {
 	stss := []uint32{1}
 	mdat := []byte{0xA1, 0xA2, 0xB1, 0xB2, 0xC1, 0xC2}
 	trak := buildTrak("vp09", 1000, stts, sizes, stsc, nil, stss)
-	data, off := buildMP4([][]byte{trak}, mdat)
+	_, off := buildMP4([][]byte{trak}, mdat)
 	trak = buildTrak("vp09", 1000, stts, sizes, stsc, []uint32{uint32(off)}, stss)
-	data, _ = buildMP4([][]byte{trak}, mdat)
+	data, _ := buildMP4([][]byte{trak}, mdat)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -137,9 +137,9 @@ func TestStreamingAudioNoStss(t *testing.T) {
 	stsc := []stscEntry{{firstChunk: 1, samplesPerChunk: 2}}
 	mdat := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	trak := buildTrak("Opus", 1000, stts, sizes, stsc, nil, nil)
-	data, off := buildMP4([][]byte{trak}, mdat)
+	_, off := buildMP4([][]byte{trak}, mdat)
 	trak = buildTrak("Opus", 1000, stts, sizes, stsc, []uint32{uint32(off)}, nil)
-	data, _ = buildMP4([][]byte{trak}, mdat)
+	data, _ := buildMP4([][]byte{trak}, mdat)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -178,7 +178,7 @@ func TestStreamingUniformSize(t *testing.T) {
 	mdia := mkBox("mdia", bytes.Join([][]byte{mdhd, minf}, nil))
 	tkhd := fullBox("tkhd", tkhdPayload())
 	trak := mkBox("trak", bytes.Join([][]byte{tkhd, mdia}, nil))
-	data, off := buildMP4([][]byte{trak}, mdat)
+	_, off := buildMP4([][]byte{trak}, mdat)
 	// Rebuild with the real stco offset.
 	stszChildren = bytes.Join([][]byte{
 		fullBox("stsd", stsdPayload("vp09")),
@@ -192,7 +192,7 @@ func TestStreamingUniformSize(t *testing.T) {
 	minf = mkBox("minf", stbl)
 	mdia = mkBox("mdia", bytes.Join([][]byte{mdhd, minf}, nil))
 	trak = mkBox("trak", bytes.Join([][]byte{tkhd, mdia}, nil))
-	data, _ = buildMP4([][]byte{trak}, mdat)
+	data, _ := buildMP4([][]byte{trak}, mdat)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {

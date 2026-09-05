@@ -74,16 +74,20 @@ type matroskaElement struct {
 }
 
 // DemuxReader is the seekable, packet-accurate WebM/Matroska reader used by
-// pkg/media. It scans element boundaries and indexes clusters without reading
-// compressed payloads during Open.
+// pkg/media. Open stops at the first Cluster once Info and Tracks are known.
+// Playback collects index entries; explicit seeks can complete the index.
 type DemuxReader struct {
 	mu sync.Mutex
 	rs io.ReadSeeker
 
-	size         int64
-	segmentStart int64
-	segmentEnd   int64
-	firstCluster int64
+	size            int64
+	segmentStart    int64
+	segmentEnd      int64
+	firstCluster    int64
+	indexComplete   bool
+	clusterPosition int64
+	indexedClusters map[int64]bool
+	parsedCues      map[int64]bool
 
 	metadata DemuxMetadata
 	tracks   []DemuxTrack
@@ -100,17 +104,34 @@ type DemuxReader struct {
 }
 
 func NewDemuxReader(rs io.ReadSeeker) (*DemuxReader, error) {
+	size := int64(-1)
+	if sized, ok := rs.(interface{ Size() int64 }); ok {
+		size = sized.Size()
+	}
+	return NewDemuxReaderWithSize(rs, size)
+}
+
+// NewDemuxReaderWithSize accepts a known total byte length without SeekEnd,
+// which can block until download completion on a sequential spool. A negative
+// size means unknown; element reads then discover truncation at consumption.
+func NewDemuxReaderWithSize(rs io.ReadSeeker, size int64) (*DemuxReader, error) {
 	if rs == nil {
 		return nil, errors.New("webm: nil reader")
 	}
 	rd := &DemuxReader{
-		rs:           rs,
-		firstCluster: -1,
+		rs:              rs,
+		size:            size,
+		indexedClusters: make(map[int64]bool),
+		parsedCues:      make(map[int64]bool),
+		firstCluster:    -1,
 		metadata: DemuxMetadata{
 			TimestampScaleNS: defaultTimestampScale,
 			Tags:             make(map[string]string),
 		},
 		trackMap: make(map[int]*DemuxTrack),
+	}
+	if rd.size < 0 {
+		rd.size = math.MaxInt64
 	}
 	if err := rd.scan(); err != nil {
 		return nil, err
@@ -146,31 +167,25 @@ func (rd *DemuxReader) Close() error {
 }
 
 func (rd *DemuxReader) scan() error {
-	cur, err := rd.rs.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	size, err := rd.rs.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
-	}
-	if size < 0 {
-		return errors.New("webm: invalid source size")
-	}
-	rd.size = size
 	if _, err := rd.rs.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 
 	e, err := rd.readElement()
-	if err != nil || e.ID != idEBML || e.Unknown {
+	if err != nil {
+		return fmt.Errorf("webm: EBML header: %w", err)
+	}
+	if e.ID != idEBML || e.Unknown {
 		return errors.New("webm: missing EBML header")
 	}
 	if err := rd.parseEBML(e); err != nil {
 		return err
 	}
 	e, err = rd.readElement()
-	if err != nil || e.ID != idSegment {
+	if err != nil {
+		return fmt.Errorf("webm: Segment header: %w", err)
+	}
+	if e.ID != idSegment {
 		return errors.New("webm: missing Segment")
 	}
 	rd.segmentStart = e.payload
@@ -180,13 +195,17 @@ func (rd *DemuxReader) scan() error {
 	}
 	var durationTicks float64
 	var haveDuration bool
+	haveInfo := false
+scanHeaders:
 	for {
 		pos, _ := rd.rs.Seek(0, io.SeekCurrent)
 		if pos >= rd.segmentEnd {
+			rd.indexComplete = true
 			break
 		}
 		child, err := rd.readElement()
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if errors.Is(err, io.EOF) {
+			rd.indexComplete = true
 			break
 		}
 		if err != nil {
@@ -194,6 +213,7 @@ func (rd *DemuxReader) scan() error {
 		}
 		switch child.ID {
 		case idInfo:
+			haveInfo = true
 			v, ok, err := rd.parseInfo(child)
 			if err != nil {
 				return err
@@ -217,11 +237,14 @@ func (rd *DemuxReader) scan() error {
 			if rd.firstCluster < 0 {
 				rd.firstCluster = child.start
 			}
+			if haveInfo && len(rd.tracks) > 0 {
+				break scanHeaders
+			}
 			next, ticks, err := rd.scanCluster(child)
 			if err != nil {
 				return err
 			}
-			rd.clusters = append(rd.clusters, clusterEntry{timeTicks: ticks, position: child.start})
+			rd.recordCluster(child.start, ticks)
 			if _, err := rd.rs.Seek(next, io.SeekStart); err != nil {
 				return err
 			}
@@ -240,19 +263,14 @@ func (rd *DemuxReader) scan() error {
 	for i := range rd.tracks {
 		rd.trackMap[rd.tracks[i].Number] = &rd.tracks[i]
 	}
-	if haveDuration && durationTicks >= 0 {
-		ns := durationTicks * float64(rd.metadata.TimestampScaleNS)
-		if ns <= float64(math.MaxInt64) {
-			rd.metadata.Duration = time.Duration(ns)
-			rd.metadata.DurationKnown = true
-		}
+	if haveDuration {
+		rd.setDuration(durationTicks)
 	}
+
 	if rd.firstCluster >= 0 {
 		if _, err := rd.rs.Seek(rd.firstCluster, io.SeekStart); err != nil {
 			return err
 		}
-	} else if _, err := rd.rs.Seek(cur, io.SeekStart); err != nil {
-		return err
 	}
 	return nil
 }
@@ -297,6 +315,7 @@ func (rd *DemuxReader) NextPacket(ctx context.Context) (*DemuxPacket, error) {
 					return nil, err
 				}
 				rd.clusterTicks = v
+				rd.recordCluster(rd.clusterPosition, v)
 			case idSimpleBlock:
 				payload, err := rd.readPayload(child)
 				if err != nil {
@@ -319,6 +338,7 @@ func (rd *DemuxReader) NextPacket(ctx context.Context) (*DemuxPacket, error) {
 
 		pos, _ := rd.rs.Seek(0, io.SeekCurrent)
 		if pos >= rd.segmentEnd {
+			rd.indexComplete = true
 			return nil, io.EOF
 		}
 		e, err := rd.readElement()
@@ -326,12 +346,13 @@ func (rd *DemuxReader) NextPacket(ctx context.Context) (*DemuxPacket, error) {
 			return nil, err
 		}
 		if e.ID != idCluster {
-			if err := rd.skipElement(e); err != nil {
+			if err := rd.consumeIndexElement(e); err != nil {
 				return nil, err
 			}
 			continue
 		}
 		rd.inCluster = true
+		rd.clusterPosition = e.start
 		rd.clusterUnknown = e.Unknown
 		rd.clusterEnd = e.end
 		rd.clusterTicks = 0
@@ -352,6 +373,13 @@ func (rd *DemuxReader) SeekTicksWithFlags(ctx context.Context, target uint64, tr
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
+	}
+	// Preserve the former complete-index seek semantics, including unordered
+	// clusters and track-specific cues, but pay for indexing only on explicit seek.
+	if !rd.indexComplete {
+		if err := rd.completeIndex(ctx); err != nil {
+			return 0, err
+		}
 	}
 	var pos int64 = -1
 	var actual uint64
@@ -744,7 +772,19 @@ func (rd *DemuxReader) parseDemuxAudio(parent matroskaElement, t *DemuxTrack) er
 	}
 }
 
-func (rd *DemuxReader) parseCues(parent matroskaElement) error {
+func (rd *DemuxReader) parseCues(parent matroskaElement) (retErr error) {
+	if rd.parsedCues[parent.start] {
+		return rd.skipElement(parent)
+	}
+	before := len(rd.cues)
+	defer func() {
+		if retErr != nil {
+			rd.cues = rd.cues[:before]
+		} else {
+			rd.parsedCues[parent.start] = true
+		}
+	}()
+
 	for {
 		pos, _ := rd.rs.Seek(0, io.SeekCurrent)
 		if pos >= parent.end {
@@ -885,9 +925,16 @@ func (rd *DemuxReader) parseSimpleTag(parent matroskaElement) error {
 }
 
 func (rd *DemuxReader) scanCluster(cluster matroskaElement) (int64, uint64, error) {
+	return rd.scanClusterContext(context.Background(), cluster)
+}
+
+func (rd *DemuxReader) scanClusterContext(ctx context.Context, cluster matroskaElement) (int64, uint64, error) {
 	var ticks uint64
 	if !cluster.Unknown {
 		for {
+			if err := ctx.Err(); err != nil {
+				return 0, 0, err
+			}
 			pos, _ := rd.rs.Seek(0, io.SeekCurrent)
 			if pos >= cluster.end {
 				return cluster.end, ticks, nil
@@ -909,11 +956,17 @@ func (rd *DemuxReader) scanCluster(cluster matroskaElement) (int64, uint64, erro
 		}
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return 0, 0, err
+		}
 		pos, _ := rd.rs.Seek(0, io.SeekCurrent)
 		if pos >= rd.segmentEnd {
 			return pos, ticks, nil
 		}
 		e, err := rd.readElement()
+		if errors.Is(err, io.EOF) {
+			return pos, ticks, nil
+		}
 		if err != nil {
 			return 0, 0, err
 		}

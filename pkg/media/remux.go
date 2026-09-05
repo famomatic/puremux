@@ -51,7 +51,22 @@ func Remux(ctx context.Context, inputs []RemuxInput, dst io.Writer, opts MuxOpti
 		}
 		demuxers = append(demuxers, demuxer)
 	}
-	if !opts.AllowMetadataLoss {
+	if err := validateRemuxMetadata(demuxers, opts.AllowMetadataLoss); err != nil {
+		return err
+	}
+	muxer, err := NewMuxer(dst, opts)
+	if err != nil {
+		return err
+	}
+	if err := remuxDemuxers(ctx, demuxers, muxer, opts.Format); err != nil {
+		return err
+	}
+	// Lazy readers can discover container tags after the final packet.
+	return validateRemuxMetadata(demuxers, opts.AllowMetadataLoss)
+}
+
+func validateRemuxMetadata(demuxers []Demuxer, allowLoss bool) error {
+	if !allowLoss {
 		for i, d := range demuxers {
 			for key, value := range d.Info().Metadata {
 				if value != "" && key != "muxing_app" && key != "writing_app" {
@@ -60,11 +75,7 @@ func Remux(ctx context.Context, inputs []RemuxInput, dst io.Writer, opts MuxOpti
 			}
 		}
 	}
-	muxer, err := NewMuxer(dst, opts)
-	if err != nil {
-		return err
-	}
-	return remuxDemuxers(ctx, demuxers, muxer, opts.Format)
+	return nil
 }
 
 func closeRemuxSources(inputs []RemuxInput) {

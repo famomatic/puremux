@@ -98,9 +98,9 @@ func TestReaderMoreSamplesThanChunks(t *testing.T) {
 	stss := []uint32{1}
 	mdatPayload := []byte{0xAA, 0xAA, 0xAA, 0xAA}
 	trak := buildTrak("vp09", 1000, stts, sizes, stsc, []uint32{0}, stss)
-	data, mdatPayloadOff := buildMP4([][]byte{trak}, mdatPayload)
+	_, mdatPayloadOff := buildMP4([][]byte{trak}, mdatPayload)
 	trak = buildTrak("vp09", 1000, stts, sizes, stsc, []uint32{uint32(mdatPayloadOff)}, stss)
-	data, _ = buildMP4([][]byte{trak}, mdatPayload)
+	data, _ := buildMP4([][]byte{trak}, mdatPayload)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {

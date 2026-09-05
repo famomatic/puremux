@@ -163,7 +163,7 @@ func ParseFrameHeader(data []byte, stream StreamInfo) (FrameHeader, error) {
 		return FrameHeader{}, io.ErrUnexpectedEOF
 	}
 	offset += used
-	blockSize := int(stream.MaxBlockSize)
+	var blockSize int
 	switch blockCode {
 	case 1:
 		blockSize = 192

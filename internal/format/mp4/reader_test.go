@@ -176,6 +176,9 @@ func buildMP4(traks [][]byte, mdatPayload []byte) ([]byte, int) {
 func TestNewReaderNonSeekable(t *testing.T) {
 	r := bytes.NewReader([]byte{0, 0, 0, 8, 'f', 't', 'y', 'p'})
 	_, err := NewReader(r)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("seekable corrupt input: %v", err)
+	}
 	// bytes.Reader IS a ReadSeeker, so this should not fail on seekability.
 	// It will fail on corruption instead. Use a non-seeker to test the gate.
 	nonSeek := struct{ io.Reader }{r}
@@ -215,10 +218,10 @@ func TestReaderVP9Track(t *testing.T) {
 	for i := range mdatPayload {
 		mdatPayload[i] = byte(i + 1) // 1..20
 	}
-	data, mdatPayloadOff := buildMP4([][]byte{trak}, mdatPayload)
+	_, mdatPayloadOff := buildMP4([][]byte{trak}, mdatPayload)
 	stco := []uint32{uint32(mdatPayloadOff)}
 	trak = buildTrak("vp09", 1000, stts, sizes, stsc, stco, stss)
-	data, _ = buildMP4([][]byte{trak}, mdatPayload)
+	data, _ := buildMP4([][]byte{trak}, mdatPayload)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -283,11 +286,11 @@ func TestReaderTwoTracksMergedOrder(t *testing.T) {
 	mdatPayload := []byte{0xAA, 0xAA, 0xAA, 0xAA, 0xBB, 0xBB, 0xBB, 0xBB}
 	vTrak := buildTrak("vp09", 1000, vStts, vSizes, vStsc, nil, vStss)
 	aTrak := buildTrak("Opus", 1000, aStts, aSizes, aStsc, nil, nil)
-	data, mdatPayloadOff := buildMP4([][]byte{vTrak, aTrak}, mdatPayload)
+	_, mdatPayloadOff := buildMP4([][]byte{vTrak, aTrak}, mdatPayload)
 	off := uint32(mdatPayloadOff)
 	vTrak = buildTrak("vp09", 1000, vStts, vSizes, vStsc, []uint32{off}, vStss)
 	aTrak = buildTrak("Opus", 1000, aStts, aSizes, aStsc, []uint32{off + 4}, nil)
-	data, _ = buildMP4([][]byte{vTrak, aTrak}, mdatPayload)
+	data, _ := buildMP4([][]byte{vTrak, aTrak}, mdatPayload)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {
@@ -344,8 +347,8 @@ func TestReaderCo64(t *testing.T) {
 	// First build with offset 0 to discover the mdat payload position. The
 	// trak size is independent of the co64 offset value (both 8 bytes), so the
 	// mdat position is stable across rebuilds.
-	data, mdatPayloadOff := buildMP4([][]byte{buildTrack(0)}, mdatPayload)
-	data, _ = buildMP4([][]byte{buildTrack(uint64(mdatPayloadOff))}, mdatPayload)
+	_, mdatPayloadOff := buildMP4([][]byte{buildTrack(0)}, mdatPayload)
+	data, _ := buildMP4([][]byte{buildTrack(uint64(mdatPayloadOff))}, mdatPayload)
 
 	rd, err := NewReader(bytes.NewReader(data))
 	if err != nil {

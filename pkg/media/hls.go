@@ -452,7 +452,7 @@ func (d *hlsDemuxer) refresh(ctx context.Context) error {
 		if playlist.EndList {
 			return io.EOF
 		}
-		return ErrNoNewSegments
+		return &LiveWaitError{Delay: max(250*time.Millisecond, playlist.TargetDuration/2)}
 	}
 	d.playlist, d.segments, d.next = playlist, newSegments, 0
 	return nil

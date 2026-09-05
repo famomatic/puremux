@@ -9,7 +9,7 @@ import (
 )
 
 // Source is the minimum sequential-input capability. A non-seekable Source
-// can currently be opened as MPEG-TS when OpenOptions.FormatHint is supplied;
+// can currently be opened as MPEG-TS using FormatHint or ProbeSequential;
 // indexed formats require SeekableSource. Closing a Source must unblock an
 // in-progress Read whenever the underlying implementation permits.
 type Source interface {

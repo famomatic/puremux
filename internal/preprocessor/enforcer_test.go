@@ -8,13 +8,6 @@ import (
 	"github.com/famomatic/puremux/internal/core"
 )
 
-func collectPackets(n int) []*core.Packet {
-	out := make([]*core.Packet, 0, n)
-	collect := func(p *core.Packet) { out = append(out, p) }
-	_ = collect
-	return out
-}
-
 func TestEnforcerMonotonicOrder(t *testing.T) {
 	e := NewEnforcer(Config{MaxBufferSize: 10, MaxBufferDuration: 100_000_000})
 	var got []*core.Packet

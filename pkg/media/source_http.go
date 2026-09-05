@@ -20,6 +20,9 @@ type HTTPSourceOptions struct {
 	Header      http.Header
 	MaxRetries  int
 	RetryPolicy HTTPRetryPolicy
+	// ReadAheadBytes is the sequential read window: zero selects 32 KiB,
+	// -1 disables prefetch for latency-sensitive or growing spools.
+	ReadAheadBytes int
 }
 
 // HTTPSource is a bounded, seekable HTTP byte source. Every data request is
@@ -43,6 +46,7 @@ type HTTPSource struct {
 	pos             int64
 	readAhead       []byte
 	readAheadOffset int64
+	readAheadSize   int
 }
 
 // OpenHTTP verifies byte-range support with a one-byte request. client is
@@ -50,6 +54,9 @@ type HTTPSource struct {
 func OpenHTTP(ctx context.Context, rawURL string, opts HTTPSourceOptions) (*HTTPSource, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if opts.ReadAheadBytes < -1 || opts.ReadAheadBytes > 8<<20 {
+		return nil, ErrInvalidData
 	}
 	if rawURL == "" {
 		return nil, errors.New("media: empty HTTP URL")
@@ -60,13 +67,17 @@ func OpenHTTP(ctx context.Context, rawURL string, opts HTTPSourceOptions) (*HTTP
 	}
 	root, cancel := context.WithCancel(context.Background())
 	s := &HTTPSource{
-		client:     client,
-		url:        rawURL,
-		header:     opts.Header.Clone(),
-		maxRetries: max(opts.MaxRetries, 0),
-		retry:      opts.RetryPolicy,
-		ctx:        root,
-		cancel:     cancel,
+		client:        client,
+		url:           rawURL,
+		header:        opts.Header.Clone(),
+		maxRetries:    max(opts.MaxRetries, 0),
+		retry:         opts.RetryPolicy,
+		ctx:           root,
+		cancel:        cancel,
+		readAheadSize: opts.ReadAheadBytes,
+	}
+	if s.readAheadSize == 0 {
+		s.readAheadSize = 32 << 10
 	}
 	if s.header == nil {
 		s.header = make(http.Header)
@@ -114,8 +125,8 @@ func (s *HTTPSource) ReadContext(ctx context.Context, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	const readAheadSize = 32 << 10
-	if len(p) >= readAheadSize || s.pos >= s.size {
+	readAheadSize := s.readAheadSize
+	if readAheadSize < 0 || len(p) >= readAheadSize || s.pos >= s.size {
 		n, err := s.ReadAtContext(ctx, p, s.pos)
 		s.pos += int64(n)
 		return n, err

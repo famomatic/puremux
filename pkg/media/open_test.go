@@ -167,24 +167,26 @@ func TestOpenSequentialMPEGTSWithHint(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	source := &sequentialTestSource{reader: bytes.NewReader(encoded.Bytes())}
-	demuxer, err := Open(context.Background(), source, OpenOptions{FormatHint: FormatMPEGTS})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer demuxer.Close()
-	if source.bytesRead >= len(encoded.Bytes()) {
-		t.Fatalf("streaming Open consumed all %d bytes instead of returning after the first completed PES", source.bytesRead)
-	}
-	if _, err := demuxer.Seek(context.Background(), SeekRequest{StreamIndex: -1}); !errors.Is(err, ErrNotSeekable) {
-		t.Fatalf("streaming seek = %v, want ErrNotSeekable", err)
-	}
-	packet, err := demuxer.ReadPacket(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(packet.Data, []byte{0x11, 0x22, 0x33}) {
-		t.Fatalf("packet data = % X", packet.Data)
+	for _, opts := range []OpenOptions{{FormatHint: FormatMPEGTS}, {ProbeSequential: true}} {
+		source := &sequentialTestSource{reader: bytes.NewReader(encoded.Bytes())}
+		demuxer, err := Open(context.Background(), source, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer demuxer.Close()
+		if source.bytesRead >= len(encoded.Bytes()) {
+			t.Fatalf("streaming Open consumed all %d bytes instead of returning after the first completed PES", source.bytesRead)
+		}
+		if _, err := demuxer.Seek(context.Background(), SeekRequest{StreamIndex: -1}); !errors.Is(err, ErrNotSeekable) {
+			t.Fatalf("streaming seek = %v, want ErrNotSeekable", err)
+		}
+		packet, err := demuxer.ReadPacket(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(packet.Data, []byte{0x11, 0x22, 0x33}) {
+			t.Fatalf("packet data = % X", packet.Data)
+		}
 	}
 }
 

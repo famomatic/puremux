@@ -94,6 +94,27 @@ func (rd *Reader) SeekTicksWithFlags(trackNumber int, target int64, backward, an
 }
 
 func (rd *Reader) seekScaled(trackNumber int, target int64, targetScale uint32, backward, any bool) (int64, uint32, error) {
+	if rd.playback && !rd.indexComplete {
+		pos, err := rd.rs.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return 0, 0, err
+		}
+		if _, err := rd.rs.Seek(0, io.SeekStart); err != nil {
+			return 0, 0, err
+		}
+		indexed, scanErr := NewReader(rd.rs)
+		_, restoreErr := rd.rs.Seek(pos, io.SeekStart)
+		if err := errors.Join(scanErr, restoreErr); err != nil {
+			return 0, 0, err
+		}
+		actual, scale, err := indexed.seekScaled(trackNumber, target, targetScale, backward, any)
+		if err != nil {
+			return 0, 0, err
+		}
+		*rd = *indexed
+		return actual, scale, nil
+	}
+
 	if target < 0 {
 		target = 0
 	}
@@ -161,10 +182,6 @@ func (rd *Reader) seekScaled(trackNumber int, target int64, targetScale uint32, 
 	}
 	rd.inited = true
 	return actual, selected.timescale, nil
-}
-
-func (t *trackState) findSeekIndex(targetNS int64, keyOnly, backward bool) (uint32, int64, error) {
-	return t.findSeekIndexScaled(targetNS, 1_000_000_000, keyOnly, backward)
 }
 
 func (t *trackState) findSeekIndexScaled(target int64, targetScale uint32, keyOnly, backward bool) (uint32, int64, error) {
@@ -254,12 +271,17 @@ func scaleToNS(value int64, scale uint32) int64 {
 
 // NewReader wraps an MP4 input stream. The reader must implement
 // io.ReadSeeker; MP4 sample tables reference absolute mdat offsets.
-func NewReader(r io.Reader) (*Reader, error) {
+func NewReader(r io.Reader) (*Reader, error) { return newReader(r, false) }
+
+// NewPlaybackReader defers later movie fragments until their samples are read.
+func NewPlaybackReader(r io.Reader) (*Reader, error) { return newReader(r, true) }
+
+func newReader(r io.Reader, playback bool) (*Reader, error) {
 	rs, ok := r.(io.ReadSeeker)
 	if !ok {
 		return nil, ErrNotSeekable
 	}
-	rd := &Reader{rs: rs, metadata: make(map[string]string), trex: make(map[uint32]trackDefaults)}
+	rd := &Reader{rs: rs, playback: playback, metadata: make(map[string]string), trex: make(map[uint32]trackDefaults)}
 	if err := rd.parse(); err != nil {
 		return nil, err
 	}
@@ -272,6 +294,15 @@ func NewReader(r io.Reader) (*Reader, error) {
 // NextSample returns the next media sample in merged absolute-time order
 // across all tracks, or io.EOF when exhausted.
 func (rd *Reader) NextSample() (*Sample, error) {
+	for rd.playback && !rd.indexComplete && rd.fragmentCursor >= len(rd.fragments) {
+		if _, err := rd.rs.Seek(rd.nextBox, io.SeekStart); err != nil {
+			return nil, err
+		}
+		if err := rd.parse(); err != nil {
+			return nil, err
+		}
+	}
+
 	if len(rd.fragments) > 0 {
 		if rd.fragmentCursor >= len(rd.fragments) {
 			return nil, io.EOF
@@ -403,8 +434,20 @@ func (rd *Reader) parse() error {
 				return err
 			}
 		case "moof":
+			count := len(rd.fragments)
 			if err := rd.parseMoof(b, off); err != nil {
+				rd.fragments = rd.fragments[:count]
 				return err
+			}
+			if rd.playback {
+				// Sort only this fragment; completed fragments must not move under the
+				// playback cursor when a later fragment has an earlier decode time.
+				all := rd.fragments
+				rd.fragments = all[count:]
+				rd.sortFragments()
+				rd.fragments = all
+				rd.nextBox = off + b.size
+				return nil
 			}
 		default:
 			if err := skipBox(rd.rs, b); err != nil {
@@ -417,6 +460,7 @@ func (rd *Reader) parse() error {
 		return ErrCorrupt
 	}
 	rd.sortFragments()
+	rd.indexComplete = true
 	return nil
 }
 

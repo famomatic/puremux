@@ -86,3 +86,17 @@ func TestParseISODuration(t *testing.T) {
 		t.Fatal("empty duration should be rejected")
 	}
 }
+
+func TestDASHMinimumUpdatePeriod(t *testing.T) {
+	base, _ := url.Parse("https://example.test/live.mpd")
+	for _, tc := range []struct {
+		value string
+		want  time.Duration
+	}{{"PT2.5S", 2500 * time.Millisecond}, {"PT0S", 0}} {
+		xml := `<MPD type="dynamic" minimumUpdatePeriod="` + tc.value + `"><Period><AdaptationSet><Representation id="a"><BaseURL>audio.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>`
+		m, err := ParseDASH(base, []byte(xml), 10, 10)
+		if err != nil || m.MinimumUpdatePeriod != tc.want {
+			t.Fatalf("update period %s: %v %v", tc.value, m.MinimumUpdatePeriod, err)
+		}
+	}
+}

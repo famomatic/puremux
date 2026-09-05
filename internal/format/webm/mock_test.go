@@ -1,7 +1,6 @@
 package webm
 
 import (
-	"bytes"
 	"errors"
 	"io"
 )
@@ -44,23 +43,3 @@ func (m *mockSeeker) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (m *mockSeeker) Bytes() []byte { return m.buf }
-
-// verify helper: ensure buf starts with the given prefix.
-func assertPrefix(t mockTB, got, want []byte, label string) {
-	t.Helper()
-	if !bytes.HasPrefix(got, want) {
-		t.Errorf("%s: got % X, want prefix % X", label, got[:min(len(got), len(want))], want)
-	}
-}
-
-type mockTB interface {
-	Helper()
-	Errorf(format string, args ...any)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

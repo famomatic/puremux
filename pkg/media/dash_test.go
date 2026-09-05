@@ -21,8 +21,7 @@ func TestOpenDASHSegmentListRangesAndSeek(t *testing.T) {
 	second, _ := aac.WrapADTS(config, []byte{3, 4, 5})
 	all := append(append([]byte(nil), first...), second...)
 	var rangeRequests atomic.Int32
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-DASH-Test") != "yes" {
 			http.Error(w, "header", http.StatusBadRequest)
 			return

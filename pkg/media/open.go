@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,7 +23,21 @@ var nanosecondTimeBase = Rational{Num: 1, Den: 1_000_000_000}
 // Open probes src and opens a compressed-packet demuxer. The returned
 // demuxer owns src after a successful call. The caller retains ownership when
 // Open returns an error.
-func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
+func Open(ctx context.Context, src Source, opts OpenOptions) (result Demuxer, resultErr error) {
+	started := time.Now()
+	initState := &initializationState{limit: opts.MaxInitBytes, active: true, stats: OpenStats{Format: opts.FormatHint, Phase: "validation"}}
+	defer func() {
+		initState.active = false
+		initState.stats.Elapsed = time.Since(started)
+		initState.stats.Err = resultErr
+		if opts.OnOpen != nil {
+			opts.OnOpen(initState.stats)
+		}
+	}()
+	if opts.MaxInitBytes < 0 {
+		return nil, errors.New("media: MaxInitBytes must not be negative")
+	}
+
 	if src == nil {
 		return nil, errors.New("media: nil source")
 	}
@@ -33,11 +48,37 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 		return nil, errors.New("media: MaxProbeBytes must not be negative")
 	}
 	rs, seekable := src.(io.ReadSeeker)
-	if !seekable && opts.FormatHint == FormatUnknown {
-		return nil, fmt.Errorf("%w: a non-seekable source requires FormatHint", ErrNotSeekable)
-	}
-	if !seekable && opts.FormatHint != FormatMPEGTS {
-		return nil, fmt.Errorf("%w: %s requires random access", ErrNotSeekable, opts.FormatHint)
+	if !seekable {
+		if opts.FormatHint == FormatUnknown && !opts.ProbeSequential {
+			return nil, fmt.Errorf("%w: a non-seekable source requires FormatHint or ProbeSequential", ErrNotSeekable)
+		}
+		var reader io.Reader = src
+		var streamingContext *contextReader
+		if contextSource, ok := src.(ContextSource); ok {
+			streamingContext = &contextReader{source: contextSource, ctx: ctx}
+			reader = streamingContext
+		}
+		reader = &initializationReader{reader: reader, state: initState}
+		format := opts.FormatHint
+		if format == FormatUnknown {
+			initState.stats.Phase = "probe"
+			if opts.MaxProbeBytes > 0 && opts.MaxProbeBytes < 4 {
+				return nil, errors.New("media: MaxProbeBytes must be at least 4 when probing")
+			}
+			var head [4]byte
+			if _, err := io.ReadFull(reader, head[:]); err != nil {
+				return nil, fmt.Errorf("%w: input header: %w", ErrInvalidData, err)
+			}
+			if head[0] == 0x47 {
+				format = FormatMPEGTS
+			}
+			reader = io.MultiReader(bytes.NewReader(head[:]), reader)
+		}
+		if format != FormatMPEGTS {
+			return nil, fmt.Errorf("%w: sequential input supports MPEG-TS", ErrNotSeekable)
+		}
+		initState.stats.Format, initState.stats.Phase = format, "initialize"
+		return openMPEGTS(src, reader, false, streamingContext)
 	}
 	var contextual *contextReadSeeker
 	if seekable {
@@ -46,8 +87,10 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 			rs = contextual
 		}
 	}
+	rs = &initializationReadSeeker{initializationReader: &initializationReader{reader: rs, state: initState}, seeker: rs}
 	format := opts.FormatHint
 	if format == FormatUnknown {
+		initState.stats.Phase = "probe"
 		probeBytes := int64(12)
 		if opts.MaxProbeBytes > 0 && opts.MaxProbeBytes < probeBytes {
 			probeBytes = opts.MaxProbeBytes
@@ -65,7 +108,7 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 			return nil, seekErr
 		}
 		if err != nil && n < 4 {
-			return nil, fmt.Errorf("%w: input header: %v", ErrInvalidData, err)
+			return nil, fmt.Errorf("%w: input header: %w", ErrInvalidData, err)
 		}
 		if [4]byte(head[:4]) == [4]byte{0x1a, 0x45, 0xdf, 0xa3} {
 			format = FormatMatroska
@@ -85,23 +128,28 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (Demuxer, error) {
 			format = FormatMPEGTS
 		}
 	}
+	initState.stats.Format, initState.stats.Phase = format, "initialize"
 	switch format {
 	case FormatWebM, FormatMatroska:
-		rd, err := webm.NewDemuxReader(rs)
+		size := int64(-1)
+		if sized, ok := src.(interface{ Size() int64 }); ok {
+			size = sized.Size()
+		}
+		rd, err := webm.NewDemuxReaderWithSize(rs, size)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidData, err)
+			return nil, fmt.Errorf("%w: %w", ErrInvalidData, err)
 		}
 		return newWebMDemuxer(src, rd, contextual), nil
 	case FormatOgg:
-		rd, err := ogg.NewReader(rs)
+		rd, err := ogg.NewPlaybackReader(rs)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidData, err)
+			return nil, fmt.Errorf("%w: %w", ErrInvalidData, err)
 		}
 		return newOggDemuxer(src, rd, contextual), nil
 	case FormatMP4:
-		rd, err := mp4.NewReader(rs)
+		rd, err := mp4.NewPlaybackReader(rs)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidData, err)
+			return nil, fmt.Errorf("%w: %w", ErrInvalidData, err)
 		}
 		return newMP4Demuxer(src, rd, contextual), nil
 	case FormatADTS:
@@ -226,7 +274,9 @@ func (d *webMDemuxer) Streams() []Stream {
 
 func (d *webMDemuxer) Info() Info {
 	info := d.info
-	info.Metadata = cloneMetadata(info.Metadata)
+	metadata := d.rd.Metadata()
+	info.Metadata = metadata.Tags
+	info.Duration, info.DurationKnown = metadata.Duration, metadata.DurationKnown
 	return info
 }
 
