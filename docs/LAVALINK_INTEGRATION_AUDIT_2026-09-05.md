@@ -26,8 +26,10 @@ Staticcheck, 비CGO 테스트·vet·빌드·race 검사가 통과했다. lavalin
 비CGO 테스트·vet와 CGO 전체 race 검사도 통과했다. 실제 libavcodec 검사에서는
 960-sample Opus 패킷의 앞 또는 뒤 10 ms를 버리면 480 samples가 출력됐다.
 
-이 수정은 puremux v0.2.3 릴리스에 포함한다. 소비자는 공개 v0.2.3 의존성으로
-전환하며, 로컬 go.work를 끈 상태로 배포된 모듈의 통합 검증을 수행한다.
+puremux v0.2.3 태그를 커밋 372fdedf164636d3a4c03517c6f80fec78b57e65로
+배포했다. lavalink-go는 공개 v0.2.3을 사용하며, go.work 없이 전체 비CGO
+테스트·vet·전체 CGO race·실행 파일 빌드를 통과했다. 소비자 변경 커밋
+0375f93415397ea7d7059ca273d0ae9994be49c7도 원격 main에 반영했다.
 
 남는 계약상 한계: 명시적 탐색은 아직 전체 인덱스를 읽을 수 있으며 context로
 시간을 제한한다. 순차 WebM/Ogg에는 rewind 가능한 spool이 필요하다. gain,
