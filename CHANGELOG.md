@@ -7,6 +7,12 @@ All notable changes to puremux are documented here. Versions are git tags on
 
 ### Fixed
 
+- Ogg Opus playback opens report the duration up front: unless `LazyIndex` is
+  set, `Open` reads at most one maximum-size page (65307 bytes) from the end and
+  uses the last valid page's granule position minus pre-skip (RFC 7845 §4).
+  Previously the duration stayed unknown until EOS, so complete files looked
+  like live streams. An unreadable tail still falls back to learning it at EOS.
+
 - Resolve all 22 reproduced findings in the September 6 audit: output directory
   preservation, bounded MP4/PTS buffers, TS PSI and continuity handling, timestamp
   rollover, AAC/AV1 validation, interrupted reads and failed seeks, HTTP retry and

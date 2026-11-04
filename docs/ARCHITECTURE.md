@@ -201,9 +201,12 @@ temporary output rather than installing it.
 ## Playback initialization and source capabilities
 
 Public `Open` also defers later fMP4 movie fragments and Ogg media pages. Ogg
-validates pages in playback order and makes duration known at EOS; callers
-should query fresh `Info()`/`Streams()` rather than retain an initialization
-snapshot. Progressive MP4 with a trailing moov still needs access to that moov.
+validates pages in playback order. Unless `LazyIndex` is set, Open also reads
+one maximum-size page window at the end of the source and takes the duration
+from the last CRC-valid page of the stream (granule minus pre-skip); with
+`LazyIndex`, or when that tail is unreadable, the duration becomes known at
+EOS. Callers should query fresh `Info()`/`Streams()` rather than retain an
+initialization snapshot. Progressive MP4 with a trailing moov still needs access to that moov.
 Fragmented playback follows fragment order and sorts samples within each
 fragment; a full explicit index can inspect all fragments for seeking.
 

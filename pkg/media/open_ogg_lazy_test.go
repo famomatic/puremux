@@ -58,3 +58,26 @@ func TestIntegrationAuditOggStartsBeforeTail(t *testing.T) {
 	}
 
 }
+
+func TestOggOpenLearnsDurationFromTail(t *testing.T) {
+	// RFC7845 little-endian OpusHead, pre-skip0, rate48000; RFC6716 F8 =20ms.
+	head := append([]byte("OpusHead"), 1, 2, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0)
+	data := append(mediaTestOggPage(2, 0, 1, 0, head), mediaTestOggPage(0, 0, 1, 1, mediaTestOpusTags("tail"))...)
+	data = append(data, mediaTestOggPage(0, 960, 1, 2, []byte{0xf8, 0xff, 0xfe})...)
+	data = append(data, mediaTestOggPage(4, 1920, 1, 3, []byte{0xf8, 0xff, 0xfe})...)
+	open := func(lazy bool) Info {
+		src := &auditDownloadPrefix{Reader: bytes.NewReader(data), available: int64(len(data))}
+		d, err := Open(context.Background(), src, OpenOptions{LazyIndex: lazy})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		return d.Info()
+	}
+	if info := open(false); !info.DurationKnown || info.Duration != 40*time.Millisecond {
+		t.Fatalf("complete source: %+v", info)
+	}
+	if info := open(true); info.DurationKnown {
+		t.Fatalf("LazyIndex must start from headers only: %+v", info)
+	}
+}

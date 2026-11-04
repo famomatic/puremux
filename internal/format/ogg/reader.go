@@ -104,7 +104,19 @@ func NewReader(rs io.ReadSeeker) (*Reader, error) {
 
 // NewPlaybackReader reads only the identification and comment headers. Later
 // pages are validated during playback; seeking can build the remaining index.
+// The duration stays unknown until EOS; see NewPlaybackReaderWithTail.
 func NewPlaybackReader(rs io.ReadSeeker) (*Reader, error) {
+	return NewPlaybackReaderWithTail(rs, false)
+}
+
+// NewPlaybackReaderWithTail is NewPlaybackReader that, when probeTail is set,
+// additionally reads at most one maximum-size page from the end of the source
+// to learn the duration up front: per RFC 7845 section 4 the stream length is
+// the final page's granule position minus pre-skip. The probe is best-effort;
+// an unreadable tail leaves the duration unknown until EOS. Callers whose
+// source is still growing should not probe, since the tail read would wait
+// for the end of the download.
+func NewPlaybackReaderWithTail(rs io.ReadSeeker, probeTail bool) (*Reader, error) {
 	if rs == nil {
 		return nil, errors.New("ogg: nil reader")
 	}
@@ -112,10 +124,48 @@ func NewPlaybackReader(rs io.ReadSeeker) (*Reader, error) {
 	if err := r.scan(context.Background(), true); err != nil {
 		return nil, err
 	}
+	if probeTail {
+		r.probeTailDuration()
+	}
 	if _, err := rs.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	return r, nil
+}
+
+// probeTailDuration sets the duration from the last CRC-valid page of this
+// logical stream within the final maxOggPageSize bytes. Pages of other
+// logical streams, pages without a granule position (-1) and corrupt or
+// truncated candidates are skipped.
+func (r *Reader) probeTailDuration() {
+	size, err := r.rs.Seek(0, io.SeekEnd)
+	if err != nil || size <= 0 {
+		return
+	}
+	start := size - maxOggPageSize
+	if start < 0 {
+		start = 0
+	}
+	if _, err := r.rs.Seek(start, io.SeekStart); err != nil {
+		return
+	}
+	window := make([]byte, size-start)
+	if _, err := io.ReadFull(r.rs, window); err != nil {
+		return
+	}
+	capture := []byte("OggS")
+	for i := bytes.LastIndex(window, capture); i >= 0; i = bytes.LastIndex(window[:i], capture) {
+		p, err := readPage(bytes.NewReader(window[i:]), int64(len(window)-i))
+		if err != nil || p.serial != r.serial || p.granule == math.MaxUint64 {
+			continue
+		}
+		preSkip := uint64(r.head.PreSkip)
+		if p.granule >= preSkip && p.granule-preSkip <= math.MaxInt64 {
+			r.duration = int64(p.granule - preSkip)
+			r.durationKnown = true
+		}
+		return
+	}
 }
 
 func (r *Reader) DurationKnown() bool {

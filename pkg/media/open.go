@@ -141,7 +141,9 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (result Demuxer, re
 		}
 		return newWebMDemuxer(src, rd, contextual), nil
 	case FormatOgg:
-		rd, err := ogg.NewPlaybackReader(rs)
+		// A lazy (possibly growing) source starts from the headers only; a
+		// complete source also reads the final page for an up-front duration.
+		rd, err := ogg.NewPlaybackReaderWithTail(rs, !opts.LazyIndex)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrInvalidData, err)
 		}
