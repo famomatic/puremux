@@ -63,6 +63,7 @@ type dashPeriodXML struct {
 }
 
 type dashAdaptationSetXML struct {
+	ContentProtection []struct{}              `xml:"ContentProtection"`
 	MimeType          string                  `xml:"mimeType,attr"`
 	ContentType       string                  `xml:"contentType,attr"`
 	Codecs            string                  `xml:"codecs,attr"`
@@ -75,6 +76,7 @@ type dashAdaptationSetXML struct {
 }
 
 type dashRepresentationXML struct {
+	ContentProtection []struct{}              `xml:"ContentProtection"`
 	ID                string                  `xml:"id,attr"`
 	MimeType          string                  `xml:"mimeType,attr"`
 	ContentType       string                  `xml:"contentType,attr"`
@@ -182,6 +184,9 @@ func ParseDASH(base *url.URL, data []byte, maxRepresentations, maxSegments int) 
 				return DASHManifest{}, err
 			}
 			for _, raw := range adaptation.Representations {
+				if len(adaptation.ContentProtection) > 0 || len(raw.ContentProtection) > 0 {
+					return DASHManifest{}, errors.New("dash: protected representations unsupported")
+				}
 				if len(manifest.Representations) >= maxRepresentations {
 					return DASHManifest{}, errors.New("dash: too many representations")
 				}

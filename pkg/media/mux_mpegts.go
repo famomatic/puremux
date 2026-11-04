@@ -17,6 +17,7 @@ type mpegtsPacketWriter interface {
 }
 
 type mpegtsMuxer struct {
+	*outputFailure
 	allowMetadataLoss bool
 	w                 mpegtsPacketWriter
 	streams           []Stream
@@ -69,6 +70,9 @@ func (m *mpegtsMuxer) AddStream(stream Stream) (int, error) {
 }
 
 func (m *mpegtsMuxer) WritePacket(ctx context.Context, packet *Packet) error {
+	if err := m.failure(); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -108,5 +112,8 @@ func (m *mpegtsMuxer) Close() error {
 	}
 	m.closed = true
 	m.closeErr = m.w.Close()
+	if err := m.failure(); err != nil {
+		m.closeErr = err
+	}
 	return m.closeErr
 }

@@ -100,3 +100,13 @@ func TestDASHMinimumUpdatePeriod(t *testing.T) {
 		}
 	}
 }
+
+func TestDASHRejectsProtectedRepresentation(t *testing.T) {
+	base, _ := url.Parse("https://example.test/manifest.mpd")
+	for _, protection := range []string{`<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011"/>`, `<ContentProtection/>`} {
+		data := []byte(`<MPD><Period><AdaptationSet>` + protection + `<Representation id="a"><BaseURL>a.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>`)
+		if _, err := ParseDASH(base, data, 10, 10); err == nil {
+			t.Fatal("protected media accepted")
+		}
+	}
+}

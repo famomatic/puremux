@@ -38,6 +38,8 @@ type ADTSFrameInfo struct {
 	SampleRate int
 	// Channels from channel_configuration (0 when signalled out-of-band via PCE).
 	Channels int
+	// ChannelConfig is the encoded index, distinct from Channels.
+	ChannelConfig int
 	// Samples is the PCM sample count per channel carried by this frame:
 	// 1024 * (number_of_raw_data_blocks + 1).
 	Samples int
@@ -72,12 +74,17 @@ func ParseADTSHeader(b []byte) (ADTSFrameInfo, bool) {
 	}
 	freqIdx := (b[2] >> 2) & 0x0F
 	chanCfg := ((b[2] & 0x01) << 2) | (b[3] >> 6)
+	channels := int(chanCfg)
+	if channels == 7 {
+		channels = 8
+	}
 	rawBlocks := int(b[6] & 0x03)
 	return ADTSFrameInfo{
-		Length:     length,
-		SampleRate: adtsSampleRates[freqIdx],
-		Channels:   int(chanCfg),
-		Samples:    1024 * (rawBlocks + 1),
+		Length:        length,
+		SampleRate:    adtsSampleRates[freqIdx],
+		Channels:      channels,
+		ChannelConfig: int(chanCfg),
+		Samples:       1024 * (rawBlocks + 1),
 	}, true
 }
 

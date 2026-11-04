@@ -86,11 +86,11 @@ func TestNewReaderCorruptIsCorruptOrEOF(t *testing.T) {
 
 // TestReaderMoreSamplesThanChunks verifies that a track whose stts/stsz
 // declare more samples than the stco chunk table can hold stops cleanly
-// (EOF) instead of reading from a bogus recycled offset.
+// with ErrCorrupt instead of reading from a bogus recycled offset.
 func TestReaderMoreSamplesThanChunks(t *testing.T) {
 	// 3 samples declared in stts/stsz, but only 1 chunk in stco holding
 	// 1 sample per chunk (stsc). After the first sample, the chunk cursor
-	// is exhausted and chunkIdx+1 >= len(stco); the reader must yield EOF
+	// is exhausted and chunkIdx+1 >= len(stco); the reader must yield ErrCorrupt
 	// rather than fabricate an offset.
 	sizes := []uint32{4, 4, 4}
 	stts := []sttsEntry{{count: 3, delta: 33}}
@@ -114,8 +114,8 @@ func TestReaderMoreSamplesThanChunks(t *testing.T) {
 	if !bytes.Equal(s1.Data, mdatPayload) {
 		t.Errorf("s1 data = %v want %v", s1.Data, mdatPayload)
 	}
-	// No more chunks: the reader must return EOF, not panic or read garbage.
-	if _, err := rd.NextSample(); err != io.EOF {
-		t.Errorf("expected EOF after chunk table exhausted, got %v", err)
+	// No more chunks: the reader must return ErrCorrupt, not panic or read garbage.
+	if _, err := rd.NextSample(); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("expected ErrCorrupt after chunk table exhausted, got %v", err)
 	}
 }

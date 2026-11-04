@@ -68,6 +68,14 @@ type Sample struct {
 	Data      []byte
 }
 
+// Release returns an internal sample payload to its bounded pool.
+func (s *Sample) Release() {
+	if s != nil {
+		core.ReleasePayload(s.Data)
+		s.Data = nil
+	}
+}
+
 // SeekNS positions every progressive track at the sync point selected from
 // trackNumber and returns that point in nanoseconds.
 func (rd *Reader) SeekNS(trackNumber int, targetNS int64) (int64, error) {
@@ -94,7 +102,7 @@ func (rd *Reader) SeekTicksWithFlags(trackNumber int, target int64, backward, an
 }
 
 func (rd *Reader) seekScaled(trackNumber int, target int64, targetScale uint32, backward, any bool) (int64, uint32, error) {
-	if rd.playback && !rd.indexComplete {
+	if rd.playback && (!rd.indexComplete || rd.discardedFragments) {
 		pos, err := rd.rs.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return 0, 0, err
@@ -164,6 +172,18 @@ func (rd *Reader) seekScaled(trackNumber int, target int64, targetScale uint32, 
 	if selected == nil {
 		return 0, 0, ErrCorrupt
 	}
+	saved := make([]trackState, len(rd.tracks))
+	for i, track := range rd.tracks {
+		saved[i] = *track
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			for i, track := range rd.tracks {
+				*track = saved[i]
+			}
+		}
+	}()
 	index, actual, err := selected.findSeekIndexScaled(target, targetScale, selected.info.IsVideo && !any, backward)
 	if err != nil {
 		return 0, 0, err
@@ -181,10 +201,21 @@ func (rd *Reader) seekScaled(trackNumber int, target int64, targetScale uint32, 
 		}
 	}
 	rd.inited = true
+	committed = true
 	return actual, selected.timescale, nil
 }
 
 func (t *trackState) findSeekIndexScaled(target int64, targetScale uint32, keyOnly, backward bool) (uint32, int64, error) {
+	orderedAudio := !t.info.IsVideo && len(t.ctts) == 0
+	for _, entry := range t.stts {
+		if entry.delta == 0 {
+			orderedAudio = false
+			break
+		}
+	}
+	if orderedAudio {
+		return t.findAudioSeek(target, targetScale, backward)
+	}
 	if err := t.initCursor(); err != nil {
 		return 0, 0, err
 	}
@@ -295,6 +326,12 @@ func newReader(r io.Reader, playback bool) (*Reader, error) {
 // across all tracks, or io.EOF when exhausted.
 func (rd *Reader) NextSample() (*Sample, error) {
 	for rd.playback && !rd.indexComplete && rd.fragmentCursor >= len(rd.fragments) {
+		if len(rd.fragments) > 0 {
+			clear(rd.fragments)
+			rd.fragments = rd.fragments[:0]
+			rd.fragmentCursor = 0
+			rd.discardedFragments = true
+		}
 		if _, err := rd.rs.Seek(rd.nextBox, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -303,16 +340,23 @@ func (rd *Reader) NextSample() (*Sample, error) {
 		}
 	}
 
+	if rd.playback && rd.indexComplete && rd.discardedFragments && len(rd.fragments) == 0 {
+		return nil, io.EOF
+	}
 	if len(rd.fragments) > 0 {
 		if rd.fragmentCursor >= len(rd.fragments) {
 			return nil, io.EOF
 		}
 		s := rd.fragments[rd.fragmentCursor]
-		if _, err := rd.rs.Seek(s.off, io.SeekStart); err != nil {
+		if err := seekSampleOffset(rd.rs, s.off); err != nil {
 			return nil, err
 		}
-		data := make([]byte, s.size)
+		if s.size > maxInputSampleBytes {
+			return nil, ErrCorrupt
+		}
+		data := core.AcquirePayload(int(s.size))
 		if _, err := io.ReadFull(rd.rs, data); err != nil {
+			core.ReleasePayload(data)
 			return nil, err
 		}
 		rd.fragmentCursor++
@@ -355,11 +399,15 @@ func (rd *Reader) NextSample() (*Sample, error) {
 	}
 	t := rd.tracks[pick]
 	s := t.peek
-	if _, err := rd.rs.Seek(s.off, io.SeekStart); err != nil {
+	if err := seekSampleOffset(rd.rs, s.off); err != nil {
 		return nil, err
 	}
-	buf := make([]byte, s.size)
+	if s.size > maxInputSampleBytes {
+		return nil, ErrCorrupt
+	}
+	buf := core.AcquirePayload(int(s.size))
 	if _, err := io.ReadFull(rd.rs, buf); err != nil {
+		core.ReleasePayload(buf)
 		return nil, err
 	}
 	// Commit cursor state only after the sample bytes were read successfully.
@@ -466,7 +514,7 @@ func (rd *Reader) parse() error {
 
 // parseMoov reads moov fully and walks its children (mvhd, trak).
 func (rd *Reader) parseMoov(b box) error {
-	if b.payload < 0 || b.payload > 1<<30 {
+	if b.payload < 0 || b.payload > 64<<20 {
 		return ErrCorrupt
 	}
 	buf := make([]byte, b.payload)
@@ -762,6 +810,9 @@ func (rd *Reader) parseStsd(r io.Reader, b box, t *trackState) error {
 		return err
 	}
 	entryCount := binary.BigEndian.Uint32(hdr[4:8])
+	if entryCount > 1 {
+		return errors.New("mp4: multiple sample descriptions unsupported")
+	}
 	remaining := int64(b.payload) - 8
 	if entryCount == 0 || remaining < 8 {
 		if remaining > 0 {
@@ -941,8 +992,15 @@ func (rd *Reader) parseStsz(r io.Reader, b box, t *trackState) error {
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return err
 	}
+	if b.payload < 12 {
+		return ErrCorrupt
+	}
 	t.uniform = binary.BigEndian.Uint32(hdr[4:8])
 	count := binary.BigEndian.Uint32(hdr[8:12])
+	t.sampleCount, t.hasSampleCount = count, true
+	if t.uniform == 0 && uint64(count)*4 > uint64(b.payload-12) {
+		return ErrCorrupt
+	}
 	if t.uniform != 0 {
 		// Uniform sizes; per-sample table omitted. Skip any leftover.
 		leftover := int64(b.payload) - 12
@@ -973,6 +1031,9 @@ func (rd *Reader) parseStsc(r io.Reader, b box, t *trackState) error {
 		var e [12]byte
 		if _, err := io.ReadFull(r, e[:]); err != nil {
 			return err
+		}
+		if binary.BigEndian.Uint32(e[8:12]) > 1 {
+			return errors.New("mp4: sample description switch unsupported")
 		}
 		t.stsc = append(t.stsc, stscEntry{
 			firstChunk:      binary.BigEndian.Uint32(e[0:4]),
@@ -1022,4 +1083,17 @@ func (rd *Reader) parseStss(r io.Reader, b box, t *trackState) error {
 		t.stss = append(t.stss, binary.BigEndian.Uint32(e[:]))
 	}
 	return nil
+}
+
+// Sequential samples need no seek. This preserves Source read-ahead windows.
+func seekSampleOffset(rs io.ReadSeeker, offset int64) error {
+	current, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if current == offset {
+		return nil
+	}
+	_, err = rs.Seek(offset, io.SeekStart)
+	return err
 }

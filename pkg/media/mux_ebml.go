@@ -59,6 +59,7 @@ func (w *positionWriter) Seek(offset int64, whence int) (int64, error) {
 }
 
 type ebmlMuxer struct {
+	*outputFailure
 	allowMetadataLoss bool
 	w                 *positionWriter
 	format            Format
@@ -274,6 +275,9 @@ func (m *ebmlMuxer) codecAllowed(codec CodecID) bool {
 }
 
 func (m *ebmlMuxer) WritePacket(ctx context.Context, packet *Packet) error {
+	if err := m.failure(); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -367,6 +371,11 @@ func (m *ebmlMuxer) closeCluster() error {
 }
 
 func (m *ebmlMuxer) Close() (retErr error) {
+	if err := m.failure(); err != nil {
+		m.closed = true
+		m.closeErr = err
+		return err
+	}
 	if m.closed {
 		return m.closeErr
 	}

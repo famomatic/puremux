@@ -25,7 +25,7 @@ func validateCodecConfig(t OutputTrack) error {
 		}
 	case core.CodecAAC:
 		config, err := aac.ParseASC(t.Config)
-		if err != nil || config.SampleRate != t.SampleRate || config.ChannelConfig != t.Channels {
+		if err != nil || config.SampleRate != t.SampleRate || config.Channels() == 0 || config.Channels() != t.Channels {
 			return ErrInvalidOutputTrack
 		}
 	case core.CodecOpus:

@@ -18,22 +18,24 @@ import (
 // MP4 sample tables reference absolute mdat offsets, so the input must be an
 // io.ReadSeeker.
 type Reader struct {
-	rs             io.ReadSeeker
-	tracks         []*trackState
-	movieTimescale uint32
-	duration       uint64
-	metadata       map[string]string
-	trex           map[uint32]trackDefaults
-	fragments      []fragmentSample
-	fragmentCursor int
-	playback       bool
-	indexComplete  bool
-	nextBox        int64
+	rs                 io.ReadSeeker
+	tracks             []*trackState
+	movieTimescale     uint32
+	duration           uint64
+	metadata           map[string]string
+	trex               map[uint32]trackDefaults
+	fragments          []fragmentSample
+	fragmentCursor     int
+	playback           bool
+	indexComplete      bool
+	discardedFragments bool
+	nextBox            int64
 	// inited is set once the streaming cursors below are primed.
 	inited bool
 }
 
 type trackState struct {
+	audioSeek         []audioSeekPoint
 	info              Track
 	timescale         uint32
 	duration          uint64
@@ -41,6 +43,8 @@ type trackState struct {
 	hasEditMediaTime  bool
 	editLeadMovie     uint64
 	presentationShift int64
+	sampleCount       uint32
+	hasSampleCount    bool
 	sampleSize        []uint32 // stsz per-sample sizes
 	uniform           uint32   // stsz uniform sample size (0 if per-sample)
 	stts              []sttsEntry
@@ -235,13 +239,17 @@ func samplesPerChunkFor(stsc []stscEntry, chunk uint32) uint32 {
 	if len(stsc) == 0 {
 		return 1
 	}
-	spc := stsc[len(stsc)-1].samplesPerChunk
-	for i := len(stsc) - 1; i >= 0; i-- {
-		if chunk >= stsc[i].firstChunk {
-			spc = stsc[i].samplesPerChunk
-			break
+	lo, hi := 0, len(stsc)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if stsc[mid].firstChunk <= chunk {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
+	index := max(0, lo-1)
+	spc := stsc[index].samplesPerChunk
 	if spc == 0 {
 		spc = 1
 	}

@@ -42,12 +42,17 @@ type InputReader struct {
 // It buffers at most one in-progress PES per PID plus packets discovered while
 // waiting for the PMT's audio configuration; it never waits for source EOF.
 type StreamingInputReader struct {
+	packet       [188]byte
+	packetRead   int
 	r            io.Reader
 	offset       int64
 	pmtPID       uint16
 	streamTypes  map[uint16]byte
 	continuity   map[uint16]byte
 	seenCC       map[uint16]bool
+	previous     map[uint16][188]byte
+	duplicated   map[uint16]bool
+	psi          map[uint16][]byte
 	active       map[uint16]*pesBuffer
 	trackByPID   map[uint16]int
 	clocks       map[uint16]*pesClock
@@ -122,26 +127,41 @@ func (s *StreamingInputReader) ready() bool {
 }
 
 func (s *StreamingInputReader) pump() error {
-	var packet [188]byte
-	n, err := io.ReadFull(s.r, packet[:])
+	n, err := io.ReadFull(s.r, s.packet[s.packetRead:])
+	s.packetRead += n
 	if err != nil {
-		if errors.Is(err, io.EOF) && n == 0 {
+		if errors.Is(err, io.EOF) && s.packetRead == 0 {
+			for _, partial := range s.psi {
+				if len(partial) > 0 {
+					return io.ErrUnexpectedEOF
+				}
+			}
 			s.eof = true
 			return s.flushActive()
 		}
 		return err
 	}
+	s.packetRead = 0
 	offset := s.offset
 	s.offset += 188
-	return s.consumePacket(packet[:], offset)
+	return s.consumePacket(s.packet[:], offset)
 }
 
 func (s *StreamingInputReader) consumePacket(packet []byte, offset int64) error {
+	if len(packet) != 188 {
+		return io.ErrUnexpectedEOF
+	}
 	if packet[0] != 0x47 || packet[1]&0x80 != 0 {
 		return errors.New("mpegts: invalid sync or transport error")
 	}
 	start := packet[1]&0x40 != 0
 	pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+	if pid == 0x1fff {
+		return nil
+	}
+	if packet[3]&0xc0 != 0 {
+		return errors.New("mpegts: scrambled packets unsupported")
+	}
 	afc := packet[3] >> 4 & 3
 	if afc == 0 {
 		return errors.New("mpegts: reserved adaptation control")
@@ -158,36 +178,76 @@ func (s *StreamingInputReader) consumePacket(packet []byte, offset int64) error 
 		}
 		payloadOffset = 5 + length
 	}
+	if discontinuity {
+		delete(s.seenCC, pid)
+		delete(s.active, pid)
+		delete(s.psi, pid)
+		delete(s.clocks, pid)
+	}
 	if afc&1 == 0 || payloadOffset == len(packet) {
 		return nil
 	}
+	if s.previous == nil {
+		s.previous = make(map[uint16][188]byte)
+		s.duplicated = make(map[uint16]bool)
+	}
 	cc := packet[3] & 15
-	if s.seenCC[pid] && !discontinuity && cc != (s.continuity[pid]+1)&15 {
-		return errors.New("mpegts: continuity counter gap")
+	var normalized [188]byte
+	copy(normalized[:], packet)
+	// H.222.0 permits the PCR value to differ in a duplicate packet.
+	if afc&2 != 0 && packet[4] >= 7 && packet[5]&0x10 != 0 {
+		clear(normalized[6:12])
+	}
+	if s.seenCC[pid] && !discontinuity {
+		if cc == s.continuity[pid] && normalized == s.previous[pid] && !s.duplicated[pid] {
+			s.duplicated[pid] = true
+			return nil
+		}
+		if cc != (s.continuity[pid]+1)&15 {
+			return errors.New("mpegts: continuity counter gap")
+		}
 	}
 	s.seenCC[pid], s.continuity[pid] = true, cc
+	s.previous[pid], s.duplicated[pid] = normalized, false
 	payload := packet[payloadOffset:]
-	if pid == 0 {
-		section, err := psiSection(payload, start)
+	if pid == 0 || pid == s.pmtPID {
+		sections, err := s.assemblePSI(pid, payload, start)
 		if err != nil {
 			return err
 		}
-		if len(section) > 0 {
-			s.pmtPID, err = parsePAT(section)
-			return err
-		}
-		return nil
-	}
-	if pid == s.pmtPID {
-		section, err := psiSection(payload, start)
-		if err != nil {
-			return err
-		}
-		if len(section) > 0 {
-			if err := parsePMT(section, s.streamTypes); err != nil {
-				return err
+		for _, section := range sections {
+			if section[5]&1 == 0 {
+				continue
+			} // current_next_indicator
+			if pid == 0 {
+				next, err := parsePAT(section)
+				if err != nil {
+					return err
+				}
+				if s.pmtPID != 0xffff && s.pmtPID != next && len(s.tracks) != 0 {
+					return errors.New("mpegts: program change unsupported")
+				}
+				s.pmtPID = next
+			} else {
+				streams := make(map[uint16]byte)
+				if err := parsePMT(section, streams); err != nil {
+					return err
+				}
+				if len(s.tracks) != 0 {
+					if len(streams) != len(s.streamTypes) {
+						return errors.New("mpegts: PMT stream change unsupported")
+					}
+					for id, typ := range streams {
+						if s.streamTypes[id] != typ {
+							return errors.New("mpegts: PMT stream change unsupported")
+						}
+					}
+				}
+				s.streamTypes = streams
+				if err := s.initializeTracks(section); err != nil {
+					return err
+				}
 			}
-			return s.initializeTracks(section)
 		}
 		return nil
 	}
@@ -390,26 +450,70 @@ func (r *InputReader) SeekWithFlags(track int, target int64, backward, any bool)
 	return r.packets[chosen].PTS, nil
 }
 
-func psiSection(payload []byte, start bool) ([]byte, error) {
-	if !start {
+// assemblePSI retains only an incomplete section for each PSI PID. Pointer
+// bytes finish the preceding section; stuffing never starts a new section.
+func (s *StreamingInputReader) assemblePSI(pid uint16, payload []byte, start bool) ([][]byte, error) {
+	if s.psi == nil {
+		s.psi = make(map[uint16][]byte)
+	}
+	var sections [][]byte
+	feed := func(data []byte, allowNew bool) error {
+		for len(data) > 0 {
+			buf := s.psi[pid]
+			if len(buf) == 0 && (!allowNew || data[0] == 0xff) {
+				return nil
+			}
+			need := 3 - len(buf)
+			if need > 0 {
+				n := min(need, len(data))
+				buf = append(buf, data[:n]...)
+				data = data[n:]
+				s.psi[pid] = buf
+				if len(buf) < 3 {
+					return nil
+				}
+			}
+			length := int(buf[1]&15)<<8 | int(buf[2])
+			if length < 9 || length > 1021 || buf[1]&0xf0 != 0xb0 {
+				return errors.New("mpegts: invalid PSI section length/header")
+			}
+			n := min(3+length-len(buf), len(data))
+			buf = append(buf, data[:n]...)
+			data = data[n:]
+			s.psi[pid] = buf
+			if len(buf) < 3+length {
+				return nil
+			}
+			if crc32MPEG(buf) != 0 {
+				return errors.New("mpegts: PSI CRC mismatch")
+			}
+			sections = append(sections, buf)
+			delete(s.psi, pid)
+		}
+		return nil
+	}
+	if start {
+		if len(payload) == 0 || int(payload[0])+1 > len(payload) {
+			return nil, errors.New("mpegts: invalid PSI pointer")
+		}
+		pointer := int(payload[0])
+		payload = payload[1:]
+		if len(s.psi[pid]) > 0 {
+			if err := feed(payload[:pointer], false); err != nil {
+				return nil, err
+			}
+			if len(s.psi[pid]) > 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
+		}
+		payload = payload[pointer:]
+	} else if len(s.psi[pid]) == 0 {
 		return nil, nil
 	}
-	if len(payload) == 0 || int(payload[0])+1 > len(payload) {
-		return nil, errors.New("mpegts: invalid PSI pointer")
+	if err := feed(payload, start); err != nil {
+		return nil, err
 	}
-	payload = payload[1+int(payload[0]):]
-	if len(payload) < 3 {
-		return nil, io.ErrUnexpectedEOF
-	}
-	length := int(payload[1]&15)<<8 | int(payload[2])
-	if length < 4 || 3+length > len(payload) {
-		return nil, io.ErrUnexpectedEOF
-	}
-	section := payload[:3+length]
-	if crc32MPEG(section) != 0 {
-		return nil, errors.New("mpegts: PSI CRC mismatch")
-	}
-	return section, nil
+	return sections, nil
 }
 
 func parsePAT(section []byte) (uint16, error) {
@@ -477,14 +581,23 @@ const (
 )
 
 func (e *timestampEpoch) unwrap(raw int64) (int64, error) {
+	if raw < 0 || raw >= pesTimestampMod {
+		return 0, errors.New("mpegts: invalid timestamp")
+	}
 	if e.seen && e.last-raw > pesTimestampHalf {
 		if e.epoch > math.MaxInt64-pesTimestampMod {
 			return 0, errors.New("mpegts: timestamp epoch overflow")
 		}
 		e.epoch += pesTimestampMod
 	}
+	if e.seen && raw-e.last > pesTimestampHalf {
+		if e.epoch < math.MinInt64+pesTimestampMod {
+			return 0, errors.New("mpegts: timestamp epoch overflow")
+		}
+		e.epoch -= pesTimestampMod
+	}
 	e.last, e.seen = raw, true
-	if raw > math.MaxInt64-e.epoch {
+	if e.epoch > 0 && raw > math.MaxInt64-e.epoch {
 		return 0, errors.New("mpegts: timestamp overflow")
 	}
 	return raw + e.epoch, nil
@@ -543,20 +656,37 @@ func parsePESWithClock(pes *pesBuffer, track int, codec core.CodecType, clock *p
 	}
 	if clock != nil && (flags == 2 || flags == 3) {
 		var err error
-		pts, err = clock.pts.unwrap(pts)
-		if err != nil {
-			return nil, InputTrack{}, err
-		}
 		if flags == 3 {
-			dts, err = clock.dts.unwrap(dts)
+			rawPTS, rawDTS := pts, dts
+			dts, err = clock.dts.unwrap(rawDTS)
 			if err != nil {
 				return nil, InputTrack{}, err
 			}
+			delta := rawPTS - rawDTS
+			if delta > pesTimestampHalf {
+				delta -= pesTimestampMod
+			}
+			if delta < -pesTimestampHalf {
+				delta += pesTimestampMod
+			}
+			if delta > 0 && dts > math.MaxInt64-delta || delta < 0 && dts < math.MinInt64-delta {
+				return nil, InputTrack{}, errors.New("mpegts: timestamp overflow")
+			}
+			pts = dts + delta
+			if pts < math.MinInt64+rawPTS {
+				return nil, InputTrack{}, errors.New("mpegts: timestamp epoch overflow")
+			}
+			clock.pts = timestampEpoch{last: rawPTS, epoch: pts - rawPTS, seen: true}
 		} else {
+			pts, err = clock.pts.unwrap(pts)
+			if err != nil {
+				return nil, InputTrack{}, err
+			}
 			dts = pts
 			clock.dts = clock.pts
 		}
 	}
+
 	payload := data[9+headerLength:]
 	trackInfo := InputTrack{Codec: codec, Timescale: 90000}
 	switch codec {
@@ -569,8 +699,12 @@ func parsePESWithClock(pes *pesBuffer, track int, codec core.CodecType, clock *p
 				return nil, InputTrack{}, err
 			}
 			if trackInfo.SampleRate == 0 {
-				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.ChannelConfig, header.SampleRate
+				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, (aac.Config{ChannelConfig: header.ChannelConfig}).Channels(), header.SampleRate
 				trackInfo.Config, _ = aac.ASC(aac.Config{AudioObjectType: header.Profile, SampleRate: header.SampleRate, FrequencyIndex: header.FrequencyIndex, ChannelConfig: header.ChannelConfig})
+			}
+			config, configErr := aac.ASC(aac.Config{AudioObjectType: header.Profile, SampleRate: header.SampleRate, FrequencyIndex: header.FrequencyIndex, ChannelConfig: header.ChannelConfig})
+			if configErr != nil || !bytes.Equal(config, trackInfo.Config) {
+				return nil, InputTrack{}, errors.New("mpegts: AAC configuration changed within PES")
 			}
 			basePTS, ok := scale90kToSamples(pts, int64(header.SampleRate))
 			if !ok || basePTS > math.MaxInt64-sampleOffset {
@@ -592,6 +726,8 @@ func parsePESWithClock(pes *pesBuffer, track int, codec core.CodecType, clock *p
 			}
 			if trackInfo.SampleRate == 0 {
 				trackInfo.SampleRate, trackInfo.Channels, trackInfo.Timescale = header.SampleRate, header.Channels, header.SampleRate
+			} else if trackInfo.SampleRate != header.SampleRate || trackInfo.Channels != header.Channels {
+				return nil, InputTrack{}, errors.New("mpegts: MP3 configuration changed within PES")
 			}
 			basePTS, ok := scale90kToSamples(pts, int64(header.SampleRate))
 			if !ok || basePTS > math.MaxInt64-sampleOffset {

@@ -42,7 +42,7 @@ type HTTPSource struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
-	posMu           sync.Mutex
+	posMu           contextMutex
 	pos             int64
 	readAhead       []byte
 	readAheadOffset int64
@@ -111,7 +111,14 @@ func (s *HTTPSource) Read(p []byte) (int, error) {
 }
 
 func (s *HTTPSource) ReadContext(ctx context.Context, p []byte) (int, error) {
-	s.posMu.Lock()
+	requestCtx, cleanup, err := s.operationContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer cleanup()
+	if err := s.posMu.lock(requestCtx); err != nil {
+		return 0, err
+	}
 	defer s.posMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -224,6 +231,10 @@ func (s *HTTPSource) Seek(offset int64, whence int) (int64, error) {
 	if next < 0 {
 		return 0, errors.New("media: negative HTTP seek position")
 	}
+	// A position query does not invalidate prefetched data.
+	if offset == 0 && whence == io.SeekCurrent {
+		return s.pos, nil
+	}
 	// Explicit seeks revalidate the resource on the next read.
 	s.readAhead = s.readAhead[:0]
 	s.pos = next
@@ -279,8 +290,22 @@ func (s *HTTPSource) probe(ctx context.Context) (int64, string, string, error) {
 	return total, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), nil
 }
 
+type rangeBodyError struct{ error }
+
 func (s *HTTPSource) fetch(ctx context.Context, dst []byte, start, end int64) (int, error) {
-	resp, err := s.do(ctx, start, end, true)
+	attempt := 0
+	for {
+		n, err := s.fetchAttempt(ctx, dst, start, end, &attempt)
+		var bodyErr *rangeBodyError
+		if !errors.As(err, &bodyErr) || ctx.Err() != nil || attempt >= s.maxRetries || s.retry == nil || !s.retry(attempt, 0, bodyErr.error) {
+			return n, err
+		}
+		attempt++
+	}
+}
+
+func (s *HTTPSource) fetchAttempt(ctx context.Context, dst []byte, start, end int64, attempt *int) (int, error) {
+	resp, err := s.doAttempts(ctx, start, end, true, attempt)
 	if err != nil {
 		return 0, err
 	}
@@ -304,19 +329,29 @@ func (s *HTTPSource) fetch(ctx context.Context, dst []byte, start, end int64) (i
 	}
 	n, err := io.ReadFull(resp.Body, dst)
 	if err != nil {
-		return n, fmt.Errorf("media: truncated HTTP range response: %w", err)
+		return n, &rangeBodyError{fmt.Errorf("media: truncated HTTP range response: %w", err)}
 	}
 	var extra [1]byte
-	if extraN, extraErr := resp.Body.Read(extra[:]); extraN != 0 || (extraErr != nil && !errors.Is(extraErr, io.EOF)) {
+	if extraN, extraErr := resp.Body.Read(extra[:]); extraN != 0 {
 		return n, errors.New("media: oversized HTTP range response")
+	} else if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		return n, &rangeBodyError{extraErr}
 	}
 	return n, nil
 }
 
 func (s *HTTPSource) do(ctx context.Context, start, end int64, conditional bool) (*http.Response, error) {
+	attempt := 0
+	return s.doAttempts(ctx, start, end, conditional, &attempt)
+}
+
+func (s *HTTPSource) doAttempts(ctx context.Context, start, end int64, conditional bool, attempt *int) (*http.Response, error) {
 	var lastStatus int
 	var lastErr error
-	for attempt := 0; ; attempt++ {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.url, nil)
 		if err != nil {
 			return nil, err
@@ -341,12 +376,13 @@ func (s *HTTPSource) do(ctx context.Context, start, end int64, conditional bool)
 			lastStatus = resp.StatusCode
 			_ = resp.Body.Close()
 		}
-		if attempt >= s.maxRetries || s.retry == nil || !s.retry(attempt, lastStatus, lastErr) {
+		if ctx.Err() != nil || *attempt >= s.maxRetries || s.retry == nil || !s.retry(*attempt, lastStatus, lastErr) {
 			if lastErr != nil {
 				return nil, lastErr
 			}
 			return nil, fmt.Errorf("media: HTTP request failed with status %d", lastStatus)
 		}
+		(*attempt)++
 	}
 }
 

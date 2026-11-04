@@ -11,14 +11,16 @@ import (
 )
 
 type mpegTSDemuxer struct {
-	stateMu    sync.Mutex
-	opMu       sync.Mutex
-	src        Source
-	rd         mpegTSInputReader
-	streams    []Stream
-	seekable   bool
-	contextual *contextReader
-	closed     bool
+	lazyRS      io.ReadSeeker
+	lazyContext *contextReadSeeker
+	stateMu     sync.Mutex
+	opMu        contextMutex
+	src         Source
+	rd          mpegTSInputReader
+	streams     []Stream
+	seekable    bool
+	contextual  *contextReader
+	closed      bool
 }
 
 type mpegTSInputReader interface {
@@ -59,7 +61,9 @@ func (d *mpegTSDemuxer) Streams() []Stream { return cloneStreams(d.streams) }
 func (d *mpegTSDemuxer) Info() Info        { return Info{Format: FormatMPEGTS, FormatName: "mpegts"} }
 
 func (d *mpegTSDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return nil, err
+	}
 	defer d.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -72,6 +76,9 @@ func (d *mpegTSDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	}
 	if d.contextual != nil {
 		d.contextual.setContext(ctx)
+	}
+	if d.lazyContext != nil {
+		d.lazyContext.setContext(ctx)
 	}
 	p, err := d.rd.NextPacket()
 	if err != nil {
@@ -89,7 +96,9 @@ func (d *mpegTSDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 }
 
 func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return SeekResult{}, err
+	}
 	defer d.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return SeekResult{}, err
@@ -118,7 +127,14 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 			return SeekResult{}, ErrInvalidData
 		}
 	}
-	rd := d.rd.(*mpegts.InputReader)
+	rd, indexed := d.rd.(*mpegts.InputReader)
+	if !indexed {
+		var err error
+		rd, err = d.indexLazy(ctx)
+		if err != nil {
+			return SeekResult{}, err
+		}
+	}
 	actual, err := rd.SeekWithFlags(index, target, req.Flags&SeekBackward != 0, req.Flags&SeekAny != 0)
 	if err != nil {
 		return SeekResult{}, err
@@ -130,6 +146,7 @@ func (d *mpegTSDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, 
 			return SeekResult{}, ErrInvalidData
 		}
 	}
+	d.rd = rd
 	return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 }
 

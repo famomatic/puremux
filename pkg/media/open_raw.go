@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 
@@ -24,7 +25,7 @@ type audioFrameIndex struct {
 
 type indexedAudioDemuxer struct {
 	stateMu    sync.Mutex
-	opMu       sync.Mutex
+	opMu       contextMutex
 	src        Source
 	rs         io.ReadSeeker
 	stream     Stream
@@ -35,7 +36,7 @@ type indexedAudioDemuxer struct {
 	closed     bool
 }
 
-func openADTS(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demuxer, error) {
+func openADTS(src Source, rs io.ReadSeeker, contextual *contextReadSeeker, lazy ...bool) (Demuxer, error) {
 	size, err := sourceSize(rs)
 	if err != nil {
 		return nil, err
@@ -68,9 +69,16 @@ func openADTS(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 		}
 		if sampleRate == 0 {
 			sampleRate, channels = frame.SampleRate, frame.Channels
-			config = aac.Config{AudioObjectType: int(header[2]>>6) + 1, SampleRate: frame.SampleRate, FrequencyIndex: int(header[2]>>2) & 0xf, ChannelConfig: frame.Channels}
-		} else if sampleRate != frame.SampleRate || channels != frame.Channels {
+			config = aac.Config{AudioObjectType: int(header[2]>>6) + 1, SampleRate: frame.SampleRate, FrequencyIndex: int(header[2]>>2) & 0xf, ChannelConfig: frame.ChannelConfig}
+		} else if sampleRate != frame.SampleRate || channels != frame.Channels || config.AudioObjectType != int(header[2]>>6)+1 {
 			return nil, errors.New("media: ADTS configuration changed")
+		}
+		if len(lazy) > 0 && lazy[0] {
+			asc, err := aac.ASC(config)
+			if err != nil {
+				return nil, err
+			}
+			return newLazyAudio(src, rs, contextual, FormatADTS, CodecAAC, sampleRate, channels, asc, CodecConfigASC, nil, offset, size), nil
 		}
 		frames = append(frames, audioFrameIndex{offset: offset + int64(headerLength), size: frame.Length - headerLength, pts: pts, duration: int64(frame.Samples)})
 		pts += int64(frame.Samples)
@@ -80,7 +88,7 @@ func openADTS(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 	return newIndexedAudio(src, rs, FormatADTS, CodecAAC, sampleRate, channels, asc, CodecConfigASC, frames, nil, contextual), nil
 }
 
-func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demuxer, error) {
+func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker, lazy ...bool) (Demuxer, error) {
 	size, err := sourceSize(rs)
 	if err != nil {
 		return nil, err
@@ -92,7 +100,10 @@ func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demux
 	if err != nil {
 		return nil, err
 	}
-	audioEnd, id3v1, err := readID3v1(rs, size, offset)
+	audioEnd, id3v1 := size, map[string]string{}
+	if len(lazy) == 0 || !lazy[0] {
+		audioEnd, id3v1, err = readID3v1(rs, size, offset)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +132,9 @@ func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demux
 		} else if sampleRate != header.SampleRate || channels != header.Channels {
 			return nil, errors.New("media: MP3 configuration changed")
 		}
+		if len(lazy) > 0 && lazy[0] {
+			return newLazyAudio(src, rs, contextual, FormatMP3, CodecMP3, sampleRate, channels, nil, CodecConfigUnknown, metadata, offset, audioEnd), nil
+		}
 		frames = append(frames, audioFrameIndex{offset: offset, size: header.FrameLength, pts: pts, duration: int64(header.Samples)})
 		pts += int64(header.Samples)
 		offset += int64(header.FrameLength)
@@ -131,7 +145,7 @@ func openMP3(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demux
 	return newIndexedAudio(src, rs, FormatMP3, CodecMP3, sampleRate, channels, nil, CodecConfigUnknown, frames, metadata, contextual), nil
 }
 
-func openFLAC(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demuxer, error) {
+func openFLAC(src Source, rs io.ReadSeeker, contextual *contextReadSeeker, lazy ...bool) (Demuxer, error) {
 	size, err := sourceSize(rs)
 	if err != nil {
 		return nil, err
@@ -191,6 +205,11 @@ func openFLAC(src Source, rs io.ReadSeeker, contextual *contextReadSeeker) (Demu
 	audioStart, err := rs.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, err
+	}
+	if len(lazy) > 0 && lazy[0] {
+		d := newLazyAudio(src, rs, contextual, FormatFLAC, CodecFLAC, streamInfo.SampleRate, streamInfo.Channels, streamInfoRaw, CodecConfigFLACStreamInfo, metadata, audioStart, size)
+		d.flacInfo = streamInfo
+		return d, nil
 	}
 	frames, err := indexFLACFrames(rs, size, audioStart, streamInfo)
 	if err != nil {
@@ -253,7 +272,9 @@ func (d *indexedAudioDemuxer) Info() Info {
 	return info
 }
 func (d *indexedAudioDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return nil, err
+	}
 	defer d.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -274,15 +295,18 @@ func (d *indexedAudioDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	if _, err := d.rs.Seek(frame.offset, io.SeekStart); err != nil {
 		return nil, err
 	}
-	data := make([]byte, frame.size)
+	data := core.AcquirePayload(frame.size)
 	if _, err := io.ReadFull(d.rs, data); err != nil {
+		core.ReleasePayload(data)
 		return nil, err
 	}
 	d.next++
-	return &Packet{StreamIndex: 0, Data: data, PTS: KnownTimestamp(frame.pts), DTS: KnownTimestamp(frame.pts), Duration: KnownTimestamp(frame.duration), Flags: PacketKeyframe, Pos: frame.offset}, nil
+	return &Packet{StreamIndex: 0, Data: data, release: core.ReleasePayload, PTS: KnownTimestamp(frame.pts), DTS: KnownTimestamp(frame.pts), Duration: KnownTimestamp(frame.duration), Flags: PacketKeyframe, Pos: frame.offset}, nil
 }
 func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return SeekResult{}, err
+	}
 	defer d.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return SeekResult{}, err
@@ -310,23 +334,12 @@ func (d *indexedAudioDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekRe
 	if len(d.frames) == 0 {
 		return SeekResult{}, ErrInvalidData
 	}
-	d.next = len(d.frames) - 1
 	if req.Flags&SeekBackward != 0 {
-		d.next = 0
-		for i, frame := range d.frames {
-			if frame.pts > target {
-				break
-			}
-			d.next = i
-		}
+		d.next = max(0, sort.Search(len(d.frames), func(i int) bool { return d.frames[i].pts > target })-1)
 	} else {
-		for i, frame := range d.frames {
-			if frame.pts >= target {
-				d.next = i
-				break
-			}
-		}
+		d.next = min(len(d.frames)-1, sort.Search(len(d.frames), func(i int) bool { return d.frames[i].pts >= target }))
 	}
+
 	actual := int64(0)
 	if len(d.frames) > 0 {
 		actual = d.frames[d.next].pts
@@ -459,52 +472,57 @@ func parseVorbisComments(data []byte, metadata map[string]string) error {
 	return nil
 }
 
+// Frame payloads remain opaque. A candidate boundary must satisfy both the
+// header and full preceding-frame CRC, plus the coded frame/sample number.
 func indexFLACFrames(rs io.ReadSeeker, size, start int64, info flac.StreamInfo) ([]audioFrameIndex, error) {
 	if _, err := rs.Seek(start, io.SeekStart); err != nil {
 		return nil, err
 	}
 	reader := bufio.NewReaderSize(rs, 64<<10)
-	var offsets []int64
-	position := start
+	var frames []audioFrameIndex
+	position, frameStart, pts := start, start, int64(0)
+	var current flac.FrameHeader
+	var crc uint16
+	have := false
 	for position < size {
 		peek, _ := reader.Peek(16)
 		if len(peek) >= 6 && peek[0] == 0xff && peek[1]&0xfe == 0xf8 {
-			if _, err := flac.ParseFrameHeader(peek, info); err == nil {
-				offsets = append(offsets, position)
+			h, err := flac.ParseFrameHeader(peek, info)
+			if err == nil && h.SampleRate == info.SampleRate && h.Channels == info.Channels && h.BitsPerSample == info.BitsPerSample {
+				expected := uint64(len(frames))
+				if have {
+					expected++
+				}
+				if h.VariableBlock {
+					expected = uint64(pts)
+					if have {
+						expected += uint64(current.BlockSize)
+					}
+				}
+				if h.Number == expected && (!have && position == start || have && crc == 0 && position-frameStart >= int64(current.HeaderLength+2) && h.VariableBlock == current.VariableBlock) {
+					if have {
+						frames = append(frames, audioFrameIndex{offset: frameStart, size: int(position - frameStart), pts: pts, duration: int64(current.BlockSize)})
+						pts += int64(current.BlockSize)
+					}
+					current, frameStart, have, crc = h, position, true, 0
+				}
 			}
 		}
-		if _, err := reader.ReadByte(); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, err
+		if !have || position-frameStart >= 64<<20 {
+			return nil, ErrInvalidData
 		}
-		position++
-	}
-	if len(offsets) == 0 && start < size {
-		return nil, ErrInvalidData
-	}
-	frames := make([]audioFrameIndex, len(offsets))
-	var pts int64
-	for i, offset := range offsets {
-		end := size
-		if i+1 < len(offsets) {
-			end = offsets[i+1]
-		}
-		if _, err := rs.Seek(offset, io.SeekStart); err != nil {
-			return nil, err
-		}
-		header := make([]byte, min(16, int(end-offset)))
-		if _, err := io.ReadFull(rs, header); err != nil {
-			return nil, err
-		}
-		parsed, err := flac.ParseFrameHeader(header, info)
+		b, err := reader.ReadByte()
 		if err != nil {
 			return nil, err
 		}
-		duration := int64(parsed.BlockSize)
-		frames[i] = audioFrameIndex{offset: offset, size: int(end - offset), pts: pts, duration: duration}
-		pts += duration
+		crc = flac.UpdateCRC16(crc, []byte{b})
+		position++
+	}
+	if have {
+		if crc != 0 || position-frameStart < int64(current.HeaderLength+2) {
+			return nil, ErrInvalidData
+		}
+		frames = append(frames, audioFrameIndex{offset: frameStart, size: int(position - frameStart), pts: pts, duration: int64(current.BlockSize)})
 	}
 	return frames, nil
 }

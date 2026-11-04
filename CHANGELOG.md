@@ -3,6 +3,33 @@
 All notable changes to puremux are documented here. Versions are git tags on
 `main`; the module has no `v1` stability promise yet.
 
+## Unreleased
+
+### Fixed
+
+- Resolve all 22 reproduced findings in the September 6 audit: output directory
+  preservation, bounded MP4/PTS buffers, TS PSI and continuity handling, timestamp
+  rollover, AAC/AV1 validation, interrupted reads and failed seeks, HTTP retry and
+  cancellation, and exact manifest origins. See `docs/AUDIT_FIXES_2026-09-06.md`.
+- Verify FLAC frame CRC16 and coded-number progression, reject unsupported MP4
+  description/TS program changes, and preserve terminal destination I/O failures.
+- Reject protected DASH representations explicitly. Stop inferring 192-byte M2TS
+  output from `.m2ts`; the MPEG-TS writer emits 188-byte packets with `.ts` output.
+
+### Added
+
+- `OpenOptions.LazyIndex` for header-only raw audio and seekable TS startup.
+- `OpenMP4WithInitOptions` for separate-init byte budgets and diagnostics.
+- `LiveIngestOptions.MaxBufferBytes` for aggregate retained payload limits.
+- HLS/DASH `HeaderForURL` callbacks for per-resource credential policies.
+
+### Improved
+
+- Reuse bounded payload and fragment scratch storage; encode each moof once.
+- Preserve sequential HTTP prefetch, use binary raw-audio/stsc lookup, and use
+  sparse checkpoints for repeated ordered-audio MP4 seeks.
+- Decrypt owned HLS ciphertext in place while preserving same-URI key rotation.
+
 ## v0.2.3 — 2026-09-06
 
 ### Fixed

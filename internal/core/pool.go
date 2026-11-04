@@ -24,6 +24,11 @@ func ReleasePacket(p *Packet) {
 	if p == nil {
 		return
 	}
+	if p.Budget != nil {
+		p.Budget.ReleasePacketBytes(p.BudgetBytes)
+		p.Budget = nil
+		p.BudgetBytes = 0
+	}
 	if cap(p.Data) > maxPooledPacketCapacity {
 		p.Data = nil
 	}

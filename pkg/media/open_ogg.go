@@ -14,7 +14,7 @@ var opusTimeBase = Rational{Num: 1, Den: 48_000}
 
 type oggDemuxer struct {
 	stateMu    sync.Mutex
-	opMu       sync.Mutex
+	opMu       contextMutex
 	src        Source
 	rd         *ogg.Reader
 	stream     Stream
@@ -70,7 +70,9 @@ func (d *oggDemuxer) Info() Info {
 }
 
 func (d *oggDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return nil, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	if d.closed {
@@ -100,7 +102,9 @@ func (d *oggDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 }
 
 func (d *oggDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return SeekResult{}, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	if d.closed {

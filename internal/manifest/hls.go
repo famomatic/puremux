@@ -286,6 +286,8 @@ func ParseHLS(base *url.URL, data []byte, maxEntries int) (HLSPlaylist, error) {
 		if pendingRange.Valid {
 			previousRangeEnd = pendingRange.Offset + pendingRange.Length
 			previousRangeURI = uri
+		} else {
+			previousRangeEnd, previousRangeURI = 0, ""
 		}
 		pendingDuration, pendingTitle, pendingRange, pendingRangeImplicit, discontinuity = 0, "", ByteRange{}, false, false
 	}

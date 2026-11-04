@@ -112,5 +112,5 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "  puremux probe INPUT")
 	fmt.Fprintln(w, "  puremux remux -o OUTPUT INPUT [INPUT ...]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Output may be MP4 (.mp4/.m4a/.m4v), WebM (.webm), Matroska (.mkv/.mka), or MPEG-TS (.ts/.m2ts).")
+	fmt.Fprintln(w, "Output may be MP4 (.mp4/.m4a/.m4v), WebM (.webm), Matroska (.mkv/.mka), or MPEG-TS (.ts, 188-byte packets).")
 }

@@ -84,16 +84,21 @@ func (c CodecType) IsAudio() bool {
 // The Data slice MUST be treated as opaque: callers may inspect codec packet
 // headers via a CodecKeyframeDetector but MUST NOT decode the payload to
 // pixels/PCM (see ARCHITECTURE.md section 4).
+// PacketBudget receives released retained-byte reservations.
+type PacketBudget interface{ ReleasePacketBytes(int) }
+
 type Packet struct {
-	Data       []byte
-	PTS        time.Duration
-	DTS        time.Duration
-	Duration   time.Duration
-	IsKeyframe bool
-	Codec      CodecType
-	TrackID    int
-	Flags      uint16
-	Pos        int64
+	Budget      PacketBudget
+	BudgetBytes int
+	Data        []byte
+	PTS         time.Duration
+	DTS         time.Duration
+	Duration    time.Duration
+	IsKeyframe  bool
+	Codec       CodecType
+	TrackID     int
+	Flags       uint16
+	Pos         int64
 	// DiscardPadding retains container-level compressed-packet padding. It is
 	// metadata only; preprocessors never inspect or alter packet payloads.
 	DiscardPadding time.Duration
@@ -102,6 +107,8 @@ type Packet struct {
 // Reset clears the packet for reuse without releasing the Data backing array.
 // Call before returning the packet to the pool.
 func (p *Packet) Reset() {
+	p.Budget = nil
+	p.BudgetBytes = 0
 	p.Data = p.Data[:0]
 	p.PTS = 0
 	p.DTS = 0

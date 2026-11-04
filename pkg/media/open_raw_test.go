@@ -161,7 +161,7 @@ func TestOpenFLACFramesAndComments(t *testing.T) {
 		if err != nil {
 			t.Fatalf("packet %d: %v", i, err)
 		}
-		if p.PTS.Value != int64(i*256) || p.Duration.Value != 256 || p.Data[len(p.Data)-1] != want {
+		if p.PTS.Value != int64(i*256) || p.Duration.Value != 256 || p.Data[len(p.Data)-3] != want {
 			t.Fatalf("packet %d: %+v", i, p)
 		}
 	}
@@ -277,5 +277,8 @@ func flacFrameFixture(number byte, marker byte) []byte {
 	// 9=44.1 kHz, independent stereo, 16-bit, one-byte UTF-8 frame number.
 	header := []byte{0xff, 0xf8, 0x89, 0x18, number}
 	header = append(header, flacbits.CRC8(header))
-	return append(header, 0x00, 0x00, marker)
+	// Two constant 16-bit subframes (header 00, sample 00/marker), then CRC16.
+	frame := append(header, 0, 0, marker, 0, 0, marker)
+	crc := flacbits.UpdateCRC16(0, frame)
+	return append(frame, byte(crc>>8), byte(crc))
 }

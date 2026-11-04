@@ -185,6 +185,10 @@ func (r *Reader) NextPacket(ctx context.Context) (*Packet, error) {
 		}
 		p, err := readPage(r.rs, r.size)
 		if err != nil {
+			_, restoreErr := r.rs.Seek(position, io.SeekStart)
+			if restoreErr != nil {
+				err = errors.Join(err, restoreErr)
+			}
 			if errors.Is(err, io.EOF) && len(r.partial) != 0 {
 				return nil, io.ErrUnexpectedEOF
 			}

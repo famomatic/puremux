@@ -29,9 +29,18 @@ func (rd *DemuxReader) consumeIndexElement(e matroskaElement) error {
 	}
 }
 
-// completeIndex is invoked only by explicit Seek. It does not change playback
-// state or lose pending laced packets when canceled or when the source fails.
-func (rd *DemuxReader) completeIndex(ctx context.Context) (retErr error) {
+// indexCovers reports whether the contiguous scan already reached target.
+// Cluster times never decrease along the file, so any later cluster is at or
+// beyond scanMax and cannot be a closer candidate in either direction.
+func (rd *DemuxReader) indexCovers(target uint64) bool {
+	return rd.indexNext != 0 && rd.scanMax >= target
+}
+
+// completeIndex is invoked only by explicit Seek. It scans forward from where
+// the previous scan stopped and returns once the target is covered or the
+// segment ends. It does not change playback state or lose pending laced
+// packets when canceled or when the source fails; progress made so far is kept.
+func (rd *DemuxReader) completeIndex(ctx context.Context, target uint64) (retErr error) {
 	saved, err := rd.rs.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -42,12 +51,18 @@ func (rd *DemuxReader) completeIndex(ctx context.Context) (retErr error) {
 		rd.indexComplete = true
 		return nil
 	}
+	if rd.indexNext != 0 {
+		start = rd.indexNext
+	}
 	if _, err := rd.rs.Seek(start, io.SeekStart); err != nil {
 		return err
 	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if rd.indexCovers(target) {
+			return nil
 		}
 		pos, err := rd.rs.Seek(0, io.SeekCurrent)
 		if err != nil {
@@ -74,8 +89,17 @@ func (rd *DemuxReader) completeIndex(ctx context.Context) (retErr error) {
 			if _, err := rd.rs.Seek(next, io.SeekStart); err != nil {
 				return err
 			}
-		} else if err := rd.consumeIndexElement(e); err != nil {
-			return err
+			rd.scanMax = max(rd.scanMax, ticks)
+			rd.indexNext = next
+		} else {
+			if err := rd.consumeIndexElement(e); err != nil {
+				return err
+			}
+			cur, err := rd.rs.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+			rd.indexNext = cur
 		}
 	}
 }

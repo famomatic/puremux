@@ -153,11 +153,11 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (result Demuxer, re
 		}
 		return newMP4Demuxer(src, rd, contextual), nil
 	case FormatADTS:
-		return openADTS(src, rs, contextual)
+		return openADTS(src, rs, contextual, opts.LazyIndex)
 	case FormatMP3:
-		return openMP3(src, rs, contextual)
+		return openMP3(src, rs, contextual, opts.LazyIndex)
 	case FormatFLAC:
-		return openFLAC(src, rs, contextual)
+		return openFLAC(src, rs, contextual, opts.LazyIndex)
 	case FormatMPEGTS:
 		var reader io.Reader = rs
 		var streamingContext *contextReader
@@ -168,7 +168,7 @@ func Open(ctx context.Context, src Source, opts OpenOptions) (result Demuxer, re
 				reader = streamingContext
 			}
 		}
-		return openMPEGTS(src, reader, seekable, streamingContext)
+		return openMPEGTSLazy(src, reader, seekable, streamingContext, contextual, opts.LazyIndex)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
 	}
@@ -195,7 +195,7 @@ func (r *contextReader) setContext(ctx context.Context) {
 
 type webMDemuxer struct {
 	stateMu    sync.Mutex
-	opMu       sync.Mutex
+	opMu       contextMutex
 	src        Source
 	rd         *webm.DemuxReader
 	streams    []Stream
@@ -281,7 +281,9 @@ func (d *webMDemuxer) Info() Info {
 }
 
 func (d *webMDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return nil, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	if d.closed {
@@ -318,7 +320,9 @@ func (d *webMDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 }
 
 func (d *webMDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return SeekResult{}, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	if d.closed {

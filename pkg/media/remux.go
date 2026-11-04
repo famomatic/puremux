@@ -316,7 +316,7 @@ func outputFormatForPath(path string) (Format, error) {
 		return FormatMatroska, nil
 	case ".mp4", ".m4a", ".m4v":
 		return FormatMP4, nil
-	case ".ts", ".m2ts":
+	case ".ts":
 		return FormatMPEGTS, nil
 	default:
 		return FormatUnknown, fmt.Errorf("%w: output extension %s", ErrUnsupportedFormat, filepath.Ext(path))
@@ -348,6 +348,13 @@ func installRemuxOutput(temporaryPath, outputPath string) error {
 }
 
 func installRemuxOutputWithRename(temporaryPath, outputPath string, rename func(string, string) error) error {
+	info, err := os.Lstat(outputPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: output must be a regular file", ErrInvalidData)
+	}
 	if err := rename(temporaryPath, outputPath); err == nil {
 		return nil
 	}

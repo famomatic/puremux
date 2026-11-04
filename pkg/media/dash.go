@@ -23,6 +23,9 @@ type DASHRepresentation struct {
 }
 
 type DASHOptions struct {
+	// HeaderForURL, when set, replaces Header for each manifest, segment, init or key URL.
+	// Use it to scope credentials by origin. Redirects follow Client.CheckRedirect.
+	HeaderForURL         func(string) http.Header
 	Client               *http.Client
 	Header               http.Header
 	MaxManifestBytes     int64
@@ -34,7 +37,7 @@ type DASHOptions struct {
 
 type dashDemuxer struct {
 	stateMu          sync.Mutex
-	opMu             sync.Mutex
+	opMu             contextMutex
 	client           *http.Client
 	header           http.Header
 	opts             DASHOptions
@@ -45,7 +48,7 @@ type dashDemuxer struct {
 	next             int
 	current          Demuxer
 	streams          []Stream
-	shiftNS          int64
+	shiftNS          segmentShift
 	shiftSet         bool
 	init             []byte
 	root             context.Context
@@ -163,7 +166,9 @@ func (d *dashDemuxer) Info() Info {
 func (d *dashDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	ctx, cleanup := manifestOperationContext(ctx, d.root)
 	defer cleanup()
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return nil, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	closed := d.closed
@@ -275,10 +280,12 @@ func (d *dashDemuxer) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
+func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (_ SeekResult, resultErr error) {
 	ctx, cleanup := manifestOperationContext(ctx, d.root)
 	defer cleanup()
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return SeekResult{}, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	closed := d.closed
@@ -314,10 +321,18 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 			break
 		}
 	}
-	if d.current != nil {
-		_ = d.current.Close()
-		d.current = nil
-	}
+	oldCurrent, oldNext, oldShift, oldSet := d.current, d.next, d.shiftNS, d.shiftSet
+	defer func() {
+		if resultErr != nil {
+			if d.current != nil && d.current != oldCurrent {
+				_ = d.current.Close()
+			}
+			d.current, d.next, d.shiftNS, d.shiftSet = oldCurrent, oldNext, oldShift, oldSet
+		} else if oldCurrent != nil {
+			_ = oldCurrent.Close()
+		}
+	}()
+	d.current = nil
 	d.next = index
 	if err := d.openSegment(ctx, index); err != nil {
 		return SeekResult{}, err
@@ -326,7 +341,11 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	if err := d.primeSegmentShift(ctx, start); err != nil {
 		return SeekResult{}, err
 	}
-	localTarget, ok := checkedSubInt64(targetNS, d.shiftNS)
+	shiftNS, err := d.shiftNS.ticks(nanosecondTimeBase)
+	if err != nil {
+		return SeekResult{}, err
+	}
+	localTarget, ok := checkedSubInt64(targetNS, shiftNS)
 	if !ok {
 		return SeekResult{}, ErrInvalidData
 	}
@@ -334,7 +353,8 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 	segmentStartTicks := int64(0)
 	if req.StreamIndex >= 0 {
 		var ok bool
-		segmentStartTicks, ok = nanosecondTimeBase.Rescale(d.shiftNS, d.streams[req.StreamIndex].TimeBase)
+		segmentStartTicks, err = d.shiftNS.ticks(d.streams[req.StreamIndex].TimeBase)
+		ok = err == nil
 		if !ok {
 			return SeekResult{}, ErrInvalidData
 		}
@@ -355,7 +375,7 @@ func (d *dashDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, er
 		}
 		return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 	}
-	actual, ok := checkedAddInt64(d.shiftNS, localResult.Timestamp)
+	actual, ok := checkedAddInt64(shiftNS, localResult.Timestamp)
 	if !ok {
 		return SeekResult{}, ErrInvalidData
 	}
@@ -437,17 +457,17 @@ func (d *dashDemuxer) openSegment(ctx context.Context, index int) error {
 		_ = demuxer.Close()
 		return errors.New("dash: representation stream configuration changed")
 	}
-	d.current, d.shiftNS, d.shiftSet = demuxer, 0, false
+	d.current, d.shiftNS, d.shiftSet = demuxer, segmentShift{}, false
 	return nil
 }
 
 func (d *dashDemuxer) fetch(ctx context.Context, rawURL string, byteRange manifest.ByteRange, limit int64) ([]byte, error) {
-	data, _, err := fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, byteRange, limit)
+	data, _, err := fetchManifestResource(ctx, d.root, d.client, manifestHeaders(d.header, d.opts.HeaderForURL, rawURL), rawURL, byteRange, limit)
 	return data, err
 }
 
 func (d *dashDemuxer) fetchManifest(ctx context.Context, rawURL string, limit int64) ([]byte, string, error) {
-	return fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, manifest.ByteRange{}, limit)
+	return fetchManifestResource(ctx, d.root, d.client, manifestHeaders(d.header, d.opts.HeaderForURL, rawURL), rawURL, manifest.ByteRange{}, limit)
 }
 
 var _ Demuxer = (*dashDemuxer)(nil)

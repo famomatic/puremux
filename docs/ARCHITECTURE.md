@@ -288,3 +288,49 @@ DASH honors an advertised nonzero minimumUpdatePeriod relative to the start
 of MPD retrieval, following the [DASH-IF snapshot validity model](https://dashif.org/Guidelines-TimingModel/#mpd-validity).
 Consumers still control scheduling and cancellation. Missing/zero hints retain
 a 250 ms compatibility fallback; no sleeping occurs inside the demuxer.
+
+
+## Audit hardening and optional lazy indexing
+
+`OpenOptions.LazyIndex` enables header-only initialization for raw ADTS, MP3,
+FLAC and seekable MPEG-TS. It is opt-in so existing eager duration/metadata
+behavior remains compatible. Playback retains only its current frame/PES;
+explicit seeking can build an index and may wait for the tail. Failed indexing
+preserves the current playback state. Late duration/tags appear through fresh
+Info/Streams snapshots. FLAC frame boundaries require header and frame CRC plus
+coded-number progression; compressed samples are never decoded.
+
+`OpenMP4WithInitOptions` adds MaxInitBytes and OnOpen to separate-init input,
+counting initialization bytes and media Source reads together. Other OpenOptions
+fields are unused for this entry point. Existing OpenMP4WithInit remains valid.
+
+Input MP4 parsing caps each trun at 65,536 samples, an explicit fragment index
+at 1,048,576 samples, and each sample/moov at 64 MiB. Sequential fMP4 playback
+releases consumed fragment metadata. Large otherwise-valid files can exceed
+these implementation limits. Multiple sample descriptions and changing TS
+program/PMT configurations are rejected instead of silently reusing old config.
+
+`LiveIngestOptions.MaxBufferBytes` defaults to 64 MiB across all streams and
+normalization stages. Reservations are acquired before copying and returned on
+release/drop/flush. This bounds retained payload length, not process RSS or pool
+capacity. The presentation synthesizer also limits held AU count and bytes,
+including non-picture input after the probe, and emits using available lookahead
+when its bound is reached.
+
+Public demuxer operations use cancellation-aware admission. Failed HLS/DASH
+seeks retain the active segment until the replacement is fully ready. Manifest
+timestamp shifts preserve the source rational origin until destination tick
+conversion, with one cached calculation per stream/segment. HTTP position queries
+retain read-ahead; explicit repositioning keeps source revalidation semantics.
+Actual destination Write/Seek errors are terminal for public muxers: later writes
+and finalization retain the error and never resume writing to that destination.
+
+HLSOptions/DASHOptions.HeaderForURL can replace common headers for each manifest,
+init, segment and key URL. Caller-owned Client.CheckRedirect still controls
+redirect policy. The readers select one rendition/representation; they do not
+perform general A/V adaptation-set merging or ABR. Multi-Period, SAMPLE-AES and
+protected DASH representations are rejected. Ogg support remains selected-stream
+Opus; general chained-stream playback and 192-byte M2TS framing are outside the
+implemented container matrix. Fast-start, DRM, subtitles and framing conversion
+remain outside the release plan. See `AUDIT_FIXES_2026-09-06.md` for the complete
+resolution and verification matrix.

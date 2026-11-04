@@ -16,6 +16,19 @@ type Config struct {
 	ChannelConfig   int
 }
 
+// Channels returns the channel count for the supported fixed configurations.
+// ISO/IEC 14496-3 configuration 7 denotes 7.1 (eight channels). Zero
+// means a PCE, reserved, or extended layout not supported by this helper.
+func (c Config) Channels() int {
+	if c.ChannelConfig >= 1 && c.ChannelConfig <= 6 {
+		return c.ChannelConfig
+	}
+	if c.ChannelConfig == 7 {
+		return 8
+	}
+	return 0
+}
+
 type ADTSHeader struct {
 	MPEGVersion    int
 	Profile        int

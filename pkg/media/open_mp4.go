@@ -8,12 +8,34 @@ import (
 	"sync"
 	"time"
 
+	"github.com/famomatic/puremux/internal/core"
 	"github.com/famomatic/puremux/internal/format/mp4"
 )
 
 // OpenMP4WithInit opens an fMP4 media segment using codec and track defaults
 // from a separate initialization segment. The returned demuxer owns src.
 func OpenMP4WithInit(ctx context.Context, init []byte, src Source) (Demuxer, error) {
+	return OpenMP4WithInitOptions(ctx, init, src, OpenOptions{})
+}
+
+// OpenMP4WithInitOptions adds MaxInitBytes and OnOpen to separate-init input.
+// The byte budget includes the init bytes and reads from the media Source.
+// Other OpenOptions fields are not used because the format is already known.
+func OpenMP4WithInitOptions(ctx context.Context, init []byte, src Source, opts OpenOptions) (result Demuxer, resultErr error) {
+	started := time.Now()
+	state := &initializationState{limit: opts.MaxInitBytes, active: true, stats: OpenStats{Format: FormatMP4, Phase: "validation"}}
+	defer func() {
+		state.active = false
+		state.stats.Elapsed = time.Since(started)
+		state.stats.Err = resultErr
+		if opts.OnOpen != nil {
+			opts.OnOpen(state.stats)
+		}
+	}()
+	if opts.MaxInitBytes < 0 || len(init) > 64<<20 {
+		return nil, ErrInvalidData
+	}
+
 	if src == nil || len(init) == 0 {
 		return nil, fmt.Errorf("%w: missing fMP4 init or media source", ErrInvalidData)
 	}
@@ -33,16 +55,18 @@ func OpenMP4WithInit(ctx context.Context, init []byte, src Source) (Demuxer, err
 		contextual = &contextReadSeeker{ReadSeeker: readSeeker, source: contextSource, ctx: ctx}
 		readSeeker = contextual
 	}
-	rd, err := mp4.NewFragmentReader(bytes.NewReader(init), readSeeker)
+	state.stats.Phase = "initialize"
+	readSeeker = &initializationReadSeeker{initializationReader: &initializationReader{reader: readSeeker, state: state}, seeker: readSeeker}
+	rd, err := mp4.NewFragmentReader(&initializationReader{reader: bytes.NewReader(init), state: state}, readSeeker)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidData, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidData, err)
 	}
 	return newMP4Demuxer(src, rd, contextual), nil
 }
 
 type mp4Demuxer struct {
 	stateMu    sync.Mutex
-	opMu       sync.Mutex
+	opMu       contextMutex
 	src        Source
 	rd         *mp4.Reader
 	streams    []Stream
@@ -100,7 +124,9 @@ func (d *mp4Demuxer) Info() Info {
 }
 
 func (d *mp4Demuxer) ReadPacket(ctx context.Context) (*Packet, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return nil, err
+	}
 	defer d.opMu.Unlock()
 	if err := d.ready(ctx); err != nil {
 		return nil, err
@@ -120,6 +146,7 @@ func (d *mp4Demuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	return &Packet{
 		StreamIndex: index,
 		Data:        sample.Data,
+		release:     core.ReleasePayload,
 		PTS:         KnownTimestamp(sample.PTS),
 		DTS:         KnownTimestamp(sample.DTS),
 		Duration:    KnownTimestamp(sample.Duration),
@@ -129,7 +156,9 @@ func (d *mp4Demuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 }
 
 func (d *mp4Demuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return SeekResult{}, err
+	}
 	defer d.opMu.Unlock()
 	if err := d.ready(ctx); err != nil {
 		return SeekResult{}, err

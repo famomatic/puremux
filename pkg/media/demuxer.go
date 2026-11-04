@@ -75,6 +75,9 @@ type OpenStats struct {
 }
 
 type OpenOptions struct {
+	// LazyIndex starts raw ADTS/MP3/FLAC and seekable MPEG-TS from headers.
+	// Duration and trailing metadata may arrive later. Explicit Seek builds an index.
+	LazyIndex bool
 	// MaxInitBytes caps all bytes read while Open initializes the demuxer,
 	// including probing and rereads. Zero is unlimited; it does not limit reads
 	// after Open returns. Use the context deadline to bound blocking I/O.

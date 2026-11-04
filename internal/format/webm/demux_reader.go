@@ -85,6 +85,8 @@ type DemuxReader struct {
 	segmentEnd      int64
 	firstCluster    int64
 	indexComplete   bool
+	indexNext       int64  // resume offset of the seek-driven scan; 0 = not started
+	scanMax         uint64 // highest cluster time reached by that contiguous scan
 	clusterPosition int64
 	indexedClusters map[int64]bool
 	parsedCues      map[int64]bool
@@ -275,13 +277,31 @@ scanHeaders:
 	return nil
 }
 
-func (rd *DemuxReader) NextPacket(ctx context.Context) (*DemuxPacket, error) {
+func (rd *DemuxReader) NextPacket(ctx context.Context) (_ *DemuxPacket, resultErr error) {
 	rd.mu.Lock()
 	defer rd.mu.Unlock()
 	if rd.closed {
 		return nil, errors.New("webm: reader closed")
 	}
+	retryPosition, seekErr := rd.rs.Seek(0, io.SeekCurrent)
+	if seekErr != nil {
+		return nil, seekErr
+	}
+	defer func() {
+		if resultErr != nil {
+			_, err := rd.rs.Seek(retryPosition, io.SeekStart)
+			if err != nil {
+				resultErr = errors.Join(resultErr, err)
+			}
+		}
+	}()
 	for {
+		var err error
+		retryPosition, err = rd.rs.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
+
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -374,16 +394,21 @@ func (rd *DemuxReader) SeekTicksWithFlags(ctx context.Context, target uint64, tr
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	// Preserve the former complete-index seek semantics, including unordered
-	// clusters and track-specific cues, but pay for indexing only on explicit seek.
-	if !rd.indexComplete {
-		if err := rd.completeIndex(ctx); err != nil {
-			return 0, err
-		}
-	}
 	var pos int64 = -1
 	var actual uint64
-	choose := func(candidate int64, ticks uint64) {
+	var choose func(candidate int64, ticks uint64)
+	chooseCues := func() {
+		for _, cue := range rd.cues {
+			if track >= 0 && int(cue.track) != track {
+				continue
+			}
+			candidate, ok := addInt64Uint64(rd.segmentStart, cue.position)
+			if ok {
+				choose(candidate, cue.timeTicks)
+			}
+		}
+	}
+	choose = func(candidate int64, ticks uint64) {
 		if candidate < rd.segmentStart || candidate >= rd.segmentEnd {
 			return
 		}
@@ -398,15 +423,19 @@ func (rd *DemuxReader) SeekTicksWithFlags(ctx context.Context, target uint64, tr
 			pos, actual = candidate, ticks
 		}
 	}
+	// Cues already parsed (typically in the header) answer a sync seek without
+	// scanning the rest of the file, so a partially downloaded source can seek.
 	if !any {
-		for _, cue := range rd.cues {
-			if track >= 0 && int(cue.track) != track {
-				continue
-			}
-			candidate, ok := addInt64Uint64(rd.segmentStart, cue.position)
-			if ok {
-				choose(candidate, cue.timeTicks)
-			}
+		chooseCues()
+	}
+	if pos < 0 && !rd.indexComplete {
+		// Index only far enough to cover the target; a source that has not
+		// downloaded that far reports its read error and keeps current playback.
+		if err := rd.completeIndex(ctx, target); err != nil {
+			return 0, err
+		}
+		if !any {
+			chooseCues()
 		}
 	}
 	if pos < 0 {

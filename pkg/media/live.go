@@ -19,6 +19,9 @@ var ErrLiveBufferFull = errors.New("media: live interleave buffer full")
 // normalization path. Zero values select the defaults returned by
 // DefaultLiveIngestOptions. The ordinary Muxer remains preprocessor-free.
 type LiveIngestOptions struct {
+	// MaxBufferBytes bounds total retained payload bytes across all streams and stages.
+	// Zero selects 64 MiB. Oversized writes return ErrLiveBufferFull before copying.
+	MaxBufferBytes       int
 	MaxBufferPackets     int
 	JitterWindow         time.Duration
 	GapThreshold         time.Duration
@@ -35,6 +38,7 @@ type LiveIngestOptions struct {
 func DefaultLiveIngestOptions() LiveIngestOptions {
 	return LiveIngestOptions{
 		MaxBufferPackets:     64,
+		MaxBufferBytes:       64 << 20,
 		JitterWindow:         400 * time.Millisecond,
 		GapThreshold:         100 * time.Millisecond,
 		MinMonotonicStep:     time.Nanosecond,
@@ -63,19 +67,21 @@ type LiveStreamMetrics struct {
 // because normalization may retain packets. LiveMuxer is not safe for
 // concurrent use.
 type LiveMuxer struct {
-	muxer         Muxer
-	cfg           preprocessor.Config
-	maxInterleave int
-	detectors     *core.DetectorRegistry
-	streams       []*liveStreamState
-	streamByIndex map[int]*liveStreamState
-	queue         []liveQueuedPacket
-	syncVideo     *liveStreamState
-	started       bool
-	closed        bool
-	draining      bool
-	processErr    error
-	closeErr      error
+	maxBufferBytes int
+	retainedBytes  int
+	muxer          Muxer
+	cfg            preprocessor.Config
+	maxInterleave  int
+	detectors      *core.DetectorRegistry
+	streams        []*liveStreamState
+	streamByIndex  map[int]*liveStreamState
+	queue          []liveQueuedPacket
+	syncVideo      *liveStreamState
+	started        bool
+	closed         bool
+	draining       bool
+	processErr     error
+	closeErr       error
 }
 
 type liveStreamState struct {
@@ -119,17 +125,21 @@ func NewLiveMuxer(muxer Muxer, opts LiveIngestOptions) (*LiveMuxer, error) {
 	if err != nil {
 		return nil, err
 	}
+	if opts.MaxBufferBytes == 0 {
+		opts.MaxBufferBytes = DefaultLiveIngestOptions().MaxBufferBytes
+	}
 	return &LiveMuxer{
-		muxer:         muxer,
-		cfg:           cfg,
-		maxInterleave: maxInterleave,
-		detectors:     core.NewDetectorRegistry(),
-		streamByIndex: make(map[int]*liveStreamState),
+		maxBufferBytes: opts.MaxBufferBytes,
+		muxer:          muxer,
+		cfg:            cfg,
+		maxInterleave:  maxInterleave,
+		detectors:      core.NewDetectorRegistry(),
+		streamByIndex:  make(map[int]*liveStreamState),
 	}, nil
 }
 
 func normalizeLiveOptions(opts LiveIngestOptions) (preprocessor.Config, int, error) {
-	if opts.MaxBufferPackets < 0 || opts.JitterWindow < 0 || opts.GapThreshold < 0 ||
+	if opts.MaxBufferBytes < 0 || opts.MaxBufferPackets < 0 || opts.JitterWindow < 0 || opts.GapThreshold < 0 ||
 		opts.MinMonotonicStep < 0 || opts.MaxInterleavePackets < 0 {
 		return preprocessor.Config{}, 0, ErrInvalidData
 	}
@@ -250,8 +260,10 @@ func (l *LiveMuxer) WritePacket(ctx context.Context, packet *Packet) error {
 		return ErrInvalidData
 	}
 	l.start()
-	p := core.AcquirePacket()
-	p.Data = append(p.Data[:0], packet.Data...)
+	p := l.copyPacket(packet.Data)
+	if p == nil {
+		return ErrLiveBufferFull
+	}
 	p.PTS, p.DTS, p.Duration = pts, dts, duration
 	p.Codec = state.codec
 	p.TrackID = state.outputIndex
@@ -285,8 +297,10 @@ func (l *LiveMuxer) WriteVideo(ctx context.Context, streamIndex int, au []byte, 
 		return ErrInvalidData
 	}
 	l.start()
-	p := core.AcquirePacket()
-	p.Data = append(p.Data[:0], au...)
+	p := l.copyPacket(au)
+	if p == nil {
+		return ErrLiveBufferFull
+	}
 	p.PTS, p.DTS = clock, clock
 	p.Codec = state.codec
 	p.TrackID = state.outputIndex
@@ -373,8 +387,11 @@ func (l *LiveMuxer) WriteADTS(ctx context.Context, streamIndex int, chunk []byte
 			writeErr = ErrInvalidData
 			return false
 		}
-		p := core.AcquirePacket()
-		p.Data = append(p.Data[:0], frame...)
+		p := l.copyPacket(frame)
+		if p == nil {
+			writeErr = ErrLiveBufferFull
+			return false
+		}
 		p.PTS, p.DTS = clock+offset, clock+offset
 		p.Duration = info.Duration()
 		p.Codec = state.codec
@@ -757,3 +774,17 @@ func (l *LiveMuxer) discardBuffered() {
 }
 
 var _ Muxer = (*LiveMuxer)(nil)
+
+func (l *LiveMuxer) copyPacket(data []byte) *core.Packet {
+	if len(data) > l.maxBufferBytes-l.retainedBytes {
+		return nil
+	}
+	p := core.AcquirePacket()
+	p.Data = append(p.Data[:0], data...)
+	p.Budget, p.BudgetBytes = l, len(data)
+	l.retainedBytes += len(data)
+	return p
+}
+
+// ReleasePacketBytes implements the internal packet ownership budget.
+func (l *LiveMuxer) ReleasePacketBytes(n int) { l.retainedBytes -= n }

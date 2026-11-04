@@ -69,9 +69,11 @@ const (
 //
 // It never writes to a file and is not safe for concurrent use.
 type PresentationSynthesizer struct {
-	probing bool
-	reorder bool
-	win     []pentry
+	probing   bool
+	reorder   bool
+	win       []pentry
+	pictures  int
+	heldBytes int
 
 	prevArrived core.POCInfo // last arrived picture (probe inversion check)
 	prevSet     bool
@@ -137,9 +139,13 @@ func (s *PresentationSynthesizer) Process(p *core.Packet, poc core.POCInfo, isPi
 		s.prevSet = true
 	}
 	s.win = append(s.win, pentry{pkt: p, poc: poc, pic: isPicture})
+	s.heldBytes += len(p.Data)
+	if isPicture {
+		s.pictures++
+	}
 
 	if s.probing {
-		if s.picCount() >= ptsProbeWindow || len(s.win) >= ptsProbeMaxHold {
+		if s.picCount() >= ptsProbeWindow || len(s.win) >= ptsProbeMaxHold || s.heldBytes >= 64<<20 {
 			s.finishProbe()
 		} else {
 			return
@@ -158,13 +164,7 @@ func (s *PresentationSynthesizer) Flush(emit func(*core.Packet)) {
 
 // picCount counts coded pictures currently held.
 func (s *PresentationSynthesizer) picCount() int {
-	n := 0
-	for _, e := range s.win {
-		if e.pic {
-			n++
-		}
-	}
-	return n
+	return s.pictures
 }
 
 // finishProbe decides passthrough vs reorder from the held window.
@@ -236,8 +236,9 @@ func (s *PresentationSynthesizer) growIfLate(poc core.POCInfo) {
 func (s *PresentationSynthesizer) drain(flush bool, emit func(*core.Packet)) {
 	for len(s.win) > 0 {
 		head := s.win[0]
+		headBytes := len(head.pkt.Data)
 		if head.pic && s.reorder {
-			if !flush && s.picCount()-1 < s.lookahead {
+			if !flush && s.picCount()-1 < s.lookahead && len(s.win) < ptsProbeMaxHold && s.heldBytes < 64<<20 {
 				return
 			}
 			s.emitPicture(head, emit)
@@ -249,6 +250,10 @@ func (s *PresentationSynthesizer) drain(flush bool, emit func(*core.Packet)) {
 			emit(head.pkt)
 		} else {
 			emit(head.pkt)
+		}
+		s.heldBytes -= headBytes
+		if head.pic {
+			s.pictures--
 		}
 		s.win[0] = pentry{}
 		s.win = s.win[1:]

@@ -18,7 +18,7 @@ err := media.RemuxFiles(
 ```
 
 Supported output extensions are `.mp4`, `.m4a`, `.m4v`, `.webm`, `.mkv`,
-`.mka`, `.ts`, and `.m2ts`. MP4 uses progressive layout for the seekable file
+`.mka`, and `.ts`. MP4 uses progressive layout for the seekable file
 destination. File installation is atomic and an existing output is retained
 when remuxing fails.
 

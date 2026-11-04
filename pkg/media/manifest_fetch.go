@@ -62,3 +62,10 @@ func fetchManifestResource(ctx, root context.Context, client *http.Client, heade
 	}
 	return data, resp.Request.URL.String(), nil
 }
+
+func manifestHeaders(header http.Header, policy func(string) http.Header, rawURL string) http.Header {
+	if policy != nil {
+		return policy(rawURL).Clone()
+	}
+	return header
+}

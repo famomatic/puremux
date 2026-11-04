@@ -19,6 +19,7 @@ type mp4SampleWriter interface {
 }
 
 type mp4Muxer struct {
+	*outputFailure
 	allowMetadataLoss bool
 	w                 mp4SampleWriter
 	streams           []Stream
@@ -159,6 +160,9 @@ func normalizeMP4Config(stream Stream) (string, []byte, error) {
 }
 
 func (m *mp4Muxer) WritePacket(ctx context.Context, packet *Packet) error {
+	if err := m.failure(); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -187,6 +191,9 @@ func (m *mp4Muxer) Close() error {
 	}
 	m.closed = true
 	m.closeErr = m.w.Close()
+	if err := m.failure(); err != nil {
+		m.closeErr = err
+	}
 	return m.closeErr
 }
 

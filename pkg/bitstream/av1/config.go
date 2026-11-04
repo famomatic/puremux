@@ -23,7 +23,11 @@ func HasSequenceHeader(data []byte) (bool, error) {
 func inspectConfig(data []byte) (bool, error) {
 	invalid := errors.New("av1: invalid AV1 configuration record")
 	if len(data) < 4 || data[0] != 0x81 || data[3]&0xe0 != 0 ||
-		data[1]>>5 > 2 || data[1]&0x1f > 23 {
+		data[1]>>5 > 2 || (data[1]&0x1f > 23 && data[1]&0x1f != 31) {
+		return false, invalid
+	}
+	// twelve_bit is present only for profile 2 with high_bitdepth set.
+	if data[2]&0x20 != 0 && (data[1]>>5 != 2 || data[2]&0x40 == 0) {
 		return false, invalid
 	}
 	// When initial_presentation_delay_present is zero, its four-bit field is

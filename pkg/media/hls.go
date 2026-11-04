@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -30,6 +31,9 @@ type HLSVariant struct {
 }
 
 type HLSOptions struct {
+	// HeaderForURL, when set, replaces Header for each manifest, segment, init or key URL.
+	// Use it to scope credentials by origin. Redirects follow Client.CheckRedirect.
+	HeaderForURL     func(string) http.Header
 	Client           *http.Client
 	Header           http.Header
 	MaxManifestBytes int64
@@ -43,7 +47,7 @@ type HLSOptions struct {
 
 type hlsDemuxer struct {
 	stateMu     sync.Mutex
-	opMu        sync.Mutex
+	opMu        contextMutex
 	client      *http.Client
 	header      http.Header
 	opts        HLSOptions
@@ -54,12 +58,11 @@ type hlsDemuxer struct {
 	current     Demuxer
 	currentSeg  manifest.HLSSegment
 	streams     []Stream
-	shiftNS     int64
+	shiftNS     segmentShift
 	shiftSet    bool
 	baseNS      int64
 	firstPacket bool
 	initCache   map[string][]byte
-	keyCache    map[string][]byte
 	root        context.Context
 	cancel      context.CancelFunc
 	closed      bool
@@ -92,7 +95,7 @@ func OpenHLS(ctx context.Context, rawURL string, opts HLSOptions) (Demuxer, erro
 	if header == nil {
 		header = make(http.Header)
 	}
-	d := &hlsDemuxer{client: client, header: header, opts: opts, playlistURL: rawURL, initCache: make(map[string][]byte), keyCache: make(map[string][]byte), root: root, cancel: cancel}
+	d := &hlsDemuxer{client: client, header: header, opts: opts, playlistURL: rawURL, initCache: make(map[string][]byte), root: root, cancel: cancel}
 	playlistURL, playlist, err := d.resolvePlaylist(ctx, rawURL)
 	if err != nil {
 		cancel()
@@ -131,7 +134,9 @@ func (d *hlsDemuxer) Info() Info {
 func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	ctx, cleanup := manifestOperationContext(ctx, d.root)
 	defer cleanup()
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return nil, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	closed := d.closed
@@ -193,10 +198,12 @@ func (d *hlsDemuxer) ReadPacket(ctx context.Context) (*Packet, error) {
 	}
 }
 
-func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, error) {
+func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (_ SeekResult, resultErr error) {
 	ctx, cleanup := manifestOperationContext(ctx, d.root)
 	defer cleanup()
-	d.opMu.Lock()
+	if err := d.opMu.lock(ctx); err != nil {
+		return SeekResult{}, err
+	}
 	defer d.opMu.Unlock()
 	d.stateMu.Lock()
 	closed := d.closed
@@ -233,10 +240,20 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 		}
 		start = end
 	}
-	if d.current != nil {
-		_ = d.current.Close()
-		d.current = nil
-	}
+	oldCurrent, oldNext, oldShift, oldSet := d.current, d.next, d.shiftNS, d.shiftSet
+	oldBase, oldSeg, oldFirst := d.baseNS, d.currentSeg, d.firstPacket
+	defer func() {
+		if resultErr != nil {
+			if d.current != nil && d.current != oldCurrent {
+				_ = d.current.Close()
+			}
+			d.current, d.next, d.shiftNS, d.shiftSet = oldCurrent, oldNext, oldShift, oldSet
+			d.baseNS, d.currentSeg, d.firstPacket = oldBase, oldSeg, oldFirst
+		} else if oldCurrent != nil {
+			_ = oldCurrent.Close()
+		}
+	}()
+	d.current = nil
 	d.baseNS, d.next = start, index
 	if err := d.openSegment(ctx, index); err != nil {
 		return SeekResult{}, err
@@ -244,7 +261,11 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	if err := d.primeSegmentShift(ctx); err != nil {
 		return SeekResult{}, err
 	}
-	localTarget, ok := checkedSubInt64(targetNS, d.shiftNS)
+	shiftNS, err := d.shiftNS.ticks(nanosecondTimeBase)
+	if err != nil {
+		return SeekResult{}, err
+	}
+	localTarget, ok := checkedSubInt64(targetNS, shiftNS)
 	if !ok {
 		return SeekResult{}, ErrInvalidData
 	}
@@ -252,7 +273,8 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 	segmentStartTicks := int64(0)
 	if req.StreamIndex >= 0 {
 		var ok bool
-		segmentStartTicks, ok = nanosecondTimeBase.Rescale(d.shiftNS, d.streams[req.StreamIndex].TimeBase)
+		segmentStartTicks, err = d.shiftNS.ticks(d.streams[req.StreamIndex].TimeBase)
+		ok = err == nil
 		if !ok {
 			return SeekResult{}, ErrInvalidData
 		}
@@ -273,7 +295,7 @@ func (d *hlsDemuxer) Seek(ctx context.Context, req SeekRequest) (SeekResult, err
 		}
 		return SeekResult{StreamIndex: req.StreamIndex, Timestamp: actual}, nil
 	}
-	actual, ok := checkedAddInt64(d.shiftNS, localResult.Timestamp)
+	actual, ok := checkedAddInt64(shiftNS, localResult.Timestamp)
 	if !ok {
 		return SeekResult{}, ErrInvalidData
 	}
@@ -425,7 +447,7 @@ func (d *hlsDemuxer) openSegment(ctx context.Context, index int) error {
 		_ = demuxer.Close()
 		return errors.New("hls: stream configuration changed without a supported transition")
 	}
-	d.current, d.currentSeg, d.shiftNS, d.shiftSet, d.firstPacket = demuxer, segment, 0, false, true
+	d.current, d.currentSeg, d.shiftNS, d.shiftSet, d.firstPacket = demuxer, segment, segmentShift{}, false, true
 	return nil
 }
 
@@ -477,7 +499,7 @@ func (d *hlsDemuxer) decrypt(ctx context.Context, encrypted []byte, keySpec *man
 	if err != nil {
 		return nil, err
 	}
-	out := append([]byte(nil), encrypted...)
+	out := encrypted // fetch returns an exclusively owned ciphertext buffer
 	cipher.NewCBCDecrypter(block, iv[:]).CryptBlocks(out, out)
 	padding := int(out[len(out)-1])
 	if padding == 0 || padding > aes.BlockSize || padding > len(out) {
@@ -492,12 +514,12 @@ func (d *hlsDemuxer) decrypt(ctx context.Context, encrypted []byte, keySpec *man
 }
 
 func (d *hlsDemuxer) fetch(ctx context.Context, rawURL string, byteRange manifest.ByteRange, limit int64) ([]byte, error) {
-	data, _, err := fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, byteRange, limit)
+	data, _, err := fetchManifestResource(ctx, d.root, d.client, manifestHeaders(d.header, d.opts.HeaderForURL, rawURL), rawURL, byteRange, limit)
 	return data, err
 }
 
 func (d *hlsDemuxer) fetchManifest(ctx context.Context, rawURL string, limit int64) ([]byte, string, error) {
-	return fetchManifestResource(ctx, d.root, d.client, d.header, rawURL, manifest.ByteRange{}, limit)
+	return fetchManifestResource(ctx, d.root, d.client, manifestHeaders(d.header, d.opts.HeaderForURL, rawURL), rawURL, manifest.ByteRange{}, limit)
 }
 
 func validHLSContentRange(value string, wantStart, wantEnd int64) bool {
@@ -553,9 +575,9 @@ func checkedSubInt64(a, b int64) (int64, bool) {
 	return checkedAddInt64(a, -b)
 }
 
-func shiftPacketTimestamps(packet *Packet, timeBase Rational, shiftNS int64) error {
-	shift, ok := nanosecondTimeBase.Rescale(shiftNS, timeBase)
-	if !ok {
+func shiftPacketTimestamps(packet *Packet, timeBase Rational, shiftNS segmentShift) error {
+	shift, err := shiftNS.ticks(timeBase)
+	if err != nil {
 		return ErrInvalidData
 	}
 	if packet.PTS.Valid {
@@ -575,22 +597,47 @@ func shiftPacketTimestamps(packet *Packet, timeBase Rational, shiftNS int64) err
 	return nil
 }
 
-func segmentTimestampShift(packet *Packet, timeBase Rational, baseNS int64) (int64, error) {
+// segmentShift retains the exact source origin until the destination tick
+// conversion. Caching makes the big-integer calculation a per-stream/segment cost.
+type segmentShift struct {
+	anchor   int64
+	timeBase Rational
+	baseNS   int64
+	cached   map[Rational]int64
+}
+
+func (s segmentShift) ticks(tb Rational) (int64, error) {
+	if value, ok := s.cached[tb]; ok {
+		return value, nil
+	}
+	if tb.Num <= 0 || tb.Den <= 0 || s.timeBase.Num <= 0 || s.timeBase.Den <= 0 {
+		return 0, ErrInvalidData
+	}
+	base := new(big.Rat).SetFrac(big.NewInt(s.baseNS), big.NewInt(1_000_000_000))
+	anchor := new(big.Rat).SetFrac(big.NewInt(s.timeBase.Num), big.NewInt(s.timeBase.Den))
+	anchor.Mul(anchor, new(big.Rat).SetInt64(s.anchor))
+	base.Sub(base, anchor)
+	base.Mul(base, new(big.Rat).SetFrac(big.NewInt(tb.Den), big.NewInt(tb.Num)))
+	result := new(big.Int).Quo(base.Num(), base.Denom())
+	if !result.IsInt64() {
+		return 0, ErrInvalidData
+	}
+	value := result.Int64()
+	if s.cached != nil {
+		s.cached[tb] = value
+	}
+	return value, nil
+}
+func segmentTimestampShift(packet *Packet, timeBase Rational, baseNS int64) (segmentShift, error) {
 	anchor := int64(0)
 	if packet.PTS.Valid {
 		anchor = packet.PTS.Value
 	} else if packet.DTS.Valid {
 		anchor = packet.DTS.Value
 	}
-	anchorNS, ok := timeBase.Rescale(anchor, nanosecondTimeBase)
-	if !ok {
-		return 0, ErrInvalidData
-	}
-	shift, ok := checkedSubInt64(baseNS, anchorNS)
-	if !ok {
-		return 0, ErrInvalidData
-	}
-	return shift, nil
+	shift := segmentShift{anchor: anchor, timeBase: timeBase, baseNS: baseNS, cached: make(map[Rational]int64)}
+	_, err := shift.ticks(nanosecondTimeBase)
+	return shift, err
 }
 
 var _ Demuxer = (*hlsDemuxer)(nil)

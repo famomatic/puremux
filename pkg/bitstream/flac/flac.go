@@ -266,3 +266,23 @@ func readUTF8Uint(data []byte) (uint64, int, bool) {
 	}
 	return value, leading, true
 }
+
+// UpdateCRC16 extends the RFC 9639 section 9.3 frame checksum, MSB-first,
+// polynomial x^16+x^15+x^2+1 (0x8005), initial value zero.
+func UpdateCRC16(crc uint16, data []byte) uint16 {
+	for _, b := range data {
+		crc = updateCRC16Byte(crc, b)
+	}
+	return crc
+}
+func updateCRC16Byte(crc uint16, b byte) uint16 {
+	crc ^= uint16(b) << 8
+	for range 8 {
+		if crc&0x8000 != 0 {
+			crc = crc<<1 ^ 0x8005
+		} else {
+			crc <<= 1
+		}
+	}
+	return crc
+}

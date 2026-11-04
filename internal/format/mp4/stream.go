@@ -40,6 +40,9 @@ func (t *trackState) initCursor() error {
 	if t.uniform != 0 {
 		var n uint32
 		for _, e := range t.stts {
+			if e.count > math.MaxUint32-n {
+				return ErrCorrupt
+			}
 			n += e.count
 		}
 		if n > t.totalSamples {
@@ -48,8 +51,21 @@ func (t *trackState) initCursor() error {
 	}
 	if t.totalSamples == 0 {
 		for _, e := range t.stts {
+			if e.count > math.MaxUint32-t.totalSamples {
+				return ErrCorrupt
+			}
 			t.totalSamples += e.count
 		}
+	}
+	var timedSamples uint64
+	for _, entry := range t.stts {
+		timedSamples += uint64(entry.count)
+		if timedSamples > math.MaxUint32 {
+			return ErrCorrupt
+		}
+	}
+	if t.hasSampleCount && (t.totalSamples != t.sampleCount || timedSamples != uint64(t.sampleCount)) {
+		return ErrCorrupt
 	}
 	if t.totalSamples == 0 {
 		return nil // empty track
@@ -142,6 +158,7 @@ func (t *trackState) peekNext() bool {
 	// inconsistent (more samples than chunk slots). Stop rather than reading
 	// from a bogus offset (the old code reused the last chunk's tail offset).
 	if t.chunkSampleLeft == 0 && t.chunkIdx+1 >= len(t.stco) {
+		t.cursorErr = ErrCorrupt
 		return false
 	}
 	off := t.chunkOff

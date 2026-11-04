@@ -9,6 +9,10 @@ import (
 	"sort"
 )
 
+const maxInputSampleBytes = 64 << 20
+const maxFragmentSamples = 65536
+const maxIndexedFragmentSamples = 1 << 20
+
 type trafState struct {
 	track        *trackState
 	baseData     int64
@@ -218,6 +222,12 @@ func (rd *Reader) parseTrun(data []byte, state *trafState) error {
 	version := data[0]
 	flags := uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	count := binary.BigEndian.Uint32(data[4:8])
+	if version > 1 || flags & ^uint32(0xf05) != 0 || flags&0x404 == 0x404 || count > maxFragmentSamples || len(rd.fragments) > maxIndexedFragmentSamples-int(count) {
+		return ErrCorrupt
+	}
+	if state.defaultValue.descriptionIndex > 1 {
+		return errors.New("mp4: sample description switch unsupported")
+	}
 	offset := 8
 	if flags&0x000001 != 0 {
 		if len(data)-offset < 4 {
@@ -242,6 +252,15 @@ func (rd *Reader) parseTrun(data []byte, state *trafState) error {
 		firstFlags = binary.BigEndian.Uint32(data[offset : offset+4])
 		haveFirstFlags = true
 		offset += 4
+	}
+	fields := 0
+	for _, flag := range []uint32{0x100, 0x200, 0x400, 0x800} {
+		if flags&flag != 0 {
+			fields++
+		}
+	}
+	if uint64(count)*uint64(fields)*4 != uint64(len(data)-offset) {
+		return ErrCorrupt
 	}
 	for i := uint32(0); i < count; i++ {
 		duration, size, sampleFlags := state.defaultValue.duration, state.defaultValue.size, state.defaultValue.flags
@@ -277,7 +296,7 @@ func (rd *Reader) parseTrun(data []byte, state *trafState) error {
 				return ErrCorrupt
 			}
 		}
-		if state.decodeTime > math.MaxInt64 || duration == 0 || size == 0 || state.dataCursor < 0 {
+		if state.decodeTime > math.MaxInt64 || duration == 0 || size == 0 || size > maxInputSampleBytes || state.dataCursor < 0 {
 			return ErrCorrupt
 		}
 		dts, ok := checkedAddInt64(int64(state.decodeTime), state.track.presentationShift)

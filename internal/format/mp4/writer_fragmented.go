@@ -36,6 +36,8 @@ type fragmentedTrack struct {
 // FragmentedWriter writes an initialization segment followed by bounded
 // moof+mdat fragments to any io.Writer.
 type FragmentedWriter struct {
+	grouped          map[int][]bufferedFragmentSample
+	trackOffsets     map[int]int
 	w                io.Writer
 	tracks           []*fragmentedTrack
 	trackByID        map[int]*fragmentedTrack
@@ -218,11 +220,18 @@ func (w *FragmentedWriter) flush() error {
 	if err := w.start(); err != nil {
 		return err
 	}
-	grouped := make(map[int][]bufferedFragmentSample, len(w.tracks))
+	if w.grouped == nil {
+		w.grouped = make(map[int][]bufferedFragmentSample, len(w.tracks))
+		w.trackOffsets = make(map[int]int, len(w.tracks))
+	}
+	grouped := w.grouped
+	for id, entries := range grouped {
+		grouped[id] = entries[:0]
+	}
 	for _, sample := range w.pending {
 		grouped[sample.sample.TrackID] = append(grouped[sample.sample.TrackID], sample)
 	}
-	trackOffsets := make(map[int]int, len(grouped))
+	trackOffsets := w.trackOffsets
 	data := w.payload.Bytes()
 	offset := 0
 	for _, track := range w.tracks {
@@ -234,11 +243,14 @@ func (w *FragmentedWriter) flush() error {
 	if uint64(offset)+8 > math.MaxUint32 {
 		return ErrOutputTooLarge
 	}
-	moof, err := makeMOOF(w.sequence, w.tracks, grouped, trackOffsets, 0)
-	if err != nil {
-		return err
+	// moof(8)+mfhd(16); each traf has 8+tfhd(16)+tfdt(20)+trun(20+16*N).
+	moofSize := 24
+	for _, track := range w.tracks {
+		if n := len(grouped[track.spec.ID]); n > 0 {
+			moofSize += 64 + 16*n
+		}
 	}
-	moof, err = makeMOOF(w.sequence, w.tracks, grouped, trackOffsets, len(moof)+8)
+	moof, err := makeMOOF(w.sequence, w.tracks, grouped, trackOffsets, moofSize+8)
 	if err != nil {
 		return err
 	}
@@ -258,6 +270,11 @@ func (w *FragmentedWriter) flush() error {
 			}
 		}
 	}
+	for id, entries := range grouped {
+		if cap(entries) > maxFragmentPackets/max(1, len(w.tracks)) {
+			delete(grouped, id)
+		}
+	}
 	w.sequence++
 	w.pending = w.pending[:0]
 	w.payload.Reset()
@@ -271,6 +288,9 @@ func (w *FragmentedWriter) Close() (retErr error) {
 	w.closed = true
 	defer func() {
 		w.closeErr = retErr
+		w.grouped = nil
+		w.trackOffsets = nil
+		w.pending = nil
 		if w.payload != nil {
 			w.payload.Reset()
 			if w.payload.Cap() <= maxPooledFragmentBytes {

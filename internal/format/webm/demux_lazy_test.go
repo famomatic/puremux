@@ -177,13 +177,19 @@ func TestDemuxLazyTrailingIndexAndTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The scan reaches the cluster at 1000 >= 500 and stops before the
+	// trailing Cues/Tags, which are not needed to answer this seek.
 	actual, err := immediate.SeekTicksWithFlags(context.Background(), 500, 1, false, false)
-	if err != nil || actual != 1000 || len(immediate.cues) != 2 {
+	if err != nil || actual != 1000 || len(immediate.cues) != 0 || immediate.indexComplete {
 		t.Fatalf("immediate seek: %d %v", actual, err)
 	}
 	packet, err := immediate.NextPacket(context.Background())
 	if err != nil || packet.Data[0] != 0x22 {
-		t.Fatalf("cue offset: %+v %v", packet, err)
+		t.Fatalf("cluster offset: %+v %v", packet, err)
+	}
+	// Past the last cluster the scan must run to the end and pick up Cues.
+	if _, err := immediate.SeekTicksWithFlags(context.Background(), 5000, 1, true, false); err != nil || len(immediate.cues) != 2 || !immediate.indexComplete {
+		t.Fatalf("full scan: cues=%d complete=%v err=%v", len(immediate.cues), immediate.indexComplete, err)
 	}
 
 	if len(rd.cues) != 0 || rd.Metadata().Tags["title"] != "" {
@@ -254,5 +260,99 @@ func TestDemuxLazyTruncatedPacket(t *testing.T) {
 		if _, err = rd.NextPacket(context.Background()); err == nil {
 			t.Fatal("truncated block accepted")
 		}
+	}
+}
+
+// partialFixture appends a third cluster (time 2000) that stays "undownloaded".
+func partialFixture() (data []byte, second, third int) {
+	data, _ = lazyWebMFixture()
+	second = bytes.LastIndex(data, []byte{0x1f, 0x43, 0xb6, 0x75})
+	third = len(data)
+	// Cluster 1F43B675, size 8B=11, Timestamp E7 82 07D0 = 2000, SimpleBlock.
+	data = append(data, 0x1f, 0x43, 0xb6, 0x75, 0x8b, 0xe7, 0x82, 0x07, 0xd0, 0xa3, 0x85, 0x81, 0, 0, 0x80, 0x33)
+	return data, second, third
+}
+
+func TestDemuxSeekPartialDownloadWithoutCues(t *testing.T) {
+	data, _, third := partialFixture()
+	spool := &gatedSpool{Reader: bytes.NewReader(data), available: int64(third)}
+	rd, err := NewDemuxReader(spool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.NextPacket(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Both targets lie inside the downloaded prefix: no full-file index needed.
+	for _, c := range []struct{ target, want uint64 }{{1000, 1000}, {0, 0}, {500, 0}} {
+		actual, err := rd.SeekTicks(context.Background(), c.target, 1)
+		if err != nil || actual != c.want {
+			t.Fatalf("seek %d: %d %v", c.target, actual, err)
+		}
+	}
+	if rd.indexComplete {
+		t.Fatal("index completed on partial download")
+	}
+	// Target in the undownloaded tail: clear error, playback state preserved.
+	if _, err := rd.SeekTicks(context.Background(), 2000, 1); !errors.Is(err, errSpoolUnavailable) {
+		t.Fatalf("tail seek: %v", err)
+	}
+	p, err := rd.NextPacket(context.Background())
+	if err != nil || p.Data[0] != 0x11 {
+		t.Fatalf("resume after failed seek: %+v %v", p, err)
+	}
+	spool.available = int64(len(data))
+	actual, err := rd.SeekTicks(context.Background(), 2000, 1)
+	if err != nil || actual != 2000 {
+		t.Fatalf("seek after download: %d %v", actual, err)
+	}
+	if len(rd.clusters) != 3 {
+		t.Fatalf("clusters: %d", len(rd.clusters))
+	}
+}
+
+func TestDemuxSeekPartialDownloadWithHeadCues(t *testing.T) {
+	data, second, third := partialFixture()
+	first := bytes.Index(data, []byte{0x1f, 0x43, 0xb6, 0x75})
+	build := func(shift int) []byte {
+		var cues bytes.Buffer
+		// Segment payload starts at 17; Cues sit before the first Cluster.
+		for _, cue := range []CuePoint{{Timecode: 0, Track: 1, ClusterPosition: uint64(first + shift - 17)}, {Timecode: 1000, Track: 1, ClusterPosition: uint64(second + shift - 17)}, {Timecode: 2000, Track: 1, ClusterPosition: uint64(third + shift - 17)}} {
+			if err := writeCuePoint(&cues, cue); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var el bytes.Buffer
+		if err := writeElement(&el, idCues, cues.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+		return el.Bytes()
+	}
+	cuesEl := build(0)
+	cuesEl = build(len(cuesEl))
+	if len(build(len(cuesEl))) != len(cuesEl) {
+		t.Fatal("cue size unstable")
+	}
+	full := append(append(append([]byte(nil), data[:first]...), cuesEl...), data[first:]...)
+	// Downloaded: header, Cues and the first two clusters; third is missing.
+	spool := &gatedSpool{Reader: bytes.NewReader(full), available: int64(third + len(cuesEl))}
+	rd, err := NewDemuxReader(spool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rd.cues) != 3 {
+		t.Fatalf("head cues: %d", len(rd.cues))
+	}
+	before := spool.furthest
+	actual, err := rd.SeekTicks(context.Background(), 1000, 1)
+	if err != nil || actual != 1000 {
+		t.Fatalf("cue seek: %d %v", actual, err)
+	}
+	if spool.furthest != before || rd.indexComplete || rd.indexNext != 0 {
+		t.Fatal("cue seek scanned the file")
+	}
+	p, err := rd.NextPacket(context.Background())
+	if err != nil || p.Data[0] != 0x22 {
+		t.Fatalf("packet after cue seek: %+v %v", p, err)
 	}
 }
