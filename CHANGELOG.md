@@ -5,6 +5,8 @@ All notable changes to puremux are documented here. Versions are git tags on
 
 ## Unreleased
 
+## v0.2.5 — 2026-11-04
+
 ### Fixed
 
 - Ogg Opus playback opens report the duration up front: unless `LazyIndex` is
@@ -13,6 +15,14 @@ All notable changes to puremux are documented here. Versions are git tags on
   Previously the duration stayed unknown until EOS, so complete files looked
   like live streams. An unreadable tail still falls back to learning it at EOS.
 
+## v0.2.4 — 2026-11-04
+
+### Fixed
+
+- WebM/Matroska `Seek` no longer indexes the whole file first: sync seeks use
+  already-parsed Cues, otherwise indexing scans contiguously and resumably only
+  until a cluster time reaches the target. Seeks into an undownloaded range
+  return the source error and keep playback intact.
 - Resolve all 22 reproduced findings in the September 6 audit: output directory
   preservation, bounded MP4/PTS buffers, TS PSI and continuity handling, timestamp
   rollover, AAC/AV1 validation, interrupted reads and failed seeks, HTTP retry and
