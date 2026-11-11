@@ -5,6 +5,13 @@ All notable changes to puremux are documented here. Versions are git tags on
 
 ## Unreleased
 
+## v0.2.6 — 2026-11-12
+
+### Fixed
+
+- The Ogg tail-duration test no longer calls `testing.(*B).Context`, which
+  needs Go 1.24; `go test ./...` builds again under the module's `go 1.23`.
+
 ## v0.2.5 — 2026-11-04
 
 ### Fixed

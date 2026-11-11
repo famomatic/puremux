@@ -2,6 +2,7 @@ package ogg
 
 import (
 	"bytes"
+	"context"
 	"math"
 	"testing"
 )
@@ -43,7 +44,7 @@ func TestPlaybackTailDuration(t *testing.T) {
 	// Probing must leave the cursor at the start for playback.
 	r, _ := NewPlaybackReaderWithTail(bytes.NewReader(stream), true)
 	for i := 0; i < 3; i++ {
-		if _, err := r.NextPacket(t.Context()); err != nil {
+		if _, err := r.NextPacket(context.Background()); err != nil {
 			t.Fatalf("packet %d after probe: %v", i, err)
 		}
 	}
